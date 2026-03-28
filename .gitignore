@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+*.sqlite3
+
+# Node
+node_modules/
+dist/
+build/
+.npm
+.yarn
+
+# Logs and environment
+*.log
+.DS_Store
+.vscode/
+.idea/
