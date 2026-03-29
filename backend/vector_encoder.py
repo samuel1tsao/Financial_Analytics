@@ -6,9 +6,16 @@ The encoder maps user preferences into:
 2. FOMO adjustment factor for momentum-tilted assets
 3. Hard constraint carve-outs
 4. Short-term vs long-term goal segregation (cash-out logic)
+
+Market data (returns, volatilities, correlations) is loaded from the database
+via market_data.get_market_data(). Hardcoded FALLBACK_* constants are used only
+when DB data is unavailable (first run with no internet, etc.).
 """
 import numpy as np
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Asset Universe ──────────────────────────────────────────────────────────
@@ -31,23 +38,20 @@ BOND_UNIVERSE = {
     "TIPS": {"name": "Inflation Protected", "risk": 0.1, "category": "tips"},
 }
 
-# Expected annual returns (simplified, for MVP simulation)
-EXPECTED_RETURNS = {
+# ─── Fallback Constants (used when DB has no market data) ────────────────────
+FALLBACK_EXPECTED_RETURNS = {
     "VOO": 0.10, "QQQ": 0.12, "VTI": 0.10, "VXUS": 0.07,
     "VGT": 0.13, "ARKK": 0.15, "VNQ": 0.08, "VWO": 0.09,
     "BND": 0.04, "SGOV": 0.045, "TLT": 0.035, "TIPS": 0.038,
 }
 
-# Annual volatility (std dev of returns)
-VOLATILITIES = {
+FALLBACK_VOLATILITIES = {
     "VOO": 0.16, "QQQ": 0.20, "VTI": 0.16, "VXUS": 0.17,
     "VGT": 0.22, "ARKK": 0.35, "VNQ": 0.20, "VWO": 0.22,
     "BND": 0.04, "SGOV": 0.01, "TLT": 0.14, "TIPS": 0.05,
 }
 
-# Simplified correlation matrix (pairwise)
-# For MVP we use broad categories rather than full NxN matrix
-CATEGORY_CORRELATIONS = {
+FALLBACK_CATEGORY_CORRELATIONS = {
     ("equity", "equity"): 0.75,
     ("equity", "bond"): -0.15,
     ("bond", "bond"): 0.60,
@@ -62,20 +66,30 @@ def classify_asset(ticker: str) -> str:
 
 
 def build_covariance_matrix(tickers: list[str]) -> np.ndarray:
-    """Build a variance-covariance matrix for the given tickers."""
+    """
+    Build a variance-covariance matrix for the given tickers.
+    Uses real market data from the DB when available, falls back to hardcoded values.
+    """
+    try:
+        from market_data import get_covariance_matrix as _get_real_cov
+        return _get_real_cov(tickers)
+    except Exception as e:
+        logger.warning(f"Could not build covariance from DB, using fallback: {e}")
+
+    # Fallback: category-based approximation
     n = len(tickers)
     cov = np.zeros((n, n))
     for i, t1 in enumerate(tickers):
         for j, t2 in enumerate(tickers):
-            vol1 = VOLATILITIES.get(t1, 0.15)
-            vol2 = VOLATILITIES.get(t2, 0.15)
+            vol1 = FALLBACK_VOLATILITIES.get(t1, 0.15)
+            vol2 = FALLBACK_VOLATILITIES.get(t2, 0.15)
             cat1 = classify_asset(t1)
             cat2 = classify_asset(t2)
             if i == j:
                 cov[i][j] = vol1 ** 2
             else:
                 pair = tuple(sorted([cat1, cat2]))
-                corr = CATEGORY_CORRELATIONS.get(pair, 0.5)
+                corr = FALLBACK_CATEGORY_CORRELATIONS.get(pair, 0.5)
                 cov[i][j] = corr * vol1 * vol2
     return cov
 
@@ -200,12 +214,24 @@ def simulate_portfolio(
     Run a variance-covariance Monte Carlo-style projection.
 
     Returns expected path, upper/lower bounds (±2σ), and cash-out events.
+    Uses real market data from the DB when available.
     """
     tickers = list(weights.keys())
     w = np.array([weights[t] for t in tickers])
 
+    # Load real market data, fall back to hardcoded
+    returns_dict = FALLBACK_EXPECTED_RETURNS
+    try:
+        from market_data import get_market_data
+        md = get_market_data()
+        if md.expected_returns:
+            returns_dict = md.expected_returns
+            logger.info("Using real market returns for simulation")
+    except Exception as e:
+        logger.warning(f"Could not load market data, using fallback: {e}")
+
     # Portfolio expected return (weighted sum)
-    mu_p = sum(weights[t] * EXPECTED_RETURNS.get(t, 0.08) for t in tickers)
+    mu_p = sum(weights[t] * returns_dict.get(t, 0.08) for t in tickers)
 
     # Portfolio variance from var-covar matrix
     cov = build_covariance_matrix(tickers)

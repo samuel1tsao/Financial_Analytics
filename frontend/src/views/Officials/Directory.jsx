@@ -114,24 +114,45 @@ function OfficialCard({ official, onMimic, onFavorite, isFavorited }) {
               {fmtMoney(official.total_value)}
             </p>
           </div>
-          <div>
-            <p style={{ color: '#475569', fontSize: '0.65rem', fontWeight: 500, margin: 0 }}>1Y</p>
-            <p style={{
-              color: official.performance_1y >= 0 ? '#4ade80' : '#f87171',
-              fontWeight: 600, fontSize: '0.95rem', margin: '0.15rem 0 0',
-            }}>
-              {official.performance_1y >= 0 ? '+' : ''}{(official.performance_1y * 100).toFixed(1)}%
-            </p>
-          </div>
-          <div>
-            <p style={{ color: '#475569', fontSize: '0.65rem', fontWeight: 500, margin: 0 }}>5Y</p>
-            <p style={{
-              color: official.performance_5y >= 0 ? '#4ade80' : '#f87171',
-              fontWeight: 600, fontSize: '0.95rem', margin: '0.15rem 0 0',
-            }}>
-              {official.performance_5y >= 0 ? '+' : ''}{(official.performance_5y * 100).toFixed(1)}%
-            </p>
-          </div>
+          {official.performance_1y != null && (
+            <div>
+              <p style={{ color: '#475569', fontSize: '0.65rem', fontWeight: 500, margin: 0 }}>1Y</p>
+              <p style={{
+                color: official.performance_1y >= 0 ? '#4ade80' : '#f87171',
+                fontWeight: 600, fontSize: '0.95rem', margin: '0.15rem 0 0',
+              }}>
+                {official.performance_1y >= 0 ? '+' : ''}{(official.performance_1y * 100).toFixed(1)}%
+              </p>
+            </div>
+          )}
+          {official.performance_5y != null && (
+            <div>
+              <p style={{ color: '#475569', fontSize: '0.65rem', fontWeight: 500, margin: 0 }}>5Y</p>
+              <p style={{
+                color: official.performance_5y >= 0 ? '#4ade80' : '#f87171',
+                fontWeight: 600, fontSize: '0.95rem', margin: '0.15rem 0 0',
+              }}>
+                {official.performance_5y >= 0 ? '+' : ''}{(official.performance_5y * 100).toFixed(1)}%
+              </p>
+            </div>
+          )}
+          {/* Data source badge */}
+          {official.data_source && (
+            <div style={{ marginLeft: 'auto' }}>
+              <span style={{
+                fontSize: '0.55rem', fontWeight: 600,
+                padding: '0.15rem 0.45rem', borderRadius: '0.3rem',
+                background: official.data_source === 'database'
+                  ? 'rgba(34,197,94,0.1)' : 'rgba(245,158,11,0.1)',
+                border: official.data_source === 'database'
+                  ? '1px solid rgba(34,197,94,0.2)' : '1px solid rgba(245,158,11,0.2)',
+                color: official.data_source === 'database' ? '#4ade80' : '#fbbf24',
+                letterSpacing: '0.04em',
+              }}>
+                {official.data_source === 'database' ? '● LIVE' : '● CURATED'}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -278,7 +299,7 @@ function OfficialCard({ official, onMimic, onFavorite, isFavorited }) {
 }
 
 // ─── Search & Filter Bar ─────────────────────────────────────────────────────
-function FilterBar({ search, setSearch, filter, setFilter, sortBy, setSortBy }) {
+function FilterBar({ search, setSearch, filter, setFilter, chamberFilter, setChamberFilter, sortBy, setSortBy }) {
   const filterBtnStyle = (active) => ({
     padding: '0.4rem 0.85rem', borderRadius: '2rem',
     fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer',
@@ -289,52 +310,64 @@ function FilterBar({ search, setSearch, filter, setFilter, sortBy, setSortBy }) 
   });
 
   return (
-    <div style={{
-      display: 'flex', flexWrap: 'wrap', gap: '0.5rem',
-      alignItems: 'center', marginBottom: '1.25rem',
-    }}>
-      <input
-        type="text"
-        placeholder="Search officials..."
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        style={{
-          padding: '0.55rem 1rem', borderRadius: '0.5rem',
-          background: 'rgba(30,41,59,0.8)',
-          border: '1px solid rgba(255,255,255,0.08)',
-          color: '#f1f5f9', fontSize: '0.85rem',
-          outline: 'none', width: 220,
-          transition: 'border-color 0.2s',
-        }}
-        onFocus={(e) => e.target.style.borderColor = 'rgba(59,130,246,0.4)'}
-        onBlur={(e) => e.target.style.borderColor = 'rgba(255,255,255,0.08)'}
-      />
-      <button style={filterBtnStyle(filter === 'all')} onClick={() => setFilter('all')}>All</button>
-      <button style={filterBtnStyle(filter === 'Democrat')} onClick={() => setFilter('Democrat')}>
-        <span style={{ color: '#3b82f6' }}>●</span> Democrat
-      </button>
-      <button style={filterBtnStyle(filter === 'Republican')} onClick={() => setFilter('Republican')}>
-        <span style={{ color: '#ef4444' }}>●</span> Republican
-      </button>
-
-      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-        <span style={{ color: '#475569', fontSize: '0.7rem' }}>Sort:</span>
-        <select
-          value={sortBy}
-          onChange={(e) => setSortBy(e.target.value)}
+    <div style={{ marginBottom: '1.25rem' }}>
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', gap: '0.5rem',
+        alignItems: 'center', marginBottom: '0.5rem',
+      }}>
+        <input
+          type="text"
+          placeholder="Search officials..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
           style={{
-            padding: '0.35rem 0.6rem', borderRadius: '0.4rem',
+            padding: '0.55rem 1rem', borderRadius: '0.5rem',
             background: 'rgba(30,41,59,0.8)',
             border: '1px solid rgba(255,255,255,0.08)',
-            color: '#94a3b8', fontSize: '0.75rem', outline: 'none',
-            cursor: 'pointer',
+            color: '#f1f5f9', fontSize: '0.85rem',
+            outline: 'none', width: 220,
+            transition: 'border-color 0.2s',
           }}
-        >
-          <option value="value">Portfolio Value</option>
-          <option value="perf1y">1Y Performance</option>
-          <option value="perf5y">5Y Performance</option>
-          <option value="name">Name</option>
-        </select>
+          onFocus={(e) => e.target.style.borderColor = 'rgba(59,130,246,0.4)'}
+          onBlur={(e) => e.target.style.borderColor = 'rgba(255,255,255,0.08)'}
+        />
+
+        {/* Party filters */}
+        <button style={filterBtnStyle(filter === 'all')} onClick={() => setFilter('all')}>All</button>
+        <button style={filterBtnStyle(filter === 'Democrat')} onClick={() => setFilter('Democrat')}>
+          <span style={{ color: '#3b82f6' }}>●</span> Democrat
+        </button>
+        <button style={filterBtnStyle(filter === 'Republican')} onClick={() => setFilter('Republican')}>
+          <span style={{ color: '#ef4444' }}>●</span> Republican
+        </button>
+
+        {/* Separator */}
+        <span style={{ color: 'rgba(255,255,255,0.1)', margin: '0 0.15rem' }}>|</span>
+
+        {/* Chamber filters */}
+        <button style={filterBtnStyle(chamberFilter === 'all')} onClick={() => setChamberFilter('all')}>All Chambers</button>
+        <button style={filterBtnStyle(chamberFilter === 'house')} onClick={() => setChamberFilter('house')}>🏛️ House</button>
+        <button style={filterBtnStyle(chamberFilter === 'senate')} onClick={() => setChamberFilter('senate')}>🏛️ Senate</button>
+
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+          <span style={{ color: '#475569', fontSize: '0.7rem' }}>Sort:</span>
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value)}
+            style={{
+              padding: '0.35rem 0.6rem', borderRadius: '0.4rem',
+              background: 'rgba(30,41,59,0.8)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              color: '#94a3b8', fontSize: '0.75rem', outline: 'none',
+              cursor: 'pointer',
+            }}
+          >
+            <option value="value">Portfolio Value</option>
+            <option value="perf1y">1Y Performance</option>
+            <option value="perf5y">5Y Performance</option>
+            <option value="name">Name</option>
+          </select>
+        </div>
       </div>
     </div>
   );
@@ -347,6 +380,7 @@ export default function Directory() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all');
+  const [chamberFilter, setChamberFilter] = useState('all');
   const [sortBy, setSortBy] = useState('value');
   const [mimicSuccess, setMimicSuccess] = useState('');
 
@@ -390,17 +424,22 @@ export default function Directory() {
   // ─── Filter + Sort ───────────────────────────────────────────────────────
   let filtered = officials.filter((o) => {
     const matchSearch = o.name.toLowerCase().includes(search.toLowerCase())
-      || o.state.toLowerCase().includes(search.toLowerCase())
-      || o.title.toLowerCase().includes(search.toLowerCase());
+      || (o.state || '').toLowerCase().includes(search.toLowerCase())
+      || (o.title || '').toLowerCase().includes(search.toLowerCase());
     const matchParty = filter === 'all' || o.party === filter;
-    return matchSearch && matchParty;
+    const matchChamber = chamberFilter === 'all'
+      || (chamberFilter === 'house' && (o.title || '').toLowerCase().includes('representative'))
+      || (chamberFilter === 'house' && (o.title || '').toLowerCase().includes('speaker'))
+      || (chamberFilter === 'senate' && (o.title || '').toLowerCase().includes('senator'))
+      || (chamberFilter === 'senate' && (o.title || '').toLowerCase().includes('senate'));
+    return matchSearch && matchParty && matchChamber;
   });
 
   filtered.sort((a, b) => {
     switch (sortBy) {
-      case 'value': return b.total_value - a.total_value;
-      case 'perf1y': return b.performance_1y - a.performance_1y;
-      case 'perf5y': return b.performance_5y - a.performance_5y;
+      case 'value': return (b.total_value || 0) - (a.total_value || 0);
+      case 'perf1y': return (b.performance_1y || 0) - (a.performance_1y || 0);
+      case 'perf5y': return (b.performance_5y || 0) - (a.performance_5y || 0);
       case 'name': return a.name.localeCompare(b.name);
       default: return 0;
     }
@@ -459,6 +498,7 @@ export default function Directory() {
       <FilterBar
         search={search} setSearch={setSearch}
         filter={filter} setFilter={setFilter}
+        chamberFilter={chamberFilter} setChamberFilter={setChamberFilter}
         sortBy={sortBy} setSortBy={setSortBy}
       />
 

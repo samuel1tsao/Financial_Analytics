@@ -9,3 +9,5 @@ SQLAlchemy
 passlib[bcrypt]
 python-multipart
 python-jose[cryptography]
+beautifulsoup4
+requests
