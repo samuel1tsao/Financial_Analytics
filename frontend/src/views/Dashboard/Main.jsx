@@ -43,7 +43,6 @@ function SimTooltip({ active, payload, label }) {
   );
 }
 
-// ─── Stat Card ───────────────────────────────────────────────────────────────
 function StatCard({ label, value, subtext, color = '#60a5fa' }) {
   return (
     <div style={{
@@ -74,6 +73,96 @@ function StatCard({ label, value, subtext, color = '#60a5fa' }) {
   );
 }
 
+// ─── ETF History Modal ────────────────────────────────────────────────────────
+function EtfModal({ ticker, onClose }) {
+  const [data, setData] = useState(null);
+  const [range, setRange] = useState('1y');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const res = await api.get(`/market/history?ticker=${ticker}&range=${range}`);
+        setData(res.data);
+      } catch (err) {
+        console.error('Failed to load ETF history', err);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [ticker, range]);
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 1000,
+      background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }} onClick={onClose}>
+      <div style={{
+        background: '#0f172a', width: '90%', maxWidth: 700,
+        borderRadius: '1rem', border: '1px solid rgba(255,255,255,0.1)',
+        padding: '1.5rem', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)',
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+          <div>
+            <h2 style={{ color: '#f1f5f9', fontSize: '1.25rem', fontWeight: 700, margin: 0 }}>
+              {ticker} Historical Performance
+            </h2>
+            {data && (
+              <p style={{
+                color: data.percent_change >= 0 ? '#4ade80' : '#f87171',
+                fontSize: '0.85rem', fontWeight: 600, marginTop: '0.25rem',
+              }}>
+                {data.percent_change >= 0 ? '+' : ''}{data.percent_change}% ({range.toUpperCase()})
+              </p>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            {['1y', '3y', '5y'].map(r => (
+              <button
+                key={r} onClick={() => setRange(r)}
+                style={{
+                  background: range === r ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.05)',
+                  border: range === r ? '1px solid rgba(59,130,246,0.4)' : '1px solid transparent',
+                  color: range === r ? '#60a5fa' : '#94a3b8',
+                  padding: '0.3rem 0.6rem', borderRadius: '0.4rem', fontSize: '0.75rem', cursor: 'pointer',
+                }}
+              >
+                {r.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {loading ? (
+          <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b' }}>
+            Loading...
+          </div>
+        ) : data && data.history ? (
+          <div style={{ height: 300, width: '100%' }}>
+            <ResponsiveContainer>
+              <AreaChart data={data.history} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="gradEtf" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.4} />
+                    <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
+                <XAxis dataKey="date" stroke="#475569" fontSize={10} tickLine={false} tickFormatter={tick => tick.slice(5, 7) + '/' + tick.slice(2, 4)} />
+                <YAxis stroke="#475569" fontSize={10} tickLine={false} tickFormatter={fmt} width={50} domain={['auto', 'auto']} />
+                <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 }} />
+                <Area type="monotone" dataKey="adj_close" name="Price" stroke="#8b5cf6" strokeWidth={2} fill="url(#gradEtf)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        ) : <p>No data</p>}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Dashboard ──────────────────────────────────────────────────────────
 export default function DashboardMain() {
   const {
@@ -84,12 +173,25 @@ export default function DashboardMain() {
   const [simulation, setSimulation] = useState(null);
   const [simLoading, setSimLoading] = useState(false);
   const [simError, setSimError] = useState('');
+  
+  // Interactive goals state
+  const [customGoals, setCustomGoals] = useState([{ name: 'House Downpayment', amount: 50000, years: 5 }]);
+  const [debouncedGoals, setDebouncedGoals] = useState(customGoals);
+  
+  // ETF Modal
+  const [etfModal, setEtfModal] = useState(null);
 
   const activePortfolio = portfolios.find((p) => p.id === activePortfolioId)
     || portfolios.find((p) => p.is_current)
     || null;
 
-  // Fetch simulation whenever the active portfolio changes
+  // Debounce goal input so we don't spam the API while dragging sliders
+  useEffect(() => {
+    const handler = setTimeout(() => setDebouncedGoals(customGoals), 500);
+    return () => clearTimeout(handler);
+  }, [customGoals]);
+
+  // Fetch simulation whenever the active portfolio or debounced goals change
   useEffect(() => {
     if (!activePortfolio) return;
     let cancelled = false;
@@ -102,6 +204,7 @@ export default function DashboardMain() {
             portfolio_id: activePortfolio.id,
             initial_investment: 100000,
             projection_years: 30,
+            custom_goals_json: JSON.stringify(debouncedGoals),
           },
         });
         if (!cancelled) setSimulation(res.data.simulation);
@@ -112,7 +215,7 @@ export default function DashboardMain() {
       }
     })();
     return () => { cancelled = true; };
-  }, [activePortfolio?.id]);
+  }, [activePortfolio?.id, debouncedGoals]);
 
   // ─── Empty State ─────────────────────────────────────────────────────────
   if (!hasCompletedQuestionnaire && portfolios.length === 0) {
@@ -295,127 +398,176 @@ export default function DashboardMain() {
       )}
 
       {simulation && !simLoading && (
-        <div style={{
-          padding: '1.5rem', borderRadius: '0.75rem',
-          background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
-          border: '1px solid rgba(255,255,255,0.06)',
-          marginBottom: '1.5rem',
-        }}>
+        <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
           <div style={{
-            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            marginBottom: '1rem',
+            flex: 3, minWidth: 500,
+            padding: '1.5rem', borderRadius: '0.75rem',
+            background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.06)',
           }}>
-            <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
-              Portfolio Growth Projection
-            </h3>
-            <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
-              ±2σ Confidence Interval · $100K Initial
-            </span>
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              marginBottom: '1rem',
+            }}>
+              <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
+                Portfolio Growth Projection
+              </h3>
+              <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
+                ±2σ Confidence Interval · $100K Initial
+              </span>
+            </div>
+
+            <ResponsiveContainer width="100%" height={380}>
+              <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="gradUpper" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.25} />
+                    <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
+                  </linearGradient>
+                  <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
+                    <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
+                  </linearGradient>
+                  <linearGradient id="gradLower" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
+                    <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                <XAxis
+                  dataKey="year"
+                  stroke="#475569" fontSize={12} tickLine={false}
+                  label={{ value: 'Years', position: 'insideBottom', offset: -2, fill: '#64748b', fontSize: 11 }}
+                />
+                <YAxis
+                  stroke="#475569" fontSize={11} tickLine={false}
+                  tickFormatter={fmt}
+                  width={65}
+                />
+                <Tooltip content={<SimTooltip />} />
+
+                {/* Confidence band: upper */}
+                <Area
+                  type="monotone" dataKey="upper" name="Best Case (+2σ)"
+                  stroke="rgba(139,92,246,0.5)" strokeWidth={1.5}
+                  fill="url(#gradUpper)" dot={false}
+                  strokeDasharray="4 2"
+                />
+
+                {/* Expected path */}
+                <Area
+                  type="monotone" dataKey="expected" name="Expected Path"
+                  stroke="#3b82f6" strokeWidth={2.5}
+                  fill="url(#gradExpected)" dot={false}
+                />
+
+                {/* Confidence band: lower */}
+                <Area
+                  type="monotone" dataKey="lower" name="Worst Case (−2σ)"
+                  stroke="rgba(239,68,68,0.4)" strokeWidth={1.5}
+                  fill="url(#gradLower)" dot={false}
+                  strokeDasharray="4 2"
+                />
+
+                {/* Goal annotations */}
+                {simulation.goal_annotations?.map((g, i) => (
+                  <ReferenceLine
+                    key={i}
+                    x={g.year}
+                    stroke={g.is_short_term ? '#f59e0b' : '#4ade80'}
+                    strokeDasharray="3 3"
+                    strokeWidth={1.5}
+                    label={{
+                      value: `${g.label} (Yr ${g.year})`,
+                      position: 'top',
+                      fill: g.is_short_term ? '#f59e0b' : '#4ade80',
+                      fontSize: 11,
+                      fontWeight: 600,
+                    }}
+                  />
+                ))}
+
+                <Legend
+                  verticalAlign="top" align="right" height={36}
+                  wrapperStyle={{ fontSize: '0.75rem', color: '#94a3b8' }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
 
-          <ResponsiveContainer width="100%" height={380}>
-            <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
-              <defs>
-                <linearGradient id="gradUpper" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.25} />
-                  <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
-                </linearGradient>
-                <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
-                  <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
-                </linearGradient>
-                <linearGradient id="gradLower" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
-                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
-                </linearGradient>
-              </defs>
-
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-              <XAxis
-                dataKey="year"
-                stroke="#475569" fontSize={12} tickLine={false}
-                label={{ value: 'Years', position: 'insideBottom', offset: -2, fill: '#64748b', fontSize: 11 }}
-              />
-              <YAxis
-                stroke="#475569" fontSize={11} tickLine={false}
-                tickFormatter={fmt}
-                width={65}
-              />
-              <Tooltip content={<SimTooltip />} />
-
-              {/* Confidence band: upper */}
-              <Area
-                type="monotone" dataKey="upper" name="Best Case (+2σ)"
-                stroke="rgba(139,92,246,0.5)" strokeWidth={1.5}
-                fill="url(#gradUpper)" dot={false}
-                strokeDasharray="4 2"
-              />
-
-              {/* Expected path */}
-              <Area
-                type="monotone" dataKey="expected" name="Expected Path"
-                stroke="#3b82f6" strokeWidth={2.5}
-                fill="url(#gradExpected)" dot={false}
-              />
-
-              {/* Confidence band: lower */}
-              <Area
-                type="monotone" dataKey="lower" name="Worst Case (−2σ)"
-                stroke="rgba(239,68,68,0.4)" strokeWidth={1.5}
-                fill="url(#gradLower)" dot={false}
-                strokeDasharray="4 2"
-              />
-
-              {/* Goal annotations */}
-              {simulation.goal_annotations?.map((g, i) => (
-                <ReferenceLine
-                  key={i}
-                  x={g.year}
-                  stroke={g.is_short_term ? '#f59e0b' : '#4ade80'}
-                  strokeDasharray="3 3"
-                  strokeWidth={1.5}
-                  label={{
-                    value: `${g.label} (Yr ${g.year})`,
-                    position: 'top',
-                    fill: g.is_short_term ? '#f59e0b' : '#4ade80',
-                    fontSize: 11,
-                    fontWeight: 600,
+          <div style={{
+            flex: 1, minWidth: 280,
+            padding: '1.5rem', borderRadius: '0.75rem',
+            background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.06)',
+          }}>
+            <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '0.9rem', marginBottom: '1rem' }}>
+              Interactive Sandbox
+            </h3>
+            <p style={{ color: '#94a3b8', fontSize: '0.75rem', marginBottom: '1.5rem' }}>
+              Test how big purchases or cash-outs affect your long-term growth by overriding your baseline goals here.
+            </p>
+            
+            {customGoals.map((g, i) => (
+              <div key={i} style={{ marginBottom: '1.5rem', paddingBottom: '1.5rem', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                <input 
+                  type="text" 
+                  value={g.name} 
+                  onChange={e => {
+                    const ng = [...customGoals];
+                    ng[i].name = e.target.value;
+                    setCustomGoals(ng);
+                  }}
+                  style={{
+                    width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                    color: '#f1f5f9', padding: '0.4rem', borderRadius: '0.3rem', fontSize: '0.8rem', marginBottom: '0.8rem',
                   }}
                 />
-              ))}
-
-              <Legend
-                verticalAlign="top" align="right" height={36}
-                wrapperStyle={{ fontSize: '0.75rem', color: '#94a3b8' }}
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-
-          {/* Cash-out events */}
-          {simulation.cash_out_events?.length > 0 && (
-            <div style={{ marginTop: '1rem' }}>
-              <p style={{ color: '#64748b', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.5rem' }}>
-                CASH-OUT EVENTS
-              </p>
-              {simulation.cash_out_events.map((ev, i) => (
-                <div key={i} style={{
-                  display: 'flex', alignItems: 'center', gap: '0.75rem',
-                  padding: '0.5rem 0.75rem', borderRadius: '0.4rem',
-                  background: 'rgba(245,158,11,0.08)',
-                  border: '1px solid rgba(245,158,11,0.15)',
-                  marginBottom: '0.35rem',
-                }}>
-                  <span style={{ color: '#f59e0b', fontSize: '0.85rem' }}>⚡</span>
-                  <span style={{ color: '#e2e8f0', fontSize: '0.8rem', flex: 1 }}>
-                    <strong>Year {ev.year}</strong> — {ev.goal_name}: withdrew {fmt(ev.amount)}
-                  </span>
-                  <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
-                    Remaining: {fmt(ev.remaining_expected)}
-                  </span>
+                
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
+                  <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Amount: {fmt(g.amount)}</label>
                 </div>
-              ))}
-            </div>
-          )}
+                <input 
+                  type="range" min="0" max="250000" step="5000"
+                  value={g.amount}
+                  onChange={e => {
+                    const ng = [...customGoals];
+                    ng[i].amount = Number(e.target.value);
+                    setCustomGoals(ng);
+                  }}
+                  style={{ width: '100%', cursor: 'pointer', marginBottom: '0.8rem' }}
+                />
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
+                  <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Year: {g.years}</label>
+                </div>
+                <input 
+                  type="range" min="1" max="30" step="1"
+                  value={g.years}
+                  onChange={e => {
+                    const ng = [...customGoals];
+                    ng[i].years = Number(e.target.value);
+                    setCustomGoals(ng);
+                  }}
+                  style={{ width: '100%', cursor: 'pointer' }}
+                />
+              </div>
+            ))}
+
+            {simulation.cash_out_events?.length > 0 && (
+              <div style={{ marginTop: '1rem', background: 'rgba(245,158,11,0.08)', padding: '0.75rem', borderRadius: '0.4rem', border: '1px solid rgba(245,158,11,0.15)' }}>
+                <p style={{ color: '#f59e0b', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                  CASH-OUT EVENT LOG
+                </p>
+                {simulation.cash_out_events.map((ev, i) => (
+                  <p key={i} style={{ color: '#e2e8f0', fontSize: '0.75rem', margin: '0.2rem 0' }}>
+                    <strong>Yr {ev.year}</strong>: {ev.goal_name} (-{fmt(ev.amount)})
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -440,13 +592,14 @@ export default function DashboardMain() {
                   key={ticker}
                   style={{
                     padding: '1rem 1.25rem', borderRadius: '0.75rem',
-                    background: 'rgba(15, 23, 42, 0.6)',
+                    background: 'rgba(15, 23, 42, 0.6)', cursor: 'pointer',
                     backdropFilter: 'blur(12px)',
                     border: '1px solid rgba(255,255,255,0.06)',
                     transition: 'border-color 0.2s, transform 0.2s',
                   }}
+                  onClick={() => setEtfModal(ticker)}
                   onMouseOver={(e) => {
-                    e.currentTarget.style.borderColor = 'rgba(59,130,246,0.3)';
+                    e.currentTarget.style.borderColor = 'rgba(139,92,246,0.3)';
                     e.currentTarget.style.transform = 'translateY(-2px)';
                   }}
                   onMouseOut={(e) => {
@@ -480,6 +633,8 @@ export default function DashboardMain() {
       ) : (
         <p style={{ color: '#64748b' }}>Select a portfolio from the sidebar to view details.</p>
       )}
+      
+      {etfModal && <EtfModal ticker={etfModal} onClose={() => setEtfModal(null)} />}
     </div>
   );
 }

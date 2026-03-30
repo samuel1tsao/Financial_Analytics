@@ -81,6 +81,7 @@ def run_simulation(
     portfolio_id: int | None = None,
     initial_investment: float = 100000,
     projection_years: int = 30,
+    custom_goals_json: str | None = None,
 ):
     """
     Run a variance-covariance simulation on the specified (or current) portfolio.
@@ -111,25 +112,37 @@ def run_simulation(
 
     weights = json.loads(portfolio.weight_json)
 
-    # 2. Fetch goals from the latest questionnaire for cash-out events
-    q = (
-        db.query(models.Questionnaire)
-        .filter(models.Questionnaire.user_id == current_user.id)
-        .order_by(models.Questionnaire.created_at.desc())
-        .first()
-    )
-
+    # 2. Extract goals for cash-out events
     goals = []
-    if q:
-        answers = json.loads(q.raw_json)
-        raw_goals = answers.get("goals", [])
-        for g in raw_goals:
-            goals.append({
-                "name": g.get("name", "Goal"),
-                "amount": g.get("amount", 0),
-                "years": g.get("years", 10),
-                "is_short_term": g.get("years", 10) <= 5,
-            })
+    if custom_goals_json:
+        try:
+            raw_custom = json.loads(custom_goals_json)
+            for g in raw_custom:
+                goals.append({
+                    "name": g.get("name", "Goal"),
+                    "amount": g.get("amount", 0),
+                    "years": g.get("years", 10),
+                    "is_short_term": g.get("years", 10) <= 5,
+                })
+        except:
+            pass
+    else:
+        q = (
+            db.query(models.Questionnaire)
+            .filter(models.Questionnaire.user_id == current_user.id)
+            .order_by(models.Questionnaire.created_at.desc())
+            .first()
+        )
+        if q:
+            answers = json.loads(q.raw_json)
+            raw_goals = answers.get("goals", [])
+            for g in raw_goals:
+                goals.append({
+                    "name": g.get("name", "Goal"),
+                    "amount": g.get("amount", 0),
+                    "years": g.get("years", 10),
+                    "is_short_term": g.get("years", 10) <= 5,
+                })
 
     # 3. Run simulation
     sim = simulate_portfolio(

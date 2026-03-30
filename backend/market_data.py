@@ -8,12 +8,13 @@ Serves aggregated stats (returns, volatilities, correlation matrix) from DB.
 import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+import yfinance as yf
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from sqlalchemy.orm import Session
 from database import SessionLocal
 from market_models import StockPrice, TickerFeature
+from congress_models import CongressTrade
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,11 @@ def sync_market_data() -> dict:
     staleness_threshold = today - timedelta(days=3)
 
     try:
-        for ticker in ALL_TICKERS:
+        # Dynamically append any custom tickers traded by congress members
+        db_tickers = {t[0] for t in db.query(CongressTrade.ticker).distinct().all()}
+        all_sync_tickers = list(set(ALL_TICKERS).union(db_tickers))
+
+        for ticker in all_sync_tickers:
             latest = _get_latest_date_in_db(db, ticker)
 
             if latest and latest >= staleness_threshold:
@@ -218,9 +223,13 @@ def get_market_data() -> MarketData:
     db = SessionLocal()
     try:
         result = MarketData()
+        
+        # Dynamically append tracked tickers
+        db_tickers = {t[0] for t in db.query(CongressTrade.ticker).distinct().all()}
+        all_stat_tickers = list(set(ALL_TICKERS).union(db_tickers))
 
         # ─── Get latest feature for each ticker ──────────────────────────────
-        for ticker in ALL_TICKERS:
+        for ticker in all_stat_tickers:
             latest_feature = (
                 db.query(TickerFeature)
                 .filter(TickerFeature.ticker == ticker)

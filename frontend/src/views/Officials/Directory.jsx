@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import useStore from '../../store';
 import api from '../../api/client';
 
@@ -7,8 +8,28 @@ const fmtMoney = (val) => {
   if (val >= 1_000_000_000) return `$${(val / 1_000_000_000).toFixed(1)}B`;
   if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(1)}M`;
   if (val >= 1_000) return `$${(val / 1_000).toFixed(0)}K`;
-  return `$${val.toFixed(0)}`;
+  return `$${val?.toFixed(0) || 0}`;
 };
+
+function EquityTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  return (
+    <div style={{
+      background: 'rgba(15,23,42,0.95)', backdropFilter: 'blur(12px)',
+      border: '1px solid rgba(255,255,255,0.1)', borderRadius: '0.6rem',
+      padding: '0.75rem 1rem', boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+    }}>
+      <p style={{ color: '#94a3b8', fontSize: '0.75rem', marginBottom: '0.4rem' }}>
+        {d.date}
+      </p>
+      <p style={{ color: '#4ade80', fontWeight: 600, fontSize: '0.9rem' }}>
+        Value: {fmtMoney(d.value)}
+      </p>
+    </div>
+  );
+}
 
 const partyColor = {
   Democrat: '#3b82f6',
@@ -184,6 +205,36 @@ function OfficialCard({ official, onMimic, onFavorite, isFavorited }) {
           borderTop: '1px solid rgba(255,255,255,0.04)',
           animation: 'fadeIn 0.2s ease',
         }}>
+          <p style={{ color: '#475569', fontSize: '0.6rem', fontWeight: 600, marginBottom: '0.4rem', letterSpacing: '0.06em' }}>
+            HISTORICAL PERFORMANCE
+          </p>
+          {official.historical_equity && official.historical_equity.length > 0 ? (
+            <div style={{ height: 180, width: '100%', marginBottom: '1.5rem' }}>
+              <ResponsiveContainer>
+                <AreaChart data={official.historical_equity} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="gradPerf" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#4ade80" stopOpacity={0.4} />
+                      <stop offset="100%" stopColor="#4ade80" stopOpacity={0.0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
+                  <XAxis dataKey="date" stroke="#475569" fontSize={10} tickLine={false} tickFormatter={(tick) => {
+                    const d = new Date(tick);
+                    return `${d.getMonth() + 1}/${d.getFullYear().toString().slice(-2)}`;
+                  }} />
+                  <YAxis stroke="#475569" fontSize={10} tickLine={false} tickFormatter={fmtMoney} width={50} />
+                  <Tooltip content={<EquityTooltip />} />
+                  <Area type="monotone" dataKey="value" stroke="#4ade80" strokeWidth={2} fill="url(#gradPerf)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <div style={{ padding: '1.5rem 0', textAlign: 'center', color: '#64748b', fontSize: '0.8rem', fontStyle: 'italic', marginBottom: '1rem' }}>
+              Not enough historical data to plot equity curve.
+            </div>
+          )}
+
           <p style={{ color: '#475569', fontSize: '0.6rem', fontWeight: 600, marginBottom: '0.4rem', letterSpacing: '0.06em' }}>
             RECENT TRADES
           </p>

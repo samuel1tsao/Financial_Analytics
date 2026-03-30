@@ -16,13 +16,16 @@ Database-backed market data service:
 - Exposes `get_market_data()` function that reads from DB (fast, no network call)
 - Falls back to existing hardcoded values if a ticker has no DB data (first run with no internet, etc.)
 
-### Component 2: Congressional Trading Data (AI-Assisted Scrape → CSV → User Verification)
-Instead of auto-populating the database from fragile scrapers, we use an **AI-assisted pipeline** that produces a CSV file for human review. The user verifies accuracy, then pushes the approved data into the system.
-- **House & Senate Scraper:** Navigates the search forms and downloads PTR results, outputting to a CSV file (`data/congress_trades_raw.csv`).
-- **CSV Loader Toolkit:** Reads a user-verified CSV and upserts records into the Database.
+### Component 2: Congressional Data (Direct DB Scraping & Profile Rebuilding)
+Instead of using rate-limited APIs or intermediate CSV files, we are implementing a robust BeautifulSoup scraper targeting `capitoltrades.com`.
+- **`scrape_capitol_trades.py`**: A CLI scraper that pulls trades. It features two modes:
+  - *Normal Sync*: Queries the local database for the newest `transaction_date` and stops scraping immediately when it detects older data. This saves bandwidth and acts responsibly towards the host. It includes a `time.sleep(2)` polite delay.
+  - *Full Sync*: Scrapes to a set depth (e.g. `pages=10`) and selectively replaces stale data in our database within that date range.
+- **Enhanced Demographics Extraction**: The scraper actively parses HTML classes (e.g. `q-field party party--republican`) to correctly capture Politician Party, Chamber, and State during the scrape.
+- **`profile_builder.py`**: A new automated routine (called on startup, via API, and on intervals) that iterates over the raw trades and builds daily Historical Equity Curves. It calculates net shares over time and stores `CongressPortfolioHistory` so the UI can draw progression charts.
 
 ### Component 3: Market Data API Endpoint
-- Added `GET /api/v1/market/stats` to return current market data from DB (returns, volatilities, correlation matrix) for the asset universe.
+- Updated `GET /api/v1/market/stats` to an endpoint that supports historical ETF charts: `GET /api/v1/market/history?ticker=VOO&range=1y`. This returns actual closing price and return vectors for UI visualizations, with ending % change.
 
 ### Component 4: Frontend Updates
 - Updated the Officials Directory to support chamber filters (House/Senate), sorting options, and displaying a "Data Source" badge (Live DB vs. Curated fallback).
@@ -53,8 +56,8 @@ Instead of auto-populating the database from fragile scrapers, we use an **AI-as
 - [x] Modify `Directory.jsx` — chamber/party filters, data source indicator
 
 ### Remaining / Verification Left To Do
-- [ ] Complete Testing: Backend startup DB population and market stats endpoints.
-- [ ] Complete Testing: Questionnaire → dashboard flow works with real data.
-- [ ] Scraper Verification: Test congressional scraper outputs valid CSV.
-- [ ] Scraper Verification: Test CSV loader logic against database.
-- [ ] Update root `README.md` with new setup/data instructions (yfinance sync and CSV load process).
+- [x] Complete Testing: Backend startup DB population and market stats endpoints.
+- [x] Complete Testing: Questionnaire → dashboard flow works with real data.
+- [x] Scraper Verification: Test congressional scraper outputs valid CSV/DB entries.
+- [x] Scraper Verification: Test CSV loader/Profile builder logic against database.
+- [x] Update root `README.md` with new setup/data instructions (yfinance sync and CSV load process).

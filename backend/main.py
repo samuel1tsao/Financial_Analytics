@@ -50,7 +50,14 @@ def on_startup():
         summary = sync_market_data()
         logger.info(f"Market data sync: {summary}")
     except Exception as e:
-        logger.error(f"Market data sync failed (will use fallback values): {e}")
+        logger.error(f"Market data sync failed: {e}")
+
+    # Automatically rebuild congress profile equity histories on startup
+    try:
+        from profile_builder import build_all_profiles
+        build_all_profiles()
+    except Exception as e:
+        logger.error(f"Congress profile build failed: {e}")
 
 
 @app.get("/")

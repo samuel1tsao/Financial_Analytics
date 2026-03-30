@@ -180,42 +180,6 @@ FALLBACK_OFFICIALS = [
 ]
 
 
-def _build_portfolio_from_trades(trades: list[CongressTrade]) -> dict:
-    """
-    Aggregate trades into approximate portfolio weights.
-    Buys increase a ticker's weight, sells decrease it.
-    Uses the midpoint of the reported amount range.
-    """
-    holdings = defaultdict(float)
-
-    for trade in trades:
-        if not trade.ticker:
-            continue
-
-        # Use midpoint of amount range, or 0 if unknown
-        amount = 0.0
-        if trade.amount_low and trade.amount_high:
-            amount = (trade.amount_low + trade.amount_high) / 2
-        elif trade.amount_low:
-            amount = trade.amount_low
-        elif trade.amount_high:
-            amount = trade.amount_high
-
-        if trade.transaction_type in ("purchase", "buy"):
-            holdings[trade.ticker] += amount
-        elif trade.transaction_type in ("sale", "sell", "sale_full", "sale_partial"):
-            holdings[trade.ticker] -= amount
-
-    # Remove negative/zero holdings and normalize to weights
-    holdings = {k: v for k, v in holdings.items() if v > 0}
-
-    total = sum(holdings.values())
-    if total > 0:
-        weights = {k: round(v / total, 4) for k, v in holdings.items()}
-    else:
-        weights = {}
-
-    return weights
 
 
 def _build_top_trades(trades: list[CongressTrade], limit: int = 5) -> list[dict]:
@@ -239,15 +203,13 @@ def _build_top_trades(trades: list[CongressTrade], limit: int = 5) -> list[dict]
 
 def _member_to_official(member: CongressMember) -> dict:
     """Convert a CongressMember + trades into the official API response format."""
-    portfolio = _build_portfolio_from_trades(member.trades)
     top_trades = _build_top_trades(member.trades)
 
-    # Estimate total value from trade amounts
-    total_value = sum(
-        ((t.amount_low or 0) + (t.amount_high or 0)) / 2
-        for t in member.trades
-        if t.transaction_type in ("purchase", "buy")
-    )
+    # Transform historical equity into a simple time-series list for charting
+    history = [
+        {"date": str(h.date), "value": h.total_value}
+        for h in member.portfolio_history
+    ] if member.portfolio_history else []
 
     return {
         "id": str(member.id),
@@ -255,11 +217,12 @@ def _member_to_official(member: CongressMember) -> dict:
         "title": f"U.S. {'Senator' if member.chamber == 'senate' else 'Representative'}",
         "party": member.party or "Unknown",
         "state": member.state or "Unknown",
-        "total_value": round(total_value),
-        "portfolio": portfolio,
+        "total_value": round(member.total_value),
+        "portfolio": member.portfolio_weights or {},
         "top_trades": top_trades,
-        "performance_1y": None,  # Requires StockPrice data to compute
-        "performance_5y": None,
+        "historical_equity": history,
+        "performance_1y": member.performance_1y,
+        "performance_5y": member.performance_5y,
         "data_source": "database",
         "last_updated": str(member.last_updated) if member.last_updated else None,
     }

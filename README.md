@@ -5,9 +5,9 @@ A full-stack web application that generates personalized ETF/stock portfolio rec
 ## Features
 
 - **Investment Questionnaire** — 5-step guided flow capturing financial goals, risk tolerance (1–100 slider), FOMO tendency (situational quiz), hard allocation constraints, and existing holdings.
-- **Portfolio Recommendation Engine** — Encodes questionnaire answers into a weighted ETF allocation across a 12-asset universe (8 equity, 4 bond) using risk-based equity/bond split, FOMO-adjusted speculative tilt, and short-term goal safeguards.
-- **Growth Projection Simulator** — Runs a variance-covariance simulation on any saved portfolio, producing a 30-year expected path with ±2σ confidence bands and cash-out event modeling for short-term goals.
-- **Public Officials Tracker** — Browse portfolios of 8 tracked U.S. officials (Pelosi, Tuberville, Ossoff, etc.) with holdings, recent trades, and 1yr/5yr performance. Users can copy ("mimic") any official's portfolio as a saved profile.
+- **Portfolio Recommendation Engine** — Encodes questionnaire answers into a weighted ETF allocation across a 12-asset universe (8 equity, 4 bond) using risk-based equity/bond split, FOMO-adjusted speculative tilt, and short-term goal safeguards. Driven by actual market data downloaded via `yfinance`.
+- **Growth Projection Simulator** — Runs a variance-covariance Monte Carlo simulation on any saved portfolio, producing a 30-year expected path with ±2σ confidence bands and cash-out event modeling for short-term goals. *Interactive sandbox mode available on the main dashboard!*
+- **Public Officials Tracker** — Browse portfolios of tracked U.S. officials pulling directly from a `capitoltrades.com` data pipeline. See their live stock holdings, timeline of trades, and Recharts historical performance progression mapped against true stock market data.
 - **User Accounts & Auth** — Email/password registration with JWT-based authentication (bcrypt hashing, 24hr token expiry).
 - **Portfolio Management** — Save multiple named portfolio profiles, mark one as "current", bulk delete.
 
@@ -27,14 +27,20 @@ Financial_Analytics/
 ├── backend/
 │   ├── main.py                  # FastAPI entrypoint (uvicorn, CORS, router setup)
 │   ├── database.py              # SQLAlchemy engine + session (SQLite)
-│   ├── models.py                # ORM models: User, Questionnaire, Portfolio, Favorite
+│   ├── models.py                # Core App ORM models: User, Questionnaire, Portfolio, Favorite
+│   ├── congress_models.py       # DB Models: CongressMember, CongressTrade, CongressPortfolioHistory
+│   ├── market_models.py         # DB Models: StockPrice, TickerFeature
 │   ├── schemas.py               # Pydantic request/response schemas
 │   ├── auth.py                  # Password hashing, JWT creation, get_current_user dependency
 │   ├── vector_encoder.py        # Questionnaire → portfolio weights + simulation engine
-│   ├── officials_data.py        # Static dataset of public officials' portfolios
+│   ├── market_data.py           # yFinance background downloader + Covariance matrix compute
+│   ├── officials_service.py     # Aggregates Congress trades + acts as API mediator
+│   ├── scrape_capitol_trades.py # The CLI Web Scraper for tracking public officials
+│   ├── profile_builder.py       # Historical portfolio performance calculator script
 │   ├── requirements.txt
 │   └── api/
 │       ├── auth_routes.py       # POST /register, /login
+│       ├── market_routes.py     # GET /market/stats, /market/history
 │       ├── user_routes.py       # GET /user/data, POST /user/favorites
 │       ├── questionnaire_routes.py  # POST /questionnaire/save, GET /questionnaire/current
 │       ├── portfolio_routes.py  # POST /profile/save, DELETE /profile
@@ -105,13 +111,23 @@ npm install
 npm run dev
 ```
 
-### 4. Use the app
+### 4. Data Ingestion (Optional)
+On startup, the backend will automatically sync foundational Market Data from Yahoo Finance and run a cached portfolio build. 
+However, to pull down **real-time Congressional trades**, you should run the web scraper manually (we advise running this on a weekly CRON job to avoid getting blacklisted by CapitolTrades):
+
+```bash
+cd backend
+python scrape_capitol_trades.py --full --pages 10
+python profile_builder.py
+```
+
+### 5. Use the app
 
 1. Open **http://localhost:5173** in your browser.
 2. Register a new account.
 3. Complete the investment questionnaire — a portfolio recommendation is generated automatically on submission.
-4. View your portfolio dashboard with growth projection charts and allocation breakdown.
-5. Browse the **Officials** tab in the sidebar to explore public officials' portfolios and optionally mimic them.
+4. View your portfolio dashboard to interact with the **Dynamic Interactive Sandbox** growth projection charts. You can click on the underlying allocation ETFs to view their historical progression.
+5. Browse the **Officials** tab in the sidebar to explore public officials' live portfolios, interactive tracking charts, and optionally mimic them.
 
 ## API Endpoints
 
@@ -137,4 +153,4 @@ All routes are prefixed with `/api/v1`.
 
 - The backend uses a hardcoded JWT secret (`dev-secret-key-change-in-production`). For production, move this to an environment variable.
 - CORS is configured to allow `localhost:5173` and `localhost:3000`.
-- The officials dataset is static/curated. In production this would pull from SEC EDGAR / Senate Financial Disclosures.
+- Fast API integrates with `yfinance` to automatically backfill historical stock data on boot, which may delay server boot by 15-30 seconds.

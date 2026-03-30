@@ -11,3 +11,4 @@ python-multipart
 python-jose[cryptography]
 beautifulsoup4
 requests
+email-validator>=2.1.1
