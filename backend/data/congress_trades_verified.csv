@@ -1,0 +1,11 @@
+member_name,chamber,party,state,ticker,transaction_type,amount_low,amount_high,transaction_date,disclosure_date,source_url
+Nancy Pelosi,house,Democrat,California,NVDA,buy,1000000,5000000,2024-06-20,2024-06-25,https://clerk.house.gov
+Nancy Pelosi,house,Democrat,California,AAPL,buy,500000,1000000,2024-03-15,2024-03-18,https://clerk.house.gov
+Tommy Tuberville,senate,Republican,Alabama,LMT,buy,100000,250000,2024-07-10,2024-07-12,https://efdsearch.senate.gov
+Tommy Tuberville,senate,Republican,Alabama,DVN,sell,50000,100000,2024-05-22,2024-05-25,https://efdsearch.senate.gov
+Jon Ossoff,senate,Democrat,Georgia,MSFT,buy,15000,50000,2024-04-10,2024-04-12,https://efdsearch.senate.gov
+Rick Scott,senate,Republican,Florida,XLE,buy,5000000,10000000,2024-05-15,2024-05-18,https://efdsearch.senate.gov
+Dan Crenshaw,house,Republican,Texas,META,buy,15000,50000,2024-02-28,2024-03-02,https://clerk.house.gov
+Elizabeth Warren,senate,Democrat,Massachusetts,VTI,sell,100000,250000,2024-03-01,2024-03-05,https://efdsearch.senate.gov
+Ted Cruz,senate,Republican,Texas,XOM,buy,50000,100000,2024-04-22,2024-04-25,https://efdsearch.senate.gov
+Chuck Schumer,senate,Democrat,New York,VOO,buy,50000,100000,2024-06-15,2024-06-18,https://efdsearch.senate.gov

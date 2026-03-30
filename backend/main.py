@@ -52,7 +52,15 @@ def on_startup():
     except Exception as e:
         logger.error(f"Market data sync failed: {e}")
 
-    # Automatically rebuild congress profile equity histories on startup
+    # Sync congressional trades from Capitol Trades (polite: 2s delay between pages)
+    try:
+        from scrape_capitol_trades import scrape_capitol_trades
+        new_trades = scrape_capitol_trades(pages=3)
+        logger.info(f"Capitol Trades sync: {new_trades} new trades added")
+    except Exception as e:
+        logger.error(f"Capitol Trades sync failed: {e}")
+
+    # Rebuild congress profile equity histories (must run AFTER trade data is loaded)
     try:
         from profile_builder import build_all_profiles
         build_all_profiles()

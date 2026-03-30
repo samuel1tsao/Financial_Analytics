@@ -23,3 +23,5 @@ build/
 .vscode/
 .idea/
 backend/*.db
+
+*.md

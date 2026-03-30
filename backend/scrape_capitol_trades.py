@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import logging
 import argparse
 import requests
 from bs4 import BeautifulSoup
@@ -10,6 +11,8 @@ from dateutil import parser as date_parser
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from database import SessionLocal
 from congress_models import CongressMember, CongressTrade
+
+logger = logging.getLogger(__name__)
 
 
 def get_or_create_member(db, name: str, chamber: str, party: str, state: str):
@@ -94,7 +97,7 @@ def scrape_capitol_trades(pages=5, full_sync=False):
         if stop_scraping:
             break
             
-        print(f"📡 Scraping page {p}...", end=" ")
+        logger.info(f"Scraping page {p}...")
         try:
             response = requests.get(base_url.format(p), headers=headers, timeout=10)
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -145,7 +148,7 @@ def scrape_capitol_trades(pages=5, full_sync=False):
                 # Normal Sync Stop Condition
                 if not full_sync and latest_trade_date_in_db:
                     if traded_date <= latest_trade_date_in_db:
-                        print(f"🛑 Reached known date {traded_date}. Stopping sync.")
+                        logger.info(f"Reached known date {traded_date}. Stopping sync.")
                         stop_scraping = True
                         break
 
@@ -189,15 +192,15 @@ def scrape_capitol_trades(pages=5, full_sync=False):
 
             db.commit()
             total_new_trades += page_trades_added
-            print(f"✅ Found {page_trades_added} new trades.")
+            logger.info(f"Found {page_trades_added} new trades on page {p}.")
             
             # If a page returns 0 new trades and we're not stopping early, it means page was blank
             if page_trades_added == 0 and not stop_scraping and len(rows) <= 1:
-                print("🛑 No more data on website. Stopping.")
+                logger.info("No more data on website. Stopping.")
                 break
                 
         except Exception as e:
-            print(f"❌ Error on page {p}: {e}")
+            logger.error(f"Error on page {p}: {e}")
         
         # POLITE DELAY to prevent overwhelming capitoltrades.com
         time.sleep(2)
@@ -207,14 +210,12 @@ def scrape_capitol_trades(pages=5, full_sync=False):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     parser = argparse.ArgumentParser(description="Politician scraper from CapitolTrades.")
     parser.add_argument("--pages", type=int, default=5, help="Number of pages to scrape.")
     parser.add_argument("--full", action="store_true", help="Full sync mode (ignore last DB date).")
     args = parser.parse_args()
 
-    print("\n" + "="*50)
-    print("🏛️ Scraping CapitolTrades...")
-    print("="*50)
-    
+    logger.info("Scraping CapitolTrades...")
     total = scrape_capitol_trades(pages=args.pages, full_sync=args.full)
-    print(f"\n🎉 Sync complete! Total new trades added: {total}")
+    logger.info(f"Sync complete! Total new trades added: {total}")

@@ -6,6 +6,7 @@ Computes rolling 1-year returns/volatilities into TickerFeature table.
 Serves aggregated stats (returns, volatilities, correlation matrix) from DB.
 """
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 import yfinance as yf
@@ -23,8 +24,8 @@ EQUITY_TICKERS = ["VOO", "QQQ", "VTI", "VXUS", "VGT", "ARKK", "VNQ", "VWO"]
 BOND_TICKERS = ["BND", "SGOV", "TLT", "TIPS"]
 ALL_TICKERS = EQUITY_TICKERS + BOND_TICKERS
 
-# Minimum years of history to fetch on first sync
-MIN_HISTORY_YEARS = 15
+# Minimum years of history to fetch on first sync (50 years effectively fetches maximum available history)
+MIN_HISTORY_YEARS = 50
 
 # Trading days in a year (for annualization)
 TRADING_DAYS = 252
@@ -61,6 +62,9 @@ def _fetch_and_store_prices(db: Session, ticker: str, start_date: date, end_date
         logger.info(f"Fetching {ticker} from {start_str} to {end_str}")
 
         data = yf.download(ticker, start=start_str, end=end_str, progress=False, auto_adjust=True)
+        
+        # Polite scraping etiquette to avoid yfinance rate limits
+        time.sleep(1.0)
 
         if data.empty:
             logger.warning(f"No data returned for {ticker}")
