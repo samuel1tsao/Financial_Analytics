@@ -44,13 +44,13 @@ def on_startup():
     init_db()
     logger.info("Database tables initialized")
 
-    # Sync market data from yfinance (incremental — only fetches missing days)
+    # Dispatch Global Automated Miner silently into the background
     try:
-        from market_data import sync_market_data
-        summary = sync_market_data()
-        logger.info(f"Market data sync: {summary}")
+        from sync_service import run_global_sync_background
+        import asyncio
+        asyncio.create_task(run_global_sync_background())
     except Exception as e:
-        logger.error(f"Market data sync failed: {e}")
+        logger.error(f"Failed to submit background sync service: {e}")
 
     # Sync congressional trades from Capitol Trades (polite: 2s delay between pages)
     try:

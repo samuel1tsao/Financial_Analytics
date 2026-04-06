@@ -7,6 +7,7 @@ import LeftSidebar from './components/LeftSidebar';
 import DashboardMain from './views/Dashboard/Main';
 import QuestionnaireStepper from './views/Questionnaire/Stepper';
 import Directory from './views/Officials/Directory';
+import MarketsPage from './views/Markets/Browse';
 
 function ProtectedLayout() {
   const { fetchUserData, fetchQuestionnaire, activeView } = useStore();
@@ -24,6 +25,7 @@ function ProtectedLayout() {
         <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
           {activeView === 'dashboard' && <DashboardMain />}
           {activeView === 'officials' && <Directory />}
+          {activeView === 'markets' && <MarketsPage />}
         </main>
       </div>
     </div>

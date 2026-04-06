@@ -9,6 +9,7 @@ A full-stack web application that generates personalized ETF/stock portfolio rec
 - **Growth Projection Simulator** — Runs a variance-covariance simulation on any saved portfolio, producing a 30-year expected path with ±2σ confidence bands and cash-out event modeling for short-term goals.
 - **Public Officials Tracker** — Browse portfolios of 8 tracked U.S. officials (Pelosi, Tuberville, Ossoff, etc.) with holdings, recent trades, and 1yr/5yr performance. Users can copy ("mimic") any official's portfolio as a saved profile.
 - **User Accounts & Auth** — Email/password registration with JWT-based authentication (bcrypt hashing, 24hr token expiry).
+- **Data Science Research Environment** — Standalone Jupyter Notebooks (`research_modeling.ipynb` and Colab version) built for quants. Dynamically scrapes the full S&P 1500 universe and uses pure Pandas vectorization to rapidly compute historical correlations, technical indicators (MACD, RSI), and Options Greeks natively skipping the web backend.
 - **Portfolio Management** — Save multiple named portfolio profiles, mark one as "current", bulk delete.
 
 ## Tech Stack

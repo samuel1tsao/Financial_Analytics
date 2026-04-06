@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import useStore from '../../store';
 import api from '../../api/client';
+import TickerInput from '../../components/TickerInput';
 
 const FOMO_QUESTIONS = [
   {
@@ -54,9 +55,14 @@ const INITIAL_STATE = {
   current_portfolio: [{ ticker: '', pct: '' }],
 };
 
+// validity maps: { "rowKey": true | false | null }
+// null = not yet checked / empty
+const INITIAL_VALIDITY = { hard_constraints: {}, current_portfolio: {} };
+
 export default function QuestionnaireStepper() {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState(INITIAL_STATE);
+  const [validity, setValidity] = useState(INITIAL_VALIDITY);
   const [saving, setSaving] = useState(false);
   const navigate = useNavigate();
   const { fetchQuestionnaire, fetchUserData } = useStore();
@@ -100,14 +106,38 @@ export default function QuestionnaireStepper() {
     next[idx] = { ...next[idx], [field]: value };
     setForm({ ...form, hard_constraints: next });
   };
-  const addConstraint = () => setForm({ ...form, hard_constraints: [...form.hard_constraints, { ticker: '', pct: '' }] });
+  const addConstraint = () => {
+    setForm({ ...form, hard_constraints: [...form.hard_constraints, { ticker: '', pct: '' }] });
+    // new row starts as null validity
+    setValidity(v => ({ ...v, hard_constraints: { ...v.hard_constraints, [form.hard_constraints.length]: null } }));
+  };
 
   const updatePortfolio = (idx, field, value) => {
     const next = [...form.current_portfolio];
     next[idx] = { ...next[idx], [field]: value };
     setForm({ ...form, current_portfolio: next });
   };
-  const addPortfolioRow = () => setForm({ ...form, current_portfolio: [...form.current_portfolio, { ticker: '', pct: '' }] });
+  const addPortfolioRow = () => {
+    setForm({ ...form, current_portfolio: [...form.current_portfolio, { ticker: '', pct: '' }] });
+    setValidity(v => ({ ...v, current_portfolio: { ...v.current_portfolio, [form.current_portfolio.length]: null } }));
+  };
+
+  // Validity helpers
+  const setConstraintValid = (idx, ticker, isValid) => {
+    setValidity(v => ({ ...v, hard_constraints: { ...v.hard_constraints, [idx]: isValid } }));
+  };
+  const setPortfolioValid = (idx, ticker, isValid) => {
+    setValidity(v => ({ ...v, current_portfolio: { ...v.current_portfolio, [idx]: isValid } }));
+  };
+
+  // Returns true if no ticker rows have is_valid === false (null / undefined = not yet checked = ok to pass)
+  const constraintsOk = form.hard_constraints.every((c, i) =>
+    !c.ticker || validity.hard_constraints[i] !== false
+  );
+  const portfolioOk = form.current_portfolio.every((c, i) =>
+    !c.ticker || validity.current_portfolio[i] !== false
+  );
+  const stepOk = step === 3 ? constraintsOk : step === 4 ? portfolioOk : true;
 
   const setFomoAnswer = (qIdx, score) => {
     const next = [...form.fomo_answers];
@@ -348,11 +378,16 @@ export default function QuestionnaireStepper() {
               Want to guarantee a position in specific companies? These will be carved out before optimization.
             </p>
             {form.hard_constraints.map((c, i) => (
-              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.5rem' }}>
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.75rem' }}>
                 <div>
                   <label style={labelStyle}>Ticker</label>
-                  <input style={inputStyle} value={c.ticker} placeholder="AAPL"
-                    onChange={(e) => updateConstraint(i, 'ticker', e.target.value)} />
+                  <TickerInput
+                    value={c.ticker}
+                    onChange={(v) => updateConstraint(i, 'ticker', v)}
+                    onValidChange={(t, isValid) => setConstraintValid(i, t, isValid)}
+                    placeholder="AAPL"
+                    strict={true}
+                  />
                 </div>
                 <div>
                   <label style={labelStyle}>Allocation %</label>
@@ -361,6 +396,11 @@ export default function QuestionnaireStepper() {
                 </div>
               </div>
             ))}
+            {!constraintsOk && (
+              <p style={{ color: '#f87171', fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                ✗ One or more tickers are invalid. Please fix them before continuing.
+              </p>
+            )}
             <button onClick={addConstraint} style={{ ...btnSecondary, fontSize: '0.8rem', marginTop: '0.5rem' }}>
               + Add Ticker
             </button>
@@ -377,11 +417,16 @@ export default function QuestionnaireStepper() {
               If you already hold investments, enter them here so we can compare and optimize.
             </p>
             {form.current_portfolio.map((c, i) => (
-              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.5rem' }}>
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.75rem' }}>
                 <div>
                   <label style={labelStyle}>Ticker</label>
-                  <input style={inputStyle} value={c.ticker} placeholder="VOO"
-                    onChange={(e) => updatePortfolio(i, 'ticker', e.target.value)} />
+                  <TickerInput
+                    value={c.ticker}
+                    onChange={(v) => updatePortfolio(i, 'ticker', v)}
+                    onValidChange={(t, isValid) => setPortfolioValid(i, t, isValid)}
+                    placeholder="VOO"
+                    strict={true}
+                  />
                 </div>
                 <div>
                   <label style={labelStyle}>Allocation %</label>
@@ -390,6 +435,11 @@ export default function QuestionnaireStepper() {
                 </div>
               </div>
             ))}
+            {!portfolioOk && (
+              <p style={{ color: '#f87171', fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                ✗ One or more tickers are invalid. Please fix or remove them.
+              </p>
+            )}
             <button onClick={addPortfolioRow} style={{ ...btnSecondary, fontSize: '0.8rem', marginTop: '0.5rem' }}>
               + Add Holding
             </button>
@@ -443,12 +493,17 @@ export default function QuestionnaireStepper() {
           </button>
 
           {step < totalSteps - 1 ? (
-            <button onClick={() => setStep(step + 1)} style={btnPrimary}>
+            <button
+              onClick={() => setStep(step + 1)}
+              disabled={!stepOk}
+              style={{ ...btnPrimary, opacity: stepOk ? 1 : 0.45, cursor: stepOk ? 'pointer' : 'not-allowed' }}
+            >
               Next
             </button>
           ) : (
-            <button onClick={handleSave} disabled={saving} style={{
-              ...btnPrimary, opacity: saving ? 0.7 : 1,
+            <button onClick={handleSave} disabled={saving || !stepOk} style={{
+              ...btnPrimary, opacity: (saving || !stepOk) ? 0.5 : 1,
+              cursor: (saving || !stepOk) ? 'not-allowed' : 'pointer',
             }}>
               {saving ? 'Saving...' : 'Complete & Generate'}
             </button>

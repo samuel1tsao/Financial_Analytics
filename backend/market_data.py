@@ -14,8 +14,9 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.orm import Session
 from database import SessionLocal
-from market_models import StockPrice, TickerFeature
+from market_models import StockPrice, TickerFeature, CompanyInfo, FinancialStatement, CorporateAction
 from congress_models import CongressTrade
+from options_data import get_theoretical_atm_greeks
 
 logger = logging.getLogger(__name__)
 
@@ -149,15 +150,37 @@ def _compute_features_for_ticker(db: Session, ticker: str) -> int:
         # Rolling 1-year return: price_today / price_252_days_ago - 1
         rolling_return = (closes[i] / closes[i - TRADING_DAYS]) - 1.0
 
-        # Rolling 1-year volatility: std of last 252 daily returns, annualized
+        # Rolling volatilities
         trailing_returns = daily_returns[i - TRADING_DAYS: i]
-        rolling_vol = float(np.std(trailing_returns, ddof=1) * np.sqrt(TRADING_DAYS))
+        vol_30d = float(np.std(daily_returns[i - 30: i], ddof=1) * np.sqrt(252))
+        vol_90d = float(np.std(daily_returns[i - 90: i], ddof=1) * np.sqrt(252))
+        vol_1yr = float(np.std(trailing_returns, ddof=1) * np.sqrt(TRADING_DAYS))
+
+        # Greeks
+        S = closes[i]
+        greeks_30d = get_theoretical_atm_greeks(S, vol_30d, 30)
+        greeks_90d = get_theoretical_atm_greeks(S, vol_90d, 90)
+        greeks_1yr = get_theoretical_atm_greeks(S, vol_1yr, 365)
 
         db.add(TickerFeature(
             ticker=ticker,
             date=current_date,
             rolling_1yr_return=round(float(rolling_return), 6),
-            rolling_1yr_volatility=round(rolling_vol, 6),
+            rolling_1yr_volatility=round(vol_1yr, 6),
+            rolling_30d_volatility=round(vol_30d, 6),
+            rolling_90d_volatility=round(vol_90d, 6),
+            greeks_30d_delta=greeks_30d["delta"],
+            greeks_30d_gamma=greeks_30d["gamma"],
+            greeks_30d_theta=greeks_30d["theta"],
+            greeks_30d_vega=greeks_30d["vega"],
+            greeks_90d_delta=greeks_90d["delta"],
+            greeks_90d_gamma=greeks_90d["gamma"],
+            greeks_90d_theta=greeks_90d["theta"],
+            greeks_90d_vega=greeks_90d["vega"],
+            greeks_1yr_delta=greeks_1yr["delta"],
+            greeks_1yr_gamma=greeks_1yr["gamma"],
+            greeks_1yr_theta=greeks_1yr["theta"],
+            greeks_1yr_vega=greeks_1yr["vega"],
         ))
         rows_created += 1
 
@@ -167,7 +190,7 @@ def _compute_features_for_ticker(db: Session, ticker: str) -> int:
     return rows_created
 
 
-def sync_market_data() -> dict:
+def sync_market_data(override_tickers: list = None) -> dict:
     """
     Sync market data from yfinance into the database.
     Only fetches data that is missing (incremental sync).
@@ -184,8 +207,11 @@ def sync_market_data() -> dict:
 
     try:
         # Dynamically append any custom tickers traded by congress members
-        db_tickers = {t[0] for t in db.query(CongressTrade.ticker).distinct().all()}
-        all_sync_tickers = list(set(ALL_TICKERS).union(db_tickers))
+        if override_tickers is None:
+            db_tickers = {t[0] for t in db.query(CongressTrade.ticker).distinct().all()}
+            all_sync_tickers = list(set(ALL_TICKERS).union(db_tickers))
+        else:
+            all_sync_tickers = override_tickers
 
         for ticker in all_sync_tickers:
             latest = _get_latest_date_in_db(db, ticker)
@@ -215,6 +241,153 @@ def sync_market_data() -> dict:
         db.close()
 
     logger.info(f"Market data sync complete: {summary}")
+    return summary
+
+def sync_company_info(override_tickers: list = None) -> dict:
+    """Fetch yfinance fundamentals for all tracked tickers and store in CompanyInfo."""
+    db = SessionLocal()
+    summary = {"updated": 0, "errors": []}
+    try:
+        if override_tickers is None:
+            db_tickers = {t[0] for t in db.query(CongressTrade.ticker).distinct().all()}
+            all_sync_tickers = list(set(ALL_TICKERS).union(db_tickers))
+        else:
+            all_sync_tickers = override_tickers
+        
+        for ticker in all_sync_tickers:
+            try:
+                time.sleep(1.0) # Polite scraping
+                info = yf.Ticker(ticker).info
+                if not info:
+                    continue
+                
+                existing = db.query(CompanyInfo).filter(CompanyInfo.ticker == ticker).first()
+                if not existing:
+                    existing = CompanyInfo(ticker=ticker)
+                    db.add(existing)
+                
+                existing.name = info.get("shortName") or info.get("longName")
+                existing.asset_type = info.get("quoteType")
+                existing.description = info.get("longBusinessSummary") or info.get("description")
+                existing.sector = info.get("sector")
+                existing.industry = info.get("industry")
+                
+                # Health & Valuation
+                existing.market_cap = info.get("marketCap")
+                existing.beta = info.get("beta")
+                existing.forward_pe = info.get("forwardPE")
+                existing.trailing_pe = info.get("trailingPE")
+                existing.price_to_book = info.get("priceToBook")
+                existing.price_to_sales = info.get("priceToSalesTrailing12Months")
+                existing.enterprise_to_ebitda = info.get("enterpriseToEbitda")
+                existing.debt_to_equity = info.get("debtToEquity")
+                existing.current_ratio = info.get("currentRatio")
+                existing.quick_ratio = info.get("quickRatio")
+                existing.dividend_yield = info.get("dividendYield")
+
+                # Margins & Growth
+                existing.profit_margins = info.get("profitMargins")
+                existing.operating_margins = info.get("operatingMargins")
+                existing.return_on_equity = info.get("returnOnEquity")
+                existing.return_on_assets = info.get("returnOnAssets")
+                existing.revenue_growth = info.get("revenueGrowth")
+                existing.earnings_growth = info.get("earningsGrowth")
+
+                # Sentiment & Context
+                existing.held_percent_insiders = info.get("heldPercentInsiders")
+                existing.held_percent_institutions = info.get("heldPercentInstitutions")
+                existing.short_ratio = info.get("shortRatio")
+                existing.fifty_two_week_high = info.get("fiftyTwoWeekHigh")
+                existing.fifty_two_week_low = info.get("fiftyTwoWeekLow")
+                existing.fifty_two_week_change = info.get("52WeekChange")
+                existing.target_mean_price = info.get("targetMeanPrice")
+
+                # ETF Specifics
+                existing.ytd_return = info.get("ytdReturn")
+                existing.three_year_average_return = info.get("threeYearAverageReturn")
+                existing.five_year_average_return = info.get("fiveYearAverageReturn")
+                existing.total_assets = info.get("totalAssets")
+                existing.annual_report_expense_ratio = info.get("annualReportExpenseRatio")
+                existing.fund_family = info.get("fundFamily")
+
+                # Logistics
+                existing.full_time_employees = info.get("fullTimeEmployees")
+                existing.country = info.get("country")
+                existing.state = info.get("state")
+
+                # Audit timestamps automatically handle created_at/updated_at defaults
+                
+                summary["updated"] += 1
+            except Exception as e:
+                logger.error(f"Failed pulling info for {ticker}: {e}")
+                summary["errors"].append(ticker)
+        db.commit()
+    finally:
+        db.close()
+    
+    logger.info(f"Company Info sync complete: {summary}")
+    return summary
+
+def sync_historical_financials(override_tickers: list = None) -> dict:
+    """Fetch deep history (statements, dividends, splits) politely."""
+    db = SessionLocal()
+    summary = {"updated": 0, "errors": []}
+    try:
+        if override_tickers is None:
+            db_tickers = {t[0] for t in db.query(CongressTrade.ticker).distinct().all()}
+            all_sync_tickers = list(set(ALL_TICKERS).union(db_tickers))
+        else:
+            all_sync_tickers = override_tickers
+        
+        for ticker in all_sync_tickers:
+            try:
+                time.sleep(2.0) # Very polite scraping
+                tk = yf.Ticker(ticker)
+                info = tk.info
+                is_etf = info.get("quoteType", "") == "ETF"
+                
+                # Historic Corp Actions
+                divs = tk.dividends
+                splits = tk.splits
+                
+                if not divs.empty:
+                    for d_date, val in divs.items():
+                        dt = d_date.date() if hasattr(d_date, 'date') else d_date
+                        ext = db.query(CorporateAction).filter_by(ticker=ticker, date=dt, action_type="dividend").first()
+                        if not ext: db.add(CorporateAction(ticker=ticker, date=dt, action_type="dividend", value=float(val)))
+                            
+                if not splits.empty:
+                    for s_date, val in splits.items():
+                        dt = s_date.date() if hasattr(s_date, 'date') else s_date
+                        ext = db.query(CorporateAction).filter_by(ticker=ticker, date=dt, action_type="split").first()
+                        if not ext: db.add(CorporateAction(ticker=ticker, date=dt, action_type="split", value=float(val)))
+
+                # Historic Statements for non-ETFs
+                if not is_etf:
+                    ann_inc = tk.financials
+                    if ann_inc is not None and not ann_inc.empty:
+                        for col in ann_inc.columns:
+                            dt = col.date() if hasattr(col, 'date') else col
+                            ext = db.query(FinancialStatement).filter_by(ticker=ticker, report_date=dt, period_type="annual").first()
+                            if not ext:
+                                fs = FinancialStatement(ticker=ticker, report_date=dt, period_type="annual")
+                                if "Total Revenue" in ann_inc.index and pd.notna(ann_inc.loc["Total Revenue", col]):
+                                    fs.total_revenue = float(ann_inc.loc["Total Revenue", col])
+                                if "Net Income" in ann_inc.index and pd.notna(ann_inc.loc["Net Income", col]):
+                                    fs.net_income = float(ann_inc.loc["Net Income", col])
+                                if "Gross Profit" in ann_inc.index and pd.notna(ann_inc.loc["Gross Profit", col]):
+                                    fs.gross_profit = float(ann_inc.loc["Gross Profit", col])
+                                db.add(fs)
+                
+                summary["updated"] += 1
+            except Exception as e:
+                logger.error(f"Failed historical deep sync for {ticker}: {e}")
+                summary["errors"].append(ticker)
+        db.commit()
+    finally:
+        db.close()
+    
+    logger.info(f"Historical Deep Sync complete: {summary}")
     return summary
 
 

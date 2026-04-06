@@ -6,6 +6,7 @@ import {
 } from 'recharts';
 import useStore from '../../store';
 import api from '../../api/client';
+import AssetModal from '../../components/AssetModal';
 
 // ─── Formatters ──────────────────────────────────────────────────────────────
 const fmt = (val) => {
@@ -73,95 +74,6 @@ function StatCard({ label, value, subtext, color = '#60a5fa' }) {
   );
 }
 
-// ─── ETF History Modal ────────────────────────────────────────────────────────
-function EtfModal({ ticker, onClose }) {
-  const [data, setData] = useState(null);
-  const [range, setRange] = useState('1y');
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    (async () => {
-      setLoading(true);
-      try {
-        const res = await api.get(`/market/history?ticker=${ticker}&range=${range}`);
-        setData(res.data);
-      } catch (err) {
-        console.error('Failed to load ETF history', err);
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [ticker, range]);
-
-  return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 1000,
-      background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }} onClick={onClose}>
-      <div style={{
-        background: '#0f172a', width: '90%', maxWidth: 700,
-        borderRadius: '1rem', border: '1px solid rgba(255,255,255,0.1)',
-        padding: '1.5rem', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)',
-      }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-          <div>
-            <h2 style={{ color: '#f1f5f9', fontSize: '1.25rem', fontWeight: 700, margin: 0 }}>
-              {ticker} Historical Performance
-            </h2>
-            {data && (
-              <p style={{
-                color: data.percent_change >= 0 ? '#4ade80' : '#f87171',
-                fontSize: '0.85rem', fontWeight: 600, marginTop: '0.25rem',
-              }}>
-                {data.percent_change >= 0 ? '+' : ''}{data.percent_change}% ({range.toUpperCase()})
-              </p>
-            )}
-          </div>
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            {['1y', '3y', '5y'].map(r => (
-              <button
-                key={r} onClick={() => setRange(r)}
-                style={{
-                  background: range === r ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.05)',
-                  border: range === r ? '1px solid rgba(59,130,246,0.4)' : '1px solid transparent',
-                  color: range === r ? '#60a5fa' : '#94a3b8',
-                  padding: '0.3rem 0.6rem', borderRadius: '0.4rem', fontSize: '0.75rem', cursor: 'pointer',
-                }}
-              >
-                {r.toUpperCase()}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {loading ? (
-          <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b' }}>
-            Loading...
-          </div>
-        ) : data && data.history ? (
-          <div style={{ height: 300, width: '100%' }}>
-            <ResponsiveContainer>
-              <AreaChart data={data.history} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="gradEtf" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                <XAxis dataKey="date" stroke="#475569" fontSize={10} tickLine={false} tickFormatter={tick => tick.slice(5, 7) + '/' + tick.slice(2, 4)} />
-                <YAxis stroke="#475569" fontSize={10} tickLine={false} tickFormatter={fmt} width={50} domain={['auto', 'auto']} />
-                <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 }} />
-                <Area type="monotone" dataKey="adj_close" name="Price" stroke="#8b5cf6" strokeWidth={2} fill="url(#gradEtf)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        ) : <p>No data</p>}
-      </div>
-    </div>
-  );
-}
 
 // ─── Main Dashboard ──────────────────────────────────────────────────────────
 export default function DashboardMain() {
@@ -634,7 +546,7 @@ export default function DashboardMain() {
         <p style={{ color: '#64748b' }}>Select a portfolio from the sidebar to view details.</p>
       )}
       
-      {etfModal && <EtfModal ticker={etfModal} onClose={() => setEtfModal(null)} />}
+      {etfModal && <AssetModal ticker={etfModal} onClose={() => setEtfModal(null)} />}
     </div>
   );
 }

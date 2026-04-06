@@ -5,6 +5,7 @@ export default function TopNavigation() {
 
   const tabs = [
     { id: 'dashboard', label: 'My Portfolios' },
+    { id: 'markets', label: '📈 Markets' },
     { id: 'officials', label: 'Public Officials' },
   ];
 
