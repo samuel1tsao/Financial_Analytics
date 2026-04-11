@@ -25,3 +25,6 @@ build/
 backend/*.db
 
 *.md
+
+# Data files
+*.csv

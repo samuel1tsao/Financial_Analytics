@@ -1,0 +1,394 @@
+"""
+_sim_worker.py
+──────────────
+Flexible backtesting engine for portfolio-goal evaluation.
+
+Core function:
+    backtest_portfolio(user_config, portfolio_composition, asset_daily_returns,
+                       baseline_daily_returns, start_i) -> SimResult
+
+Loss / training label:
+    signed_squared_relative_delta = sign(delta) * delta**2
+    where delta = (pers_terminal - base_terminal) / |base_terminal|
+
+This is the label fed to the two-tower recommendation model.
+"""
+
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+LOAN_DAILY_RATE  = (1.10) ** (1.0 / 252) - 1   # 10% APR compounded daily
+TRADING_DAYS     = 252
+SIM_YEARS        = 30
+
+
+# ── Result container ──────────────────────────────────────────────────────────
+@dataclass
+class SimResult:
+    base_terminal:              float = 0.0
+    pers_terminal:              float = 0.0
+    base_failures:              int   = 0
+    pers_failures:              int   = 0
+    base_utility:               float = 0.0   # signed log(base_terminal)
+    pers_utility:               float = 0.0   # signed log(pers_terminal)
+    signed_squared_relative_delta: float = 0.0  # ← training label for two-tower model
+
+    # Raw delta (useful for inspection)
+    relative_delta:             float = 0.0   # (pers - base) / |base|
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def signed_log(x: float) -> float:
+    """Signed log utility — handles negative terminal wealth."""
+    if x >= 0:
+        return float(np.log1p(x))
+    return float(-np.log1p(abs(x)))
+
+
+def signed_squared_delta(pers_terminal: float, base_terminal: float) -> tuple:
+    """
+    Return (relative_delta, signed_squared_relative_delta).
+
+    Formula:
+        delta = (pers - base) / |base|
+        label = sign(delta) * delta**2
+
+    Properties:
+        • Relative (normalised across starting capitals)
+        • Quadratic: large deviations from baseline are emphasised
+        • Signed: positive = outperforms baseline, negative = underperforms
+    """
+    denom = abs(base_terminal) if abs(base_terminal) > 1 else 1.0
+    delta = (pers_terminal - base_terminal) / denom
+    label = float(np.sign(delta) * delta ** 2)
+    return float(delta), label
+
+
+# ── Core simulation ───────────────────────────────────────────────────────────
+def _run_sim_core(
+    start_i: int,
+    n_days: int,
+    portfolio_daily_returns: np.ndarray,   # 1-D array of blended daily returns
+    user_config: dict,
+    initial_alloc_cash: float,
+    initial_alloc_growth: float,           # everything non-Cash goes here
+):
+    """
+    Run one daily simulation path.
+
+    Two-account model:
+        cash_bucket  — flat 3% annual, used for immediate goals
+        growth_bucket — tracks portfolio_daily_returns, used for all other goals and contributions
+
+    Returns (terminal_net, n_failures).
+    """
+    goals         = user_config["goals"]         # {year_int: amount_float}
+    daily_contrib = user_config["monthly_contrib"] / 21.0
+
+    cash_bucket   = float(initial_alloc_cash)
+    growth_bucket = float(initial_alloc_growth)
+    debt          = 0.0
+    n_failures    = 0
+
+    end_i = min(start_i + n_days, len(portfolio_daily_returns))
+
+    for day_off in range(end_i - start_i):
+        i = start_i + day_off
+
+        # 1. Compound debt
+        debt *= (1 + LOAN_DAILY_RATE)
+
+        # 2. Apply daily returns
+        cash_bucket   *= (1 + 0.03 / TRADING_DAYS)
+        growth_ret     = float(portfolio_daily_returns[i])
+        # Clip extreme daily moves to ±50% to prevent blow-ups from bad data
+        growth_ret     = max(-0.50, min(0.50, growth_ret))
+        growth_bucket *= (1 + growth_ret)
+
+        # 3. Service debt with daily contribution first; remainder invests
+        if debt > 0:
+            payment       = min(daily_contrib, debt)
+            debt         -= payment
+            growth_bucket += daily_contrib - payment
+        else:
+            growth_bucket += daily_contrib
+
+        # 4. Goal liquidation at annual boundaries
+        year_idx = day_off // TRADING_DAYS + 1
+        if day_off > 0 and day_off % TRADING_DAYS == 0 and year_idx in goals:
+            needed = float(goals[year_idx])
+            # Waterfall: cash first, then growth
+            for bucket_name in ("cash", "growth"):
+                if needed <= 0:
+                    break
+                if bucket_name == "cash":
+                    drawn        = min(cash_bucket, needed)
+                    cash_bucket -= drawn
+                else:
+                    drawn          = min(growth_bucket, needed)
+                    growth_bucket -= drawn
+                needed -= drawn
+            if needed > 0:
+                debt      += needed      # shortfall → loan at 10% APR
+                n_failures += 1
+
+    terminal_net = (cash_bucket + growth_bucket) - debt
+    return float(terminal_net), n_failures
+
+
+def _run_sim_with_trajectory(
+    start_i: int,
+    n_days: int,
+    portfolio_daily_returns: np.ndarray,
+    user_config: dict,
+    initial_alloc_cash: float,
+    initial_alloc_growth: float,
+) -> tuple:
+    """
+    Same as _run_sim_core but also returns a list of (year, net_value) snapshots
+    taken at each annual boundary — used for trajectory visualisation.
+    Returns (terminal_net, n_failures, annual_snapshots).
+    """
+    goals         = user_config["goals"]
+    daily_contrib = user_config["monthly_contrib"] / 21.0
+
+    cash_bucket   = float(initial_alloc_cash)
+    growth_bucket = float(initial_alloc_growth)
+    debt          = 0.0
+    n_failures    = 0
+    snapshots     = [(0, cash_bucket + growth_bucket)]   # year 0 = starting value
+
+    end_i = min(start_i + n_days, len(portfolio_daily_returns))
+
+    for day_off in range(end_i - start_i):
+        i = start_i + day_off
+        debt *= (1 + LOAN_DAILY_RATE)
+        cash_bucket   *= (1 + 0.03 / TRADING_DAYS)
+        growth_ret     = float(portfolio_daily_returns[i])
+        growth_ret     = max(-0.50, min(0.50, growth_ret))
+        growth_bucket *= (1 + growth_ret)
+
+        if debt > 0:
+            payment        = min(daily_contrib, debt)
+            debt          -= payment
+            growth_bucket += daily_contrib - payment
+        else:
+            growth_bucket += daily_contrib
+
+        year_idx = day_off // TRADING_DAYS + 1
+        if day_off > 0 and day_off % TRADING_DAYS == 0:
+            if year_idx in goals:
+                needed = float(goals[year_idx])
+                for bucket_name in ("cash", "growth"):
+                    if needed <= 0:
+                        break
+                    if bucket_name == "cash":
+                        drawn        = min(cash_bucket, needed)
+                        cash_bucket -= drawn
+                    else:
+                        drawn          = min(growth_bucket, needed)
+                        growth_bucket -= drawn
+                    needed -= drawn
+                if needed > 0:
+                    debt      += needed
+                    n_failures += 1
+            snapshots.append((year_idx, (cash_bucket + growth_bucket) - debt))
+
+    terminal_net = (cash_bucket + growth_bucket) - debt
+    return float(terminal_net), n_failures, snapshots
+
+
+# ── Portfolio return blender ───────────────────────────────────────────────────
+def blend_portfolio_returns(
+    portfolio_composition: Dict[str, float],
+    asset_daily_returns: Dict[str, np.ndarray],
+    n_days: int,
+) -> np.ndarray:
+    """
+    Compute blended daily returns for a {ticker: weight} portfolio.
+
+    portfolio_composition  — {ticker: weight}, weights should sum to ~1.0
+    asset_daily_returns    — {ticker: 1-D np.ndarray of daily returns}
+    n_days                 — clip to this length
+    """
+    weights        = np.array(list(portfolio_composition.values()), dtype=np.float64)
+    weights       /= weights.sum()                      # normalise to sum = 1
+    tickers        = list(portfolio_composition.keys())
+
+    # Find common length across all assets
+    available      = [asset_daily_returns[t] for t in tickers if t in asset_daily_returns]
+    if not available:
+        return np.zeros(n_days)
+
+    min_len        = min(len(a) for a in available)
+    clip           = min(min_len, n_days)
+
+    matrix         = np.vstack([asset_daily_returns[t][:clip] for t in tickers
+                                 if t in asset_daily_returns]).T   # (days, assets)
+    blended        = matrix @ weights[:matrix.shape[1]]
+    # Pad with zeros if needed
+    if len(blended) < n_days:
+        blended = np.concatenate([blended, np.zeros(n_days - len(blended))])
+    return blended
+
+
+# ── Allocator ─────────────────────────────────────────────────────────────────
+def allocate(
+    start_cap: float,
+    goals: Dict[int, float],
+    short_max_yr: int,
+    medium_max_yr: int,
+) -> tuple:
+    """
+    Allocate starting capital into (cash_bucket, growth_bucket).
+
+    Goals ≤ short_max_yr  → cash_bucket  (capital-protected)
+    Goals > short_max_yr  → growth_bucket (market-exposed)
+
+    short_max_yr controls what we consider "near-term" — the larger it is,
+    the more capital we protect in cash, the lower the growth exposure.
+
+    Returns (cash_alloc, growth_alloc).
+    """
+    cash_alloc   = 0.0
+    growth_alloc = 0.0
+    remaining    = float(start_cap)
+
+    for yr in sorted(goals):
+        if remaining <= 0:
+            break
+        funding = min(float(goals[yr]), remaining)
+        if yr <= short_max_yr:        # ← uses actual boundary, not hardcoded 1
+            cash_alloc += funding
+        else:
+            growth_alloc += funding
+        remaining -= funding
+
+    growth_alloc += remaining    # surplus → long-term growth
+    return cash_alloc, growth_alloc
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+def backtest_portfolio(
+    user_config: dict,
+    portfolio_composition: Dict[str, float],
+    asset_daily_returns: Dict[str, np.ndarray],
+    baseline_daily_returns: np.ndarray,
+    start_i: int = 0,
+    boundary: tuple = (5, 15),           # (short_max_yr, medium_max_yr)
+) -> SimResult:
+    """
+    Evaluate a portfolio against a user's financial goals and a baseline.
+
+    Parameters
+    ----------
+    user_config
+        {start_cap, monthly_contrib, goals: {year_int: amount_float}}
+    portfolio_composition
+        {ticker: weight}  — the candidate portfolio to evaluate
+    asset_daily_returns
+        {ticker: np.ndarray}  — pre-loaded daily returns for each asset
+    baseline_daily_returns
+        np.ndarray  — daily returns for the baseline portfolio (e.g. S&P500)
+    start_i
+        Index into the daily returns arrays for the historical start date
+    boundary
+        (short_max_yr, medium_max_yr) used by the allocator
+
+    Returns
+    -------
+    SimResult with signed_squared_relative_delta as the training label
+    """
+    goals       = user_config["goals"]
+    start_cap   = float(user_config["start_cap"])
+    n_days      = TRADING_DAYS * SIM_YEARS
+    short_max, medium_max = boundary
+
+    # ── Blend portfolio into a single daily-return series ──────────────────────
+    portfolio_returns = blend_portfolio_returns(portfolio_composition, asset_daily_returns, len(baseline_daily_returns))
+
+    # ── Allocate starting capital ───────────────────────────────────────────────
+    cash_p, growth_p = allocate(start_cap, goals, short_max, medium_max)
+    # Baseline: 100% in growth (tracks baseline returns)
+    cash_b, growth_b = 0.0, start_cap
+
+    # ── Run both sims ───────────────────────────────────────────────────────────
+    pers_term, pers_fails = _run_sim_core(
+        start_i, n_days, portfolio_returns,  user_config, cash_p, growth_p
+    )
+    base_term, base_fails = _run_sim_core(
+        start_i, n_days, baseline_daily_returns, user_config, cash_b, growth_b
+    )
+
+    # ── Compute training label ─────────────────────────────────────────────────
+    rel_delta, label = signed_squared_delta(pers_term, base_term)
+
+    return SimResult(
+        base_terminal               = base_term,
+        pers_terminal               = pers_term,
+        base_failures               = base_fails,
+        pers_failures               = pers_fails,
+        base_utility                = signed_log(base_term),
+        pers_utility                = signed_log(pers_term),
+        signed_squared_relative_delta = label,
+        relative_delta              = rel_delta,
+    )
+
+
+# ── Batch job for joblib parallelism ──────────────────────────────────────────
+def simulate_batch(
+    start_i: int,
+    sp_ret: np.ndarray,
+    bond_ret: np.ndarray,
+    all_configs: list,
+    boundary_configs: dict,
+) -> list:
+    """
+    Process one historical start date across all user configs and boundary strategies.
+
+    portfolio_composition defaults to a hybrid {SP500: stock_ratio, VBTIX: bond_ratio}
+    using the pre-loaded sp_ret and bond_ret arrays — ready to swap in real ticker
+    weights from scoring_df once the asset embedding pipeline is wired up.
+    """
+    asset_rets = {"^GSPC": sp_ret, "VBTIX": bond_ret}
+    results    = []
+
+    for cfg in all_configs:
+        for strategy_name, (boundary, ratio) in boundary_configs.items():
+            # Dynamic portfolio composition based on boundary + ratio
+            # Medium-term goals get (ratio)% SP500 / (1-ratio)% bonds
+            composition = {"^GSPC": ratio, "VBTIX": 1.0 - ratio}
+
+            result = backtest_portfolio(
+                user_config            = cfg,
+                portfolio_composition  = composition,
+                asset_daily_returns    = asset_rets,
+                baseline_daily_returns = sp_ret,
+                start_i                = start_i,
+                boundary               = boundary,
+            )
+
+            res_dict = {
+                "start_i":        start_i,
+                "strategy":       strategy_name,
+                "start_cap":      cfg["start_cap"],
+                "monthly_contrib":cfg["monthly_contrib"],
+                "base_terminal":  result.base_terminal,
+                "base_failures":  result.base_failures,
+                "base_utility":   result.base_utility,
+                "pers_terminal":  result.pers_terminal,
+                "pers_failures":  result.pers_failures,
+                "pers_utility":   result.pers_utility,
+                "relative_delta": result.relative_delta,
+                "label":          result.signed_squared_relative_delta,
+            }
+            if "meta_cap_ratio" in cfg:
+                res_dict["meta_cap_ratio"] = cfg["meta_cap_ratio"]
+                res_dict["meta_inc_ratio"] = cfg["meta_inc_ratio"]
+                res_dict["meta_dist"]      = cfg["meta_dist"]
+                
+            results.append(res_dict)
+
+    return results
