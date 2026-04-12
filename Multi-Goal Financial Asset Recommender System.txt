@@ -1,0 +1,257 @@
+﻿Project Proposal
+Project Proposal: Multi-Goal Financial Asset Recommender System
+Course: CMPE 256 | Focus: Hybrid Recommendation & Portfolio Optimization
+Samuel Tsao, Ianna Duran, Christian Oh
+1. Objective
+We propose a personalized stock and ETF recommender system that integrates user-specific goals with Modern Portfolio Theory (MPT). While standard recommenders focus on item (stocks in our case) similarity, our system treats financial assets as "items" to be matched with a user’s unique risk profile, sector interest, and temporal goals (short vs. long term), transforming a simple ranking task into a constrained optimization problem.
+2. Dataset
+We will synthesize data from primarily yahoo finance to create a rich feature set:
+* Market Data: Daily prices, returns, and volatility via Yahoo Finance API.
+* Fundamental Data: Key ratios (P/E, Debt-to-Equity)
+* Macro/Categorical Data: Sector classifications and historical macro trends from Kaggle.
+3. Methodology
+The core of the project involves transitioning from a baseline "popularity" model to a sophisticated hybrid architecture.
+* Baselines: Popularity-based (Top Gainers) and Content-Based Filtering using metadata (Sector/Industry). AKA S&P index funds
+* Proposed Hybrid Model:
+   1. Collaborative/Content Layer: Predicts user affinity for specific sectors or asset classes based on profile features.
+   2. Constraint Layer: Applies Modern Portfolio Theory to ensure diversification.
+   3. Allocation Engine: Uses a "Bucket-Based" approach to separate recommendations by time horizon (Short, Medium, Long-term).
+4. MVP Scope & Implementation
+The MVP will focus on a Personalized Allocation Pipeline:
+1. Input: User defines Risk Tolerance (1–10), Sector Preferences, and Time Horizons (e.g., "5-year house down payment" vs. "30-year retirement").
+2. Processing: The system filters assets by risk/volatility, then applies a weighted allocation logic.
+3. Output: A diversified portfolio recommendation including specific ticker symbols and percentage weights.
+Future Extensions (Stretch Goals)
+* Time-Decay Rebalancing: Automated risk reduction as goal dates approach.
+* Tax-Aware Optimization: Logic to prioritize long-term capital gains.
+5. Novelty & Data Mining Significance
+* Multi-Objective Optimization: Unlike Netflix (single goal: watch time), this system balances competing objectives: Return vs. Risk vs. Time.
+* Context-Aware Recommendations: The "item" value changes based on the user's temporal context (the same stock might be a 'buy' for a 30-year goal but a 'skip' for a 2-year goal).
+6. Evaluation Metrics
+To validate the system, we will use a dual-evaluation strategy:
+* Recommender Metrics: NDCG and Precision@K to measure how well the system identifies high-performing assets within the user's preferred sectors.
+* Financial Metrics: Back-testing the recommended portfolios against a Sharpe Ratio benchmark and the S&P 500 to ensure the "diversification" logic actually reduces volatility.
+* Terminal Wealth Comparison: We will simulate the growth of a $10,000 investment over a historical 20-30 year period. We will compare our Multi-Goal Hybrid Model against two baselines:
+   * Static Baseline: A traditional 60/40 Stock/Bond split.
+   * Aggressive Baseline: A 100% S&P 500 Equity allocation.
+* Goal Success Rate: For short and medium-term buckets (e.g., 5-year house goal), we will measure the Max Drawdown. Success is defined by the portfolio’s ability to preserve capital during market volatility compared to a non-personalized recommender.
+
+
+
+
+
+
+Project Plan
+4-Week Execution Plan: Goal-Based Portfolio Recommender
+1. Project Overview & Team Roles
+To successfully deliver this CMPE 256 MVP in 4 weeks, the workload is divided into three parallel tracks. Each team member owns a specific domain, but tight collaboration is required, especially between the ML/Data layer and the Simulation layer.
+* Member A (Ianna Duran) (Data & ML Lead): Owns data ingestion, latent embeddings, asset scoring, and the final UI.
+* Member B (Christian Oh) (Financial Logic Lead): Owns the mathematical goal modeling, risk decay (Glide Path), dynamic selection logic, and Monte Carlo generation.
+* Member C (Samuel Tsao) (Simulation & Architecture Lead): Owns the repository structure, the core path-dependent simulator, historical backtesting, and the optimization loop.
+2. Week 1: Data Infrastructure & Foundation
+Goal: Build the raw materials (data + embeddings) and the environment (simulation loop).
+* Member A (Data/ML):
+   * Set up data pipelines using yfinance (or similar APIs) to pull historical daily/monthly returns for a defined universe (e.g., Top 100 ETFs, S&P 500 stocks).
+   * Calculate raw features: rolling 1/3/5-year returns, rolling volatility, and max drawdowns.
+   * Stretch: Begin coding the Hybrid Embedding model (correlation matrix / temporal sequences).
+* Member B (Finance Logic):
+   * Implement the UserObjective class.
+   * Code the Nonlinear Risk Scaling (Glide Path) function: Risk_Target(t) = Risk_User * (1 - e^(-t / τ)).
+   * Create the logic for Multi-Goal Aggregation (weighting goals by capital required).
+* Member C (Simulation/Arch):
+   * Initialize the GitHub repository and set up the Python environment (requirements.txt, linting).
+   * Build the base Simulator class.
+   * Implement the core loop: iterating through time, applying a dummy portfolio return, and deducting cash flows (withdrawals) at specific timestamps.
+* 🏁 Week 1 Milestone: Data pipeline is functional, and a dummy portfolio can successfully pass through the simulation loop with cash deductions.
+3. Week 2: Asset Scoring & Dynamic Selection
+Goal: Translate raw data into ranked assets and build the historical evaluation engine.
+* Member A (Data/ML):
+   * Finalize the Feature Fusion step (combining embeddings with raw metrics).
+   * Build the parametric ScoringFunction [ S_i = φ(V_asset, V_user_state) ] with configurable weights.
+* Member B (Finance Logic):
+   * Implement the Dynamic K Thresholding mechanism (filtering assets where S_i > θ).
+   * Write unit tests to ensure the system scales the number of assets up or down based on the threshold rather than a fixed number.
+* Member C (Simulation/Arch):
+   * Upgrade the Simulator into a full Historical Backtester.
+   * Implement rolling windows (e.g., starting paths in 2000, 2004, 2008, etc.).
+   * Add the tracking logic for the primary metrics: Goal Fulfillment Rate (GFR) and Expected Terminal Value (ETV).
+* 🏁 Week 2 Milestone: The system can ingest user goals, score the asset universe, filter the top candidates, and run them through a basic historical backtest.
+4. Week 3: Portfolio Optimization & Synthesis
+Goal: Connect the Recommender to the Simulator to optimize the portfolio weights.
+* Member A (Data/ML):
+   * Implement the Temperature-scaled Softmax Weighting function to convert raw scores into percentage allocations.
+   * Ensure the temperature parameter properly reflects the user's risk tolerance (high temp = diversified, low temp = concentrated).
+* Member B (Finance Logic):
+   * Build the Monte Carlo Bootstrap overlay.
+   * Allow the simulator to randomly sample historical return sequences (with replacement) to generate thousands of synthetic market paths for robust stress testing.
+* Member C (Simulation/Arch):
+   * Build the Optimizer Loop (Random Search or Grid Search).
+   * Connect Layer 1 (Scoring) and Layer 3 (Simulation): The optimizer must iteratively adjust the scoring weights (φ) and threshold (θ) to maximize the Objective Function [ Maximize (α * ETV) subject to (GFR > 0.90) ].
+* 🏁 Week 3 Milestone: The MVP pipeline is complete end-to-end. The system automatically finds the best portfolio allocation to survive simulated goal withdrawals.
+5. Week 4: Validation, UI, & Final Delivery
+Goal: Prove the system works, create visualizations, and prepare the CMPE 256 submission.
+* Member A (Data/ML):
+   * Wrap the python backend into a simple Streamlit or Gradio UI.
+   * Allow a user to input starting capital, risk tolerance, and 2-3 financial goals, then display the recommended portfolio.
+* Member B (Finance Logic):
+   * Run targeted Stress Tests: Force the simulated portfolios through the 2000 Dot-Com crash and the 2008 Financial Crisis.
+   * Generate "Projected Success Probability" charts and "Portfolio Risk Drift" (Glide Path) visualizations.
+* Member C (Simulation/Arch):
+   * Generate a Feature Correlation Matrix to prove which asset features drove the highest success rates.
+   * Lead the drafting of the final CMPE 256 report, focusing heavily on the architecture, trade-offs, and simulation results.
+* 🏁 Week 4 Milestone: Code freeze. UI is locally deployable. Final report and presentation slides are ready for submission.
+6. Risk Management & Dependencies
+* Data Bottlenecks: If the Hybrid Embeddings (Member A) take too long to train, fall back to a simple Historical Correlation Matrix for Week 2 so Member B and C are not blocked.
+* Simulation Speed: Path-dependent backtesting is slow. Member C should ensure the simulation logic uses vectorized NumPy/Pandas operations wherever possible, rather than slow Python for loops.
+* Scope Creep: Do not attempt to add tax-loss harvesting or individual stock fractional shares unless the Week 3 milestone is completed ahead of schedule. Stick strictly to the MVP.
+* Availability: Week 3 has two members that will be unavailable and have little to no bandwidth.
+
+
+MVP
+MVP Design Specification: Goal-Based Portfolio Recommender
+1. Project Vision & Philosophy
+Traditional recommender systems (like those used for Netflix or Amazon) answer the question: "What item will this user like?" They rely on user-item interaction matrices (clicks, ratings, purchases).
+Financial recommendation requires a fundamental paradigm shift. A user does not "like" a bond more than a tech stock; rather, different assets serve different utility functions depending on the user's specific financial milestones and time horizons. Therefore, our system reframes recommendation from an item-matching problem to a constraint-based simulation optimization problem.
+The system follows a three-layer pipeline: Representation (ML), Allocation (Finance), and Evaluation (Simulation).
+2. Layer 1: Representation & Scoring (The "Item" Layer)
+Instead of treating stocks as discrete categorical IDs, we map them into a latent "behavioral" space. This allows the model to understand that two entirely different companies might serve the exact same financial utility in a portfolio.
+Hybrid Embeddings
+We generate an 8-to-16 dimensional embedding for each asset using a dual-objective approach:
+* Temporal Component (Dynamics): We use a small GRU (Gated Recurrent Unit) or LSTM to encode rolling 1-30 year return sequences. This captures the asset's "momentum," "regime," and volatility signatures over time.
+* Behavioral Component (Structure): We use a contrastive learning approach (like Triplet Loss). If two assets behave similarly during market downturns, they are pulled together in the embedding space. Uncorrelated assets are pushed apart. This naturally discovers latent concepts like "defensive," "cyclical," or "growth" without requiring explicit sector labels.
+Feature Fusion
+The final asset vector concatenates the learned embeddings with interpretable raw metrics: Final Vector = [Embedding (8d) || Volatility || Sector || Market Cap]
+The Scoring Function
+Instead of predicting a "rating," we predict a utility score S_i for each asset given a user's current state:
+S_i = φ(V_asset, V_user_state)
+* MVP Design: φ is a parametric linear combination of expected return, volatility penalty, and sector alignment.
+* Why this choice? Without millions of labeled user portfolios, we cannot train a massive deep neural network to output scores directly. By parametrizing the scoring function, we can use our Simulation Engine (Layer 3) to adjust the weights of φ until the portfolio survives the backtests.
+3. Layer 2: Personalization & Goal Mapping (The "User" Layer)
+We must translate abstract user desires (e.g., "I want to buy a house in 5 years and I have a medium risk tolerance") into hard mathematical constraints.
+Nonlinear Risk Scaling (The Glide Path)
+We explicitly reject linear time-weighting for risk. Financial risk capacity decays exponentially as a deadline approaches. We model this using a "Glide Path" decay function:
+Risk_Target(t) = Risk_User * (1 - e^(-t / τ))
+* t = years until the goal is executed.
+* τ = time constant (e.g., 7 to 10 years).
+* Why this choice? If a user needs $300,000 for a house in 2 years, a market crash would be catastrophic. The exponential decay ensures that as t -> 0, the allowable risk plummets to 0 (forcing the system to recommend cash/bonds). For a retirement goal where t = 30, the exponential term becomes negligible, allowing the system to fully utilize the user's baseline risk tolerance for maximum growth.
+Multi-Goal Aggregation
+Users rarely have just one goal. The system calculates a "Portfolio-wide Risk Budget" by taking the weighted average of Risk_Target across all active goals, weighted by the capital required for each goal.
+4. Layer 3: The Allocator (The "Recommender" Layer)
+This layer converts the raw scores S_i into an actual recommended portfolio (a list of assets and their percentage weights).
+Dynamic K Thresholding
+Traditional recommenders output a "Top-K" list (e.g., top 10 movies). This is dangerous in finance.
+* The Mechanism: Instead of a fixed K, we select all assets where S_i > θ (Threshold), or we accumulate assets until Σ S_i ≥ Target Mass.
+* Why this choice? In a highly volatile, correlated market crash, there may only be 3 truly safe assets. A fixed K=10 would force the system to recommend 7 bad assets just to fill the quota. Dynamic thresholding expands the portfolio in target-rich environments (maximizing diversification) and shrinks it in poor environments (maximizing safety). Additionally we maximize the amount of diversification for assets that align with a user based on a threshold
+Softmax Weighting
+Once the assets are selected, we assign portfolio weights W_i using a temperature-scaled Softmax:
+W_i = e^(S_i / T) / [ Σ e^(S_j / T) ]
+* Why this choice? The "Temperature" (T) acts as a diversification dial linked to the user's risk profile.
+   * High T (Low Risk User): The weights flatten out, approaching 1/K, creating a highly diversified, equal-weight portfolio.
+   * Low T (High Risk User): The softmax becomes "sharp," heavily concentrating the user's capital into the top 2 or 3 highest-scoring assets.
+5. The Evaluation Framework (The "Loss Function")
+Because we lack "ground truth" portfolios, our evaluation metric is entirely simulation-based. We use Path-Dependent Backtesting.
+The Threat: Sequence of Returns Risk (SORR)
+We do not use simple average annual returns. A portfolio that drops 50% in Year 1 and gains 50% in Year 2 has an average return of 0%, but an actual cumulative return of -25%. If a user withdraws money during that Year 1 drop, the portfolio may never recover.
+* The Mechanism: We simulate the portfolio through rolling historical windows (e.g., starting in 2000, 2001, 2002...). The simulation physically deducts the target goal amount at year t.
+Core Evaluation Metrics
+1. Goal Fulfillment Rate (GFR): The primary metric. Out of 100 simulated market paths, how many times did the user successfully withdraw the cash for their goal without bankrupting the portfolio?
+GFR = Successful Simulations / Total Simulations
+2. Expected Terminal Value (ETV): The secondary metric. After all short and medium-term goals are funded, what is the median remaining portfolio balance for retirement?
+The system optimizes for: Maximize (α * ETV) subject to (GFR > 0.90).
+6. Simulation & Threshold Adjustments
+Finding the optimal portfolio structure relies heavily on tuning the Dynamic K threshold (θ) and the scoring weights. Rather than setting these manually, they are determined via an automated simulation feedback loop.
+The Feedback Loop
+   1. Initialize Parameters: Set a baseline threshold θ and random weights for the scoring function φ.
+   2. Generate Candidates: The system scores the asset universe and filters out any asset where S_i < θ.
+   3. Simulate: The remaining assets are weighted and pushed through the historical backtesting engine (handling goal withdrawals).
+   4. Evaluate & Adjust: The system records the GFR and ETV. Using Grid Search or Random Search, it adjusts the threshold θ and re-runs the simulation.
+Threshold (θ) Tuning Philosophy
+   * If θ is too high: Only 1 or 2 assets pass the filter. The portfolio becomes overly concentrated. While it might hit high ETV in bull markets, it will fail the GFR constraint due to high volatility crashes.
+   * If θ is too low: Too many weak assets pass the filter. The portfolio becomes over-diversified ("diworsification"), dragging down the Expected Terminal Value (ETV) to the point where long-term retirement goals fall short.
+   * The Goal: The simulation isolates the exact threshold that balances necessary diversification (to survive withdrawals) with adequate concentration (to maximize growth).
+Risk as a Constraint, Not a Target
+A critical distinction in our tuning and scoring philosophy is how volatility is handled. A high user risk score does not mean the system actively seeks the most volatile assets. Instead, the user's risk tolerance acts strictly as a soft upper boundary (a constraint). The simulation optimizes for the best possible returns (ETV) without exceeding the user's acceptable volatility limits. If a stable, low-volatility asset yields the same expected return as a highly volatile one, the system will always mathematically prefer the stable asset, regardless of how aggressive the user's risk profile is.
+
+
+7. Key Design Considerations & Trade-offs
+Choice
+	Rationale
+	Trade-off
+	Simulated Loss vs. Ground Truth
+	We lack real user portfolio data mapped to goals. Simulation acts as a self-supervised environment to validate our scoring weights.
+	Highly computationally expensive. Requires efficient vectorized backtesting code.
+	Dynamic K vs. Fixed K
+	Fixed K forces false diversification or dangerous concentration depending on market regimes. Dynamic K adapts.
+	Harder to build a static UI; the number of recommended assets will fluctuate.
+	ETFs + Stocks Matrix
+	ETFs provide the "beta" (market baseline and stability); individual stocks provide the "alpha" (upside growth).
+	Increases data ingestion complexity and requires mapping stock sector overlap with ETF holdings.
+	Nonlinear Decay vs. Linear
+	Matches professional actuarial and "Target Date Fund" logic. Protects against tail-risk events near goal execution.
+	Harder to explain the underlying math to a non-technical end-user.
+	8. MVP Implementation Roadmap
+Phase 1: Data & Features (Week 1)
+   * Scrape Yahoo Finance/Kaggle for Top 500 Stocks + Top 100 ETFs.
+   * Calculate rolling 1/3/5 year returns, maximum drawdowns, and volatilities.
+   * Generate the 8d embeddings using a simple sequence model or correlation matrix.
+Phase 2: The Logic Engine (Week 2)
+   * Build the UserObjective class that maps inputs to the Risk Glide Path.
+   * Build the Simulator that loops through time, applies asset returns, and strictly subtracts goal amounts at deadlines.
+Phase 3: The Recommender (Week 3)
+   * Implement the ScoringFunction, DynamicK logic, and Softmax allocator.
+   * Run the "Optimizer" (Random Search or Grid Search) to find the hyperparameter weights that maximize the Goal Fulfillment Rate (GFR).
+Phase 4: Validation & UI (Week 4)
+   * Stress-test the system specifically against the 2000 Dot-com crash and the 2008 Financial Crisis.
+   * Wrap the Python logic into a Streamlit or Gradio UI.
+   * Generate the "Projected Success Probability" and "Portfolio Drift" charts for the final CMPE 256 report.
+9. Stretch Goals & Future Enhancements
+If the team completes the core MVP milestones ahead of schedule, we will target the following advanced features to elevate the project to a production-grade algorithmic planner:
+9.1 Tax-Aware Liquidation Strategy (Finance Focus)
+   * The Problem: Selling assets indiscriminately to fund a goal can trigger massive short-term capital gains taxes, heavily degrading the portfolio's actual value.
+   * The Plan: Modify the simulator to track asset holding periods. Introduce a priority queue for liquidations:
+   1. Sell lots that qualify for long-term capital gains (>1 year).
+   2. Implement Tax-Loss Harvesting (sell losing positions to offset necessary gains).
+   3. Only sell short-term gains as a last resort.
+   * Impact: Adds a highly realistic, novel constraint that most academic recommenders ignore.
+9.2 Self-Supervised ML Scoring Engine (ML Focus)
+   * The Problem: The MVP uses a parametric scoring function (w1return + w2volatility) tuned via grid search. This is effective but lacks deep learning complexity.
+   * The Plan: 1. Use the Simulator to generate 100,000 randomized portfolios and evaluate their Goal Fulfillment Rate (GFR). 2. Use this generated dataset as "labeled ground truth." 3. Train a neural network or XGBoost model to predict a portfolio's success probability directly from its aggregated asset embeddings, eliminating the need for manual weight tuning.
+9.3 Reinforcement Learning Allocator (Architecture Focus)
+   * The Problem: Optimizing portfolio weights at every timestep using traditional search methods is computationally heavy.
+   * The Plan: Formulate the asset allocation process as a Markov Decision Process (MDP).
+   * State: User's current portfolio balance, years remaining to goals, and current market regime.
+   * Action: Adjust the percentage weights of the portfolio.
+   * Reward: High reward for successfully funding a goal; massive penalty for bankruptcy; moderate reward for high terminal value.
+   * Train an RL agent (e.g., PPO or DDPG) to act as the dynamic allocator.
+9.4 Advanced Regime-Switching Monte Carlo
+   * The Problem: Standard Monte Carlo bootstraps returns uniformly, which ignores clustered volatility (e.g., bear markets tend to drag on).
+   * The Plan: Implement a Hidden Markov Model (HMM) to identify underlying market regimes (Bull, Bear, Sideways) from historical data. The Monte Carlo engine will then sample synthetic paths that accurately simulate prolonged downturns, making the stress tests far more rigorous.
+10. Out of Scope & Project Limitations
+To ensure the MVP is completed within the 4-week timeline, several elements common to enterprise financial systems have been intentionally excluded:
+   * Psychometric Risk Profiling: Accurately calculating a user's true risk score via behavioral questionnaires requires extensive psychological research and survey design. For this project, we assume the user provides a direct scalar value (0.0 to 1.0) representing their risk tolerance.
+   * Extensive User Data Mining: Mining real-world, personalized portfolio data mapping individual users to their specific financial goals is unfeasible due to privacy constraints and a lack of public datasets. We will rely on simulated synthetic user profiles to test the recommendation engine.
+   * Intraday Trading & Micro-Optimization: The system focuses on macro-allocation and long-term planning (monthly/yearly rebalancing). High-frequency trading execution, slippage models, and order-book dynamics are out of scope.
+   * Complex Tax Law Integration: While a basic tax-loss harvesting stretch goal is proposed, full integration of localized tax codes, wash-sale rules, and specific account types (e.g., Roth IRA vs. 401(k) vs. Taxable Brokerage) is outside the bounds of this project.
+11. Architectural Alternatives & Embedding Considerations
+During the design phase, several alternative machine learning architectures and data-handling strategies were considered. The following details the rationale for our final MVP choices over popular alternatives.
+11.1 Forward-Predicting Embeddings vs. "Flipped" Generative Modeling
+   * The Alternative: A "flipped" Inverse Generative Model. Instead of predicting an asset's future return, the model takes the User's desired financial outcome as an input and outputs the Ideal Asset Fundamentals (e.g., "To achieve 15% return and low volatility, find an asset with a P/E of 15 and Tech sector tagging").
+   * Why we rejected it (The Value Trap): Generating criteria does not select strong individual assets. The model might output criteria indicating a cheap, high-yield retail stock is ideal for a conservative user. Searching the database for those metrics might yield a dying company right before bankruptcy (a "value trap").
+   * The Chosen Approach: Our ML model strictly predicts the future outcomes of specific, individual assets (creating the Embedding). We then use the mathematical Optimizer (Layer 3) to combine those individual, strong assets into a portfolio that meets the user's criteria.
+11.2 Term Structure Loss (Milestone Horizons vs. 30-Year Granularity)
+   * The Alternative: Forcing the neural network to output 60 predictions per asset (Expected Return and Standard Deviation for every single year from 1 to 30).
+   * Why we rejected it: Overfitting. Predicting the exact market conditions 28 years from now versus 29 years from now introduces massive statistical noise.
+   * The Chosen Approach (Milestone Horizons): We calculate the embedding loss against specific milestones: Year 1, 3, 5, 10, and 15. Furthermore, we apply heavier weights to the short-term predictions (e.g., 1-Year Loss = 1.0 weight, 15-Year Loss = 0.2 weight). This forces the embedding to memorize near-term volatility risks while still respecting long-term mean reversion. All targets are Z-score normalized so massive cumulative returns don't wash out small volatility percentages in the loss calculation.
+11.3 Time-Decayed Sample Weighting (Handling Regime Shifts)
+   * The Problem: The stock market of 1995 behaves fundamentally differently than the algorithmic-trading market of 2024. If the embedding model treats a training error from 1995 equally to an error from 2023, it optimizes for a nonexistent market regime.
+   * The Chosen Approach: We apply an Exponential Decay Half-Life to historical training samples. Assuming a 10-year market half-life, a sample from today receives a weight of 1.0 in the loss function, while a sample from 10 years ago receives a weight of 0.5. The model learns structural lessons from past crashes (like 2008), but heavily prioritizes modern market dynamics when updating its weights.
+11.4 Missing Token Imputation vs. Price-Derived Signals
+   * The Alternative: Utilizing deep fundamental data (P/E ratios, Debt-to-Equity) to train the embeddings.
+   * Why we rejected it for MVP: High-quality fundamental data sets often have massive missing values prior to 2010. Using a "Missing Token" approach (e.g., filling missing P/E with -999) allows the model to train, but degrades its accuracy during historical backtesting of the crucial 2000 and 2008 crashes.
+   * The Chosen Approach: For the core MVP, the embedding relies on completely continuous price-derived signals (Return Trajectories, Trailing Volatility, Price * Volume as a proxy for Market Cap). This guarantees an unbroken data stream for rigorous 30-year historical stress testing. Fundamental data fusion remains a viable stretch goal.
+11.5 The "Right-Edge Problem" (Inference vs. Training)
+   * The Problem (Data Censoring): To calculate the loss for a 5-year return prediction, the model must know the actual 5-year future. Therefore, current data (e.g., from 2025) cannot be fully used to train the 5-year prediction layer, because 2030 hasn't happened yet.
+   * The Solution (Frozen Inference & Masked Training): 1. Inference (Live Output): Historical data (e.g., 1980–2023) is used to fully train and "freeze" the embedding model's weights. When generating a recommendation today, the current market data is pushed through this frozen model to generate today's predictions. 2. Masked Training: For recent historical data where long-term horizons haven't elapsed, the model still trains on the short-term prediction losses (e.g., 1-year returns) while actively masking (ignoring) the unresolvable 5-year and 10-year losses. This allows the network to adapt to recent regimes without waiting a decade for validation.
+11.6 Layer 3 Hard Constraints (The Sanity Check)
+   * The Problem: By excluding sparse fundamental data (like current P/E ratios or ESG scores) from the historical embedding training to ensure an unbroken dataset (Section 11.4), we risk missing obvious fundamental red flags in the present day.
+   * The Solution (The Guardrail): Current point-in-time fundamental data is passed directly to the Layer 3 Allocator/Optimizer. Even if the embedding model ranks a stock highly based on price trajectory alone, the optimizer acts as a hard constraint logic gate. For example, the system can enforce a rule: "Reject any stock with a current P/E > 100 or negative earnings, regardless of its embedding score." This elegantly blends the neural network's latent predictions with classic, hard-coded financial logic.
