@@ -6,6 +6,8 @@ import numpy as np
 import time
 import os
 
+from _constants import TRADING_DAYS_PER_YEAR
+
 class AssetEmbeddingNet(nn.Module):
     def __init__(self, input_dim, config, output_dim):
         super(AssetEmbeddingNet, self).__init__()
@@ -82,10 +84,10 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
     # 2. Compute Return & Volatility Snapshots
     if drip_daily_returns is not None:
         annual_returns = drip_daily_returns.resample('YE').apply(lambda x: (1 + x).prod() - 1)
-        annual_vols = drip_daily_returns.resample('YE').std() * np.sqrt(252)
+        annual_vols = drip_daily_returns.resample('YE').std() * np.sqrt(TRADING_DAYS_PER_YEAR)
     else:
         annual_returns = daily_returns.resample('YE').apply(lambda x: (1 + x).prod() - 1)
-        annual_vols = daily_returns.resample('YE').std() * np.sqrt(252)
+        annual_vols = daily_returns.resample('YE').std() * np.sqrt(TRADING_DAYS_PER_YEAR)
         
     daily_log_vol = np.log1p(volume_matrix).diff().dropna(how='all')
     annual_log_vol = daily_log_vol.resample('YE').sum().reindex(index=annual_returns.index, columns=price_matrix.columns).fillna(0)
@@ -125,11 +127,11 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
             p_prior = price_matrix[ticker].loc[:valid_years[i]].dropna()
             v_prior = volume_matrix[ticker].loc[:valid_years[i]].dropna()
             
-            if len(p_prior) < 252: continue
+            if len(p_prior) < TRADING_DAYS_PER_YEAR: continue
             
-            mom = (p_prior.iloc[-1] / p_prior.iloc[-252]) - 1
-            vol = p_prior.pct_change().tail(252).std() * np.sqrt(252)
-            logv = np.log1p(v_prior.tail(252).sum())
+            mom = (p_prior.iloc[-1] / p_prior.iloc[-TRADING_DAYS_PER_YEAR]) - 1
+            vol = p_prior.pct_change().tail(TRADING_DAYS_PER_YEAR).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+            logv = np.log1p(v_prior.tail(TRADING_DAYS_PER_YEAR).sum())
             
             # Point-in-time features
             feat_vec = master_encoded.loc[ticker, all_feature_cols].astype(float).tolist()
@@ -245,11 +247,11 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
             p_prior = price_matrix[ticker].dropna()
             v_prior = volume_matrix[ticker].dropna()
             
-            if len(p_prior) < 252: continue
+            if len(p_prior) < TRADING_DAYS_PER_YEAR: continue
             
-            mom = (p_prior.iloc[-1] / p_prior.iloc[-252]) - 1
-            vol = p_prior.pct_change().tail(252).std() * np.sqrt(252)
-            logv = np.log1p(v_prior.tail(252).sum())
+            mom = (p_prior.iloc[-1] / p_prior.iloc[-TRADING_DAYS_PER_YEAR]) - 1
+            vol = p_prior.pct_change().tail(TRADING_DAYS_PER_YEAR).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+            logv = np.log1p(v_prior.tail(TRADING_DAYS_PER_YEAR).sum())
             
             feat_vec = master_encoded.loc[ticker, all_feature_cols].astype(float).tolist()
             feat_vec = [float(mom), float(vol), float(logv)] + feat_vec

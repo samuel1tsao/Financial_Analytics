@@ -18,6 +18,16 @@ import math
 import numpy as np
 import pandas as pd
 
+from _constants import (
+    DEFAULT_ARCHETYPE_COUNT,
+    DEFAULT_BUDGET_TOLERANCE,
+    DEFAULT_FALLBACK_SAFE_COUNT,
+    DEFAULT_VOLATILITY,
+    DEFAULT_V_SCORE_ANCHOR,
+    DEFAULT_SOFTMAX_CAP,
+    TRADING_DAYS_PER_YEAR,
+)
+
 
 # ── Utility Functions ─────────────────────────────────────────────────────────
 
@@ -29,7 +39,7 @@ def cosine_similarity(v1, v2):
     return float(np.dot(v1, v2) / norm_product)
 
 
-def vol_to_vscore(raw_vol, anchor=0.50):
+def vol_to_vscore(raw_vol, anchor=DEFAULT_V_SCORE_ANCHOR):
     """
     Map raw annualized volatility to a linear V_score in [0, 10].
 
@@ -37,7 +47,7 @@ def vol_to_vscore(raw_vol, anchor=0.50):
     Any volatility >= anchor is treated as maximum risk (score 10).
     """
     if anchor <= 0:
-        anchor = 0.50
+        anchor = DEFAULT_V_SCORE_ANCHOR
     score = (raw_vol / anchor) * 10.0
     return min(10.0, max(0.0, score))
 
@@ -82,8 +92,8 @@ def build_user_preference_vector(dataset, user_profile, config):
     for ticker in embeddings:
         if ticker not in daily_returns.columns:
             continue
-        ann_vol = daily_returns[ticker].std() * np.sqrt(252)
-        ann_ret = (1 + daily_returns[ticker].mean()) ** 252 - 1
+        ann_vol = daily_returns[ticker].std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+        ann_ret = (1 + daily_returns[ticker].mean()) ** TRADING_DAYS_PER_YEAR - 1
         if not np.isnan(ann_vol) and ann_vol > 0:
             v_score = vol_to_vscore(ann_vol, v_anchor)
             asset_metrics[ticker] = {"return": ann_ret, "v_score": v_score}
@@ -94,14 +104,14 @@ def build_user_preference_vector(dataset, user_profile, config):
 
     metrics_df = pd.DataFrame(asset_metrics).T
 
-    # Step 3: Filter to safe assets (within budget + 10% tolerance)
-    budget_ceil = risk_budget * 1.1
+    # Step 3: Filter to safe assets (within budget + tolerance)
+    budget_ceil = risk_budget * DEFAULT_BUDGET_TOLERANCE
     safe = metrics_df[metrics_df["v_score"] <= budget_ceil]
     if len(safe) == 0:
-        safe = metrics_df.nsmallest(20, "v_score")
+        safe = metrics_df.nsmallest(DEFAULT_FALLBACK_SAFE_COUNT, "v_score")
 
-    # Step 4: Average top-30 safe archetypes' embeddings
-    archetypes = safe.nlargest(30, "return").index
+    # Step 4: Average top archetype embeddings
+    archetypes = safe.nlargest(DEFAULT_ARCHETYPE_COUNT, "return").index
     vecs = [embeddings[t] for t in archetypes if t in embeddings]
     return np.nan_to_num(np.nanmean(vecs, axis=0), nan=0.0)
 
@@ -196,9 +206,9 @@ def recommend_and_allocate_member_b(dataset, user_profile, user_vector, config):
         )
 
         # Get annualized volatility
-        ann_vol = 0.25  # default
+        ann_vol = DEFAULT_VOLATILITY  # default
         if ticker in daily_returns.columns:
-            v = daily_returns[ticker].std() * np.sqrt(252)
+            v = daily_returns[ticker].std() * np.sqrt(TRADING_DAYS_PER_YEAR)
             if pd.notna(v) and v > 0:
                 ann_vol = float(v)
 
@@ -237,7 +247,7 @@ def recommend_and_allocate_member_b(dataset, user_profile, user_vector, config):
     # Temperature-scaled softmax allocation
     risk_user = user_profile["risk_tolerance"]
     T = max(0.1, (11.0 - risk_user) / 2.0)
-    exp_scores = {t: math.exp(min(20, s / T)) for t, s in filtered.items()}
+    exp_scores = {t: math.exp(min(DEFAULT_SOFTMAX_CAP, s / T)) for t, s in filtered.items()}
     sum_exp = sum(exp_scores.values())
     weights = {t: v / sum_exp for t, v in exp_scores.items()}
 

@@ -15,13 +15,18 @@ This is the label fed to the two-tower recommendation model.
 """
 
 import numpy as np
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-LOAN_DAILY_RATE  = (1.10) ** (1.0 / 252) - 1   # 10% APR compounded daily
-TRADING_DAYS     = 252
-SIM_YEARS        = 30
+from _constants import (
+    TRADING_DAYS_PER_YEAR as TRADING_DAYS,
+    SIM_YEARS,
+    LOAN_DAILY_RATE,
+    CASH_BUCKET_ANNUAL_RATE,
+    DAILY_RETURN_CLAMP,
+    GFR_OBJECTIVE_THRESHOLD,
+)
 
 
 # ── Result container ──────────────────────────────────────────────────────────
@@ -101,10 +106,10 @@ def _run_sim_core(
         debt *= (1 + LOAN_DAILY_RATE)
 
         # 2. Apply daily returns
-        cash_bucket   *= (1 + 0.03 / TRADING_DAYS)
+        cash_bucket   *= (1 + CASH_BUCKET_ANNUAL_RATE / TRADING_DAYS)
         growth_ret     = float(portfolio_daily_returns[i])
         # Clip extreme daily moves to ±50% to prevent blow-ups from bad data
-        growth_ret     = max(-0.50, min(0.50, growth_ret))
+        growth_ret     = max(-DAILY_RETURN_CLAMP, min(DAILY_RETURN_CLAMP, growth_ret))
         growth_bucket *= (1 + growth_ret)
 
         # 3. Service debt with daily contribution first; remainder invests
@@ -165,9 +170,9 @@ def _run_sim_with_trajectory(
     for day_off in range(end_i - start_i):
         i = start_i + day_off
         debt *= (1 + LOAN_DAILY_RATE)
-        cash_bucket   *= (1 + 0.03 / TRADING_DAYS)
+        cash_bucket   *= (1 + CASH_BUCKET_ANNUAL_RATE / TRADING_DAYS)
         growth_ret     = float(portfolio_daily_returns[i])
-        growth_ret     = max(-0.50, min(0.50, growth_ret))
+        growth_ret     = max(-DAILY_RETURN_CLAMP, min(DAILY_RETURN_CLAMP, growth_ret))
         growth_bucket *= (1 + growth_ret)
 
         if debt > 0:
@@ -392,3 +397,81 @@ def simulate_batch(
             results.append(res_dict)
 
     return results
+
+
+# ── Lightweight Annual Evaluation ─────────────────────────────────────────────
+# Complements backtest_portfolio (daily-granularity training-label generator).
+# This function uses annual rolling windows for quick GFR/ETV assessment.
+
+def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config):
+    """
+    Member C: Portfolio evaluation via historical rolling-window backtesting.
+
+    Strategy:
+        - Slice daily returns to [simulation_start_date, simulation_end_date]
+        - Run rolling-window simulations across a VARIETY of historical start points
+        - Each window plays out the user's full goal horizon
+        - Most recent 10-15 years serve as validation windows
+
+    Uses DRIP returns if available, otherwise price-only returns.
+
+    Returns:
+        dict with GFR, ETV, Objective_Function_Score, Total_Simulations
+    """
+    weights = recommendations["portfolio_weights"]
+
+    # Use DRIP returns if available, otherwise price-only
+    base_returns = dataset.get("drip_daily_returns") or dataset["daily_returns"]
+
+    # Filter to simulation date window
+    sim_start = pd.Timestamp(config.get("simulation_start_date", "2015-01-01"))
+    sim_end   = pd.Timestamp(config.get("simulation_end_date", "2026-12-31"))
+
+    available_tickers = [t for t in weights.keys() if t in base_returns.columns]
+    if not available_tickers:
+        print(f"  WARNING: No portfolio tickers found in returns data!")
+        return {"GFR": 0, "ETV": 0, "Objective_Function_Score": 0, "Total_Simulations": 0}
+
+    sim_returns = base_returns[available_tickers].loc[sim_start:sim_end]
+
+    # Compute portfolio-weighted daily returns
+    weight_series = pd.Series({t: weights[t] for t in available_tickers})
+    weight_series = weight_series / weight_series.sum()  # renormalize
+    portfolio_returns = sim_returns.dot(weight_series)
+    annual_returns = portfolio_returns.resample('YE').apply(lambda x: (1+x).prod() - 1)
+
+    max_horizon_years = max(user_profile['goals'].keys())
+    start_capital = user_profile['start_cap']
+    successful_simulations, total_simulations = 0, 0
+    terminal_values = []
+
+    # Rolling window: try every possible start year within the simulation range
+    for start_year in range(len(annual_returns) - max_horizon_years + 1):
+        if start_year + max_horizon_years > len(annual_returns):
+            break
+
+        current_balance = start_capital
+        bankrupt = False
+
+        path = annual_returns.iloc[start_year:start_year+max_horizon_years]
+        for year_idx, yr_return in enumerate(path):
+            current_balance = current_balance * (1 + yr_return)
+            actual_year = year_idx + 1
+            if actual_year in user_profile['goals']:
+                withdrawal = user_profile['goals'][actual_year]
+                current_balance -= withdrawal
+                if current_balance < 0:
+                    bankrupt = True
+                    break
+
+        total_simulations += 1
+        if not bankrupt:
+            successful_simulations += 1
+            terminal_values.append(current_balance)
+
+    GFR = successful_simulations / total_simulations if total_simulations > 0 else 0
+    ETV = np.median(terminal_values) if len(terminal_values) > 0 else 0
+    alpha = 1.0
+    objective_score = (alpha * ETV) if GFR >= GFR_OBJECTIVE_THRESHOLD else (alpha * ETV) * (GFR / GFR_OBJECTIVE_THRESHOLD)
+
+    return {"GFR": GFR, "ETV": ETV, "Objective_Function_Score": objective_score, "Total_Simulations": total_simulations}
