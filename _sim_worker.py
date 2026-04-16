@@ -475,3 +475,62 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config):
     objective_score = (alpha * ETV) if GFR >= GFR_OBJECTIVE_THRESHOLD else (alpha * ETV) * (GFR / GFR_OBJECTIVE_THRESHOLD)
 
     return {"GFR": GFR, "ETV": ETV, "Objective_Function_Score": objective_score, "Total_Simulations": total_simulations}
+
+# ── RL Environment Step ───────────────────────────────────────────────────────
+
+def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config):
+    """
+    Phase 4: The Black-Box Environment.
+    Evaluates sampled portfolio weights through the non-differentiable simulator
+    and returns a single scalar Reward Score.
+    """
+    # 1. Map sampled tensor weights to ticker dictionary
+    portfolio_weights = {tickers[i]: float(weights[0, i]) for i in range(len(tickers))}
+    
+    # 2. Evaluate portfolio using existing non-differentiable rolling window logic
+    # This evaluates how the portfolio handles real historical market paths.
+    metrics = evaluate_portfolio_member_c(
+        dataset, 
+        {"portfolio_weights": portfolio_weights}, 
+        user_profile, 
+        config
+    )
+    
+    # 3. Retrieve Reward Hyperparameters & Dynamic Target
+    # Dynamic target based on "net" value of portfolio minus goals, compounded over horizon.
+    start_cap = user_profile.get("start_cap", 100000.0)
+    goals = user_profile.get("goals", {})
+    total_goal_cost = sum(goals.values())
+    max_horizon = max(goals.keys()) if goals else 10
+    
+    net_starting_value = max(start_cap - total_goal_cost, 10000.0)
+    baseline_growth = config.get("reward_baseline_growth", 0.06)  # 6% baseline growth
+    dynamic_term_target = net_starting_value * ((1.0 + baseline_growth) ** max_horizon)
+    
+    # Allow config override, else use the logical dynamic target
+    term_target = config.get("reward_terminal_target", None)
+    if term_target is None or term_target <= 0.0:
+        term_target = dynamic_term_target
+        
+    term_k = config.get("reward_terminal_k", 2.0)
+    penalty_rate = config.get("reward_goal_penalty_rate", 0.5)
+    lambda_term = config.get("reward_lambda_terminal", 1.0)
+    lambda_goal = config.get("reward_lambda_goal", 1.0)
+    
+    ETV = metrics["ETV"]
+    GFR = metrics["GFR"] # 0.0 to 1.0 (1.0 means all goals funded without bankruptcy)
+    
+    # 4. Compute Inverse-Exponential Terminal Reward
+    # Sigmoid-like scaling: heavily penalizes small balances, rewards large balances exponentially until saturation.
+    # We normalize ETV to the target to keep exponents numerically stable.
+    normalized_balance = (ETV - term_target) / max(term_target, 1.0)
+    terminal_reward = 1.0 / (1.0 + np.exp(-term_k * normalized_balance))
+    
+    # 5. Compute Goal Penalty 
+    # (1 - GFR) represents the fraction of simulations that went bankrupt or missed goals
+    goal_penalty = penalty_rate * (1.0 - GFR)
+    
+    # 6. Final Scalar Reward
+    reward = (lambda_term * terminal_reward) - (lambda_goal * goal_penalty)
+    
+    return float(reward), metrics

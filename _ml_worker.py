@@ -115,12 +115,10 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
     X_samples, Y_samples, Y_weights = [], [], []
     valid_years = annual_returns.index
     
-    training_cutoff_year = pd.Timestamp(config.get("training_cutoff_date", "2015-01-01")).year
+    half_life = config.get("ml_time_decay_half_life", 10)
+    max_year = valid_years[-1].year if len(valid_years) > 0 else 2026
     
     for i in range(1, len(valid_years) - 1):
-        if valid_years[i].year >= training_cutoff_year:
-            continue
-            
         for ticker in master_df.index:
             if ticker not in annual_returns.columns: continue
             
@@ -141,18 +139,23 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
             y_vec = []
             y_w_vec = []
             
+            # Time decay weighting based on the current year
+            time_w = 1.0
+            if half_life is not None:
+                time_w = 2.0 ** (-(max_year - valid_years[i].year) / half_life)
+                
             has_valid = False
             for h in horizons:
                 if i + h < len(valid_years):
                     for metric in target_metrics:
                         val = metric_sources[metric][ticker].iloc[i+1 : i+h+1].mean()
                         y_vec.append(val if pd.notna(val) else np.nan)
-                        y_w_vec.append(horizon_weights[h])
+                        y_w_vec.append(horizon_weights[h] * time_w)
                         if pd.notna(val):
                             has_valid = True
                 else:
                     y_vec.extend([np.nan] * len(target_metrics))
-                    y_w_vec.extend([horizon_weights[h]] * len(target_metrics))
+                    y_w_vec.extend([horizon_weights[h] * time_w] * len(target_metrics))
                     
             if has_valid:
                 X_samples.append(feat_vec)

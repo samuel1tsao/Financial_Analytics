@@ -125,20 +125,29 @@ DEFAULT_PIPELINE_CONFIG = {
     "ml_time_decay_half_life": 10,
 
     # -----------------------
-    # Scoring & Portfolio (Member B)
+    # RL Transformer Geometry
     # -----------------------
-    "scoring_sim_weight": 1.0,
-    "scoring_perf_weight_range": [0.2, 2.0],
-    "scoring_penalty_weight_range": [2.0, 0.2],
-    "portfolio_min_k": 5,
-    "portfolio_max_k": 30,
+    "rl_d_model": 64,
+    "rl_nhead": 4,
+    "rl_num_encoder_layers": 4,
+    "rl_dim_feedforward": 256,
+    "rl_dropout": 0.1,
+    "rl_learning_rate": 0.0001,
+    "rl_episodes": 100,
+
+    # -----------------------
+    # Reward Function (Inverse Exponential)
+    # -----------------------
+    "reward_terminal_target": 1000000.0, # Target for inverse exp scaling
+    "reward_terminal_k": 2.0,            # Exp scaling factor
+    "reward_goal_penalty_rate": 0.5,     # Penalty per percentage missed
+    "reward_lambda_goal": 1.0,           # Weight for goal penalty loss
+    "reward_lambda_terminal": 1.0,       # Weight for terminal wealth loss
 
     # -----------------------
     # Simulation & Thresholds
     # -----------------------
     "sim_glide_path_tau": 8.0,
-    "sim_v_score_anchor": DEFAULT_V_SCORE_ANCHOR,
-    "sim_dynamic_k_theta": 0.5,
 }
 
 
