@@ -403,22 +403,13 @@ def simulate_batch(
 # Complements backtest_portfolio (daily-granularity training-label generator).
 # This function uses annual rolling windows for quick GFR/ETV assessment.
 
-def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config):
+def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config, debug_path=False):
     """
     Member C: Portfolio evaluation via historical rolling-window backtesting.
-
-    Strategy:
-        - Slice daily returns to [simulation_start_date, simulation_end_date]
-        - Run rolling-window simulations across a VARIETY of historical start points
-        - Each window plays out the user's full goal horizon
-        - Most recent 10-15 years serve as validation windows
-
-    Uses DRIP returns if available, otherwise price-only returns.
-
-    Returns:
-        dict with GFR, ETV, Objective_Function_Score, Total_Simulations
+    Restored with NaN-safe returns and configurable horizon modes.
     """
     weights = recommendations["portfolio_weights"]
+    mode = config.get("sim_horizon_mode", "ignore") # 'ignore' or 'loop'
 
     # Use DRIP returns if available, otherwise price-only
     base_returns = dataset.get("drip_daily_returns") or dataset["daily_returns"]
@@ -427,50 +418,87 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config):
     sim_start = pd.Timestamp(config.get("simulation_start_date", "2015-01-01"))
     sim_end   = pd.Timestamp(config.get("simulation_end_date", "2026-12-31"))
 
-    available_tickers = [t for t in weights.keys() if t in base_returns.columns]
-    if not available_tickers:
-        print(f"  WARNING: No portfolio tickers found in returns data!")
+    # FIX: NaN-Safe Returns. Only include tickers with non-zero WEIGHTS in the math.
+    active_tickers = [t for t in weights.keys() if weights[t] > 0.0001 and t in base_returns.columns]
+    
+    if not active_tickers:
+        if debug_path: print(f"  [DEBUG] No active tickers with data found.")
         return {"GFR": 0, "ETV": 0, "Objective_Function_Score": 0, "Total_Simulations": 0}
 
-    sim_returns = base_returns[available_tickers].loc[sim_start:sim_end]
+    sim_returns = base_returns[active_tickers].loc[sim_start:sim_end]
 
     # Compute portfolio-weighted daily returns
-    weight_series = pd.Series({t: weights[t] for t in available_tickers})
-    weight_series = weight_series / weight_series.sum()  # renormalize
+    weight_series = pd.Series({t: weights[t] for t in active_tickers})
+    weight_series = weight_series / weight_series.sum()  # ensure sum=1.0
+    
+    # Dot product is now NaN-safe because it only sees stocks we actually bought
     portfolio_returns = sim_returns.dot(weight_series)
     annual_returns = portfolio_returns.resample('YE').apply(lambda x: (1+x).prod() - 1)
 
-    max_horizon_years = max(user_profile['goals'].keys())
+    max_horizon_years = max(user_profile['goals'].keys()) if user_profile['goals'] else 1
     start_capital = user_profile['start_cap']
     successful_simulations, total_simulations = 0, 0
     terminal_values = []
 
-    # Rolling window: try every possible start year within the simulation range
-    for start_year in range(len(annual_returns) - max_horizon_years + 1):
-        if start_year + max_horizon_years > len(annual_returns):
-            break
+    if debug_path:
+        print(f"\n  [SIMULATOR DEBUG] Mode: {mode.upper()} | Available Data: {len(annual_returns)} years | Goal Horizon: {max_horizon_years} years")
+
+    # Rolling window: try starting at every year in our history
+    num_years = len(annual_returns)
+    for start_year_idx in range(num_years):
+        actual_start_date = annual_returns.index[start_year_idx].year
+        
+        # In 'ignore' mode, we only count scenarios where we have enough history 
+        # for at least the FIRST major goal, or at least 5 years.
+        # But for 'loop' mode, we can always simulate the full horizon.
+        if mode == "ignore" and (num_years - start_year_idx) < min(max_horizon_years, 5):
+            continue
 
         current_balance = start_capital
         bankrupt = False
+        trail = []
+        
+        # Decide how many years this specific simulation will run
+        sim_horizon = max_horizon_years if mode == "loop" else (num_years - start_year_idx)
 
-        path = annual_returns.iloc[start_year:start_year+max_horizon_years]
-        for year_idx, yr_return in enumerate(path):
+        for year_idx in range(sim_horizon):
+            # Calculate data index (supports looping via modulo)
+            data_idx = (start_year_idx + year_idx) % num_years
+            yr_return = annual_returns.iloc[data_idx]
+            
+            # Update balance
             current_balance = current_balance * (1 + yr_return)
-            actual_year = year_idx + 1
-            if actual_year in user_profile['goals']:
-                withdrawal = user_profile['goals'][actual_year]
+            actual_year_in_sim = year_idx + 1
+            
+            step_str = f"Y{actual_year_in_sim}: ${current_balance:,.0f} ({yr_return:+.1%})"
+            
+            # Check for goals
+            if actual_year_in_sim in user_profile['goals']:
+                withdrawal = user_profile['goals'][actual_year_in_sim]
                 current_balance -= withdrawal
+                step_str += f" | GOAL -${withdrawal:,.0f} -> ${current_balance:,.0f}"
                 if current_balance < 0:
                     bankrupt = True
-                    break
+                    step_str += " [BANKRUPT] ❌"
+                    trail.append(step_str)
+                    break 
+            
+            trail.append(step_str)
 
         total_simulations += 1
         if not bankrupt:
             successful_simulations += 1
             terminal_values.append(current_balance)
+            if debug_path:
+                print(f"    Path {actual_start_date} (Horizon {sim_horizon}): {' -> '.join(trail)} ✅")
+        elif debug_path:
+             print(f"    Path {actual_start_date} (Horizon {sim_horizon}): {' -> '.join(trail)} ❌")
 
     GFR = successful_simulations / total_simulations if total_simulations > 0 else 0
     ETV = np.median(terminal_values) if len(terminal_values) > 0 else 0
+    
+    # Scoring: weight ETV by GFR to penalize risky portfolios
+    from _constants import GFR_OBJECTIVE_THRESHOLD
     alpha = 1.0
     objective_score = (alpha * ETV) if GFR >= GFR_OBJECTIVE_THRESHOLD else (alpha * ETV) * (GFR / GFR_OBJECTIVE_THRESHOLD)
 
@@ -478,7 +506,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config):
 
 # ── RL Environment Step ───────────────────────────────────────────────────────
 
-def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config):
+def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config, debug_path=False):
     """
     Phase 4: The Black-Box Environment.
     Evaluates sampled portfolio weights through the non-differentiable simulator
@@ -493,7 +521,8 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
         dataset, 
         {"portfolio_weights": portfolio_weights}, 
         user_profile, 
-        config
+        config,
+        debug_path=debug_path
     )
     
     # 3. Retrieve Reward Hyperparameters & Dynamic Target

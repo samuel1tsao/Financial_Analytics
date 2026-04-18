@@ -89,7 +89,7 @@ DEFAULT_PIPELINE_CONFIG = {
     # -----------------------
     # System Execution Limits
     # -----------------------
-    "data_source_mode":  DataSyncMode.FULL_REBUILD,
+    "data_source_mode":  DataSyncMode.OFFLINE_CSV_ONLY,
     "data_start_date": "1962-01-01",
     "training_cutoff_date": "2015-01-01",
     "simulation_start_date": "2015-01-01",
@@ -142,6 +142,13 @@ DEFAULT_PIPELINE_CONFIG = {
     "reward_terminal_k": 2.0,            # Exp scaling factor
     "reward_goal_penalty_rate": 0.5,     # Penalty per percentage missed
     "reward_lambda_goal": 1.0,           # Weight for goal penalty loss
+    
+    # -----------------------
+    # Simulation Parameters
+    # -----------------------
+    "sim_horizon_mode": "ignore",        # 'ignore' (truncate) or 'loop' (cyclical padding)
+    "simulation_start_date": "2015-01-01",
+    "simulation_end_date": "2026-12-31",
     "reward_lambda_terminal": 1.0,       # Weight for terminal wealth loss
 
     # -----------------------

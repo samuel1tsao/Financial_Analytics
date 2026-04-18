@@ -48,6 +48,11 @@ class PortfolioTransformerRL(nn.Module):
         self.mu_head = nn.Linear(self.d_model, 1)
         self.sigma_head = nn.Linear(self.d_model, 1)
         
+        # Sparse Initialization: bias mu slightly negative so model starts by 'rejecting' 
+        # most items. A value of -0.1 is softer than -1.0, encouraging more 
+        # discovery during early training.
+        nn.init.constant_(self.mu_head.bias, -0.1)
+        
     def forward(self, x):
         """
         x shape: (batch_size, num_assets, input_dim)
@@ -113,8 +118,21 @@ def build_rl_dataset(dataset, user_profile, config):
     
     # User Profile Features
     risk_tolerance = float(user_profile.get("risk_tolerance", 5.0))
-    budget_score = user_profile.get("_risk_budget_score", risk_tolerance)
+    start_cap = float(user_profile.get("start_cap", 100000.0))
+    raw_goals = user_profile.get("goals", {})
     
+    # Encode Goals: 100-year dense timeline vector
+    # goal_vec[yr] = amount / start_cap
+    max_horizon = 100
+    goal_vec = [0.0] * max_horizon
+    for yr, amt in raw_goals.items():
+        # User specified: ignore goals beyond year 30
+        if 0 <= yr <= 30:
+            # Round to nearest year for index
+            idx = int(round(yr))
+            if idx < max_horizon:
+                goal_vec[idx] = float(amt / start_cap)
+            
     tickers = []
     feature_vectors = []
     
@@ -124,8 +142,9 @@ def build_rl_dataset(dataset, user_profile, config):
             
         static_features = master_df.loc[ticker, all_feature_cols].astype(float).tolist()
         
-        # Input Vector structure: [Autoencoder_Embedding, User_Risk, User_Budget, Static_Identity...]
-        full_vec = list(emb) + [risk_tolerance, budget_score] + static_features
+        # Input Vector structure: 
+        # [Autoencoder_Embedding, User_Risk, Start_Cap_Ratio, Goal_Timeline(100), Static_Identity...]
+        full_vec = list(emb) + [risk_tolerance, start_cap / 100000.0] + goal_vec + static_features
         
         tickers.append(ticker)
         feature_vectors.append(full_vec)
@@ -135,10 +154,11 @@ def build_rl_dataset(dataset, user_profile, config):
 
 from _sim_worker import simulate_rl_environment_step
 
-def train_rl_agent(dataset, user_profile, config, verbose=True):
+def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=True, debug_sim=False):
     """
     Phase 5: The Policy Gradient Update.
     Instantiates the RL agent, runs interactions with the simulator, and updates via REINFORCE.
+    Supporting 'Warm-Starts' for curriculum learning.
     """
     # 1. Build Ingestion Dataset
     tensor_x, tickers = build_rl_dataset(dataset, user_profile, config)
@@ -147,9 +167,16 @@ def train_rl_agent(dataset, user_profile, config, verbose=True):
         return {"portfolio_weights": {}, "training_history": []}
         
     input_dim = tensor_x.shape[-1]
-    agent = PortfolioTransformerRL(input_dim, config)
     
-    # 2. Setup Optimizer
+    # Use existing agent if provided (Warm Start), else create a new one
+    if existing_agent is not None:
+        agent = existing_agent
+        if verbose:
+            print(f"[{time.strftime('%H:%M:%S')}] [Member D] WARM START: Using existing agent weights.")
+    else:
+        agent = PortfolioTransformerRL(input_dim, config)
+    
+    # 2. Setup Optimizer - needs to be tied to the current agent instance
     lr = config.get("rl_learning_rate", 0.0001)
     episodes = config.get("rl_episodes", 100)
     optimizer = optim.Adam(agent.parameters(), lr=lr)
@@ -159,6 +186,7 @@ def train_rl_agent(dataset, user_profile, config, verbose=True):
         print(f"[{time.strftime('%H:%M:%S')}] [Member D] Starting RL Training Loop for {episodes} episodes...")
         
     history = []
+    last_action_weights = torch.zeros((1, len(tickers)))
     
     for ep in range(episodes):
         agent.train()
@@ -169,17 +197,13 @@ def train_rl_agent(dataset, user_profile, config, verbose=True):
         
         # Sample action and get log probability
         action_weights, log_prob = get_action_and_log_prob(mu, sigma)
+        last_action_weights = action_weights # Store for fallback
         
         # Phase 4: Environment interaction (Simulator)
-        # Detach action for the environment, it's a black box.
         action_numpy = action_weights.detach().numpy()
-        
         reward_scalar, metrics = simulate_rl_environment_step(action_numpy, tickers, dataset, user_profile, config)
         
         # Phase 5: Policy Gradient Update
-        # Loss = -Reward * log_prob
-        # We want to maximize reward, so we minimize -reward * log_prob
-        # log_prob shape is (1,), sum makes it a scalar.
         loss = -float(reward_scalar) * log_prob.sum()
         
         # Backprop
@@ -200,12 +224,33 @@ def train_rl_agent(dataset, user_profile, config, verbose=True):
     # Final Evaluation (greedy, no sampling noise)
     agent.eval()
     with torch.no_grad():
-        mu, _ = agent(tensor_x)
+        mu, sigma = agent(tensor_x)
         action_weights = F.relu(mu)
         action_sum = action_weights.sum(dim=-1, keepdim=True) + 1e-9
-        final_weights = action_weights / action_sum
+        greedy_weights = action_weights / action_sum
         
-    portfolio_weights = {tickers[i]: float(final_weights[0, i]) for i in range(len(tickers))}
+    # Use greedy weights if available, otherwise fallback to last sampled (stochastic) weights
+    # ensuring the "breakdown" is always populated during early training exploration.
+    if greedy_weights.sum() > 0.001:
+        final_weights_tensor = greedy_weights
+        if verbose: print("  [DEBUG] Using GREEDY policy for final breakdown.")
+    else:
+        final_weights_tensor = last_action_weights
+        if verbose: print("  [DEBUG] Greedy policy empty; using last STOCHASTIC sample for breakdown.")
+
+    # Final Verification Sim (to get full metrics with optional debug paths)
+    final_reward, final_metrics = simulate_rl_environment_step(
+        final_weights_tensor.detach().numpy(), 
+        tickers, 
+        dataset, 
+        user_profile, 
+        config,
+        debug_path=debug_sim
+    )
+
+    portfolio_weights = {tickers[i]: float(final_weights_tensor[0, i]) for i in range(len(tickers))}
+    policy_params = {tickers[i]: {"mu": float(mu[0, i]), "sigma": float(sigma[0, i])} for i in range(len(tickers))}
+    
     selected_assets = {k: v for k, v in portfolio_weights.items() if v > 0.001}
     
     # Normalize selected assets
@@ -215,6 +260,10 @@ def train_rl_agent(dataset, user_profile, config, verbose=True):
     
     return {
         "portfolio_weights": selected_assets,
+        "policy_params": policy_params,
         "training_history": history,
-        "final_reward": history[-1]["reward"] if history else 0.0
+        "agent": agent,
+        "final_reward": final_reward,
+        "final_metrics": final_metrics,
+        "tickers": tickers
     }
