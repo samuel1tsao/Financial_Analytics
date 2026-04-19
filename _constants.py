@@ -114,13 +114,17 @@ DEFAULT_PIPELINE_CONFIG = {
     # -----------------------
     # Neural Network Geometry
     # -----------------------
-    "ml_embedding_dim": 8,
-    "ml_hidden_layers": [128, 64, 32],
+    "ml_max_seq_len": 1260,          # 5 years * 252 days.
+    "ml_d_model": 64,
+    "ml_nhead": 4,
+    "ml_num_encoder_layers": 2,
+    "ml_dim_feedforward": 128,
+    "ml_embedding_dim": 8,           
     "ml_target_metrics": ["return", "volatility", "volume"],
     "ml_target_horizons": [1, 3, 5, 10, 15],
     "ml_horizon_weights": {1: 1.0, 3: 0.8, 5: 0.6, 10: 0.4, 15: 0.2},
     "ml_epochs": 150,
-    "ml_batch_size": 64,
+    "ml_batch_size": 32,             # Lowered from 64 to fit sequence model into memory
     "ml_learning_rate": 0.001,
     "ml_time_decay_half_life": 10,
 
@@ -132,8 +136,8 @@ DEFAULT_PIPELINE_CONFIG = {
     "rl_num_encoder_layers": 4,
     "rl_dim_feedforward": 256,
     "rl_dropout": 0.1,
-    "rl_learning_rate": 0.0001,
-    "rl_episodes": 100,
+    "rl_learning_rate": 0.001,
+    "rl_episodes": 1000,
 
     # -----------------------
     # Reward Function (Inverse Exponential)
@@ -155,6 +159,15 @@ DEFAULT_PIPELINE_CONFIG = {
     # Simulation & Thresholds
     # -----------------------
     "sim_glide_path_tau": 8.0,
+
+    # -----------------------
+    # Validation & Splitting
+    # -----------------------
+    "ml_validation_mode": "absolute",       # 'absolute' (years) or 'proportional' (%)
+    "ml_validation_horizon_years": 20,
+    "ml_validation_percent": 0.20,
+    "ml_cache_dir": "cache",
+    "ml_force_retrain": False,
 }
 
 

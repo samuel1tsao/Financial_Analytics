@@ -1,47 +1,130 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import pandas as pd
 import numpy as np
 import time
+import math
 import os
+import pickle
+from tqdm import tqdm
 
 from _constants import TRADING_DAYS_PER_YEAR
 
-class AssetEmbeddingNet(nn.Module):
-    def __init__(self, input_dim, config, output_dim):
-        super(AssetEmbeddingNet, self).__init__()
-        
-        hidden_layers = config.get("ml_hidden_layers", [128, 64, 32])
-        emb_dim = config.get("ml_embedding_dim", 8)
-        
-        # Encoder
-        enc_layers = []
-        in_d = input_dim
-        for h in hidden_layers:
-            enc_layers.append(nn.Linear(in_d, h))
-            enc_layers.append(nn.ReLU())
-            enc_layers.append(nn.LayerNorm(h)) # Stable training
-            in_d = h
-            
-        enc_layers.append(nn.Linear(in_d, emb_dim))
-        self.encoder = nn.Sequential(*enc_layers)
-        
-        # Decoder
-        dec_layers = []
-        in_d = emb_dim
-        for h in reversed(hidden_layers):
-            dec_layers.append(nn.Linear(in_d, h))
-            dec_layers.append(nn.ReLU())
-            in_d = h
-            
-        dec_layers.append(nn.Linear(in_d, output_dim))
-        self.decoder = nn.Sequential(*dec_layers)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        emb = self.encoder(x)
-        out = self.decoder(emb)
-        return emb, out
+        x = x + self.pe[:, :x.size(1), :]
+        return x
+
+class AssetTransformerNet(nn.Module):
+    def __init__(self, input_dim, config, output_macro_dim, output_ar_dim):
+        super(AssetTransformerNet, self).__init__()
+        self.d_model = config.get("ml_d_model", 64)
+        self.max_seq_len = config.get("ml_max_seq_len", 3780)
+        
+        self.input_proj = nn.Linear(input_dim, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model, max_len=max(self.max_seq_len, 5000))
+        
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=config.get("ml_nhead", 4),
+            dim_feedforward=config.get("ml_dim_feedforward", 128),
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layers,
+            num_layers=config.get("ml_num_encoder_layers", 2)
+        )
+        
+        self.emb_dim = config.get("ml_embedding_dim", 8)
+        self.bottleneck = nn.Sequential(
+            nn.Linear(self.d_model, self.emb_dim),
+            nn.ReLU()
+        )
+        
+        self.head_macro = nn.Linear(self.emb_dim, output_macro_dim)
+        self.head_ar = nn.Linear(self.d_model, output_ar_dim)
+
+    def generate_square_subsequent_mask(self, sz, device):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask.to(device)
+
+    def forward(self, src, src_key_padding_mask=None):
+        x = self.input_proj(src)
+        x = self.pos_encoder(x)
+        
+        seq_len = src.size(1)
+        mask = self.generate_square_subsequent_mask(seq_len, src.device)
+        
+        out = self.transformer_encoder(x, mask=mask, src_key_padding_mask=src_key_padding_mask)
+        
+        ar_preds = self.head_ar(out)
+        
+        if src_key_padding_mask is not None:
+            lengths = (~src_key_padding_mask).sum(dim=1) - 1
+            lengths = torch.clamp(lengths, min=0)
+            idx = lengths.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.d_model)
+            last_tokens = torch.gather(out, 1, idx).squeeze(1)
+        else:
+            last_tokens = out[:, -1, :]
+            
+        emb = self.bottleneck(last_tokens)
+        macro_preds = self.head_macro(emb)
+        
+        return ar_preds, macro_preds, emb
+
+class TransformerDataset(torch.utils.data.Dataset):
+    def __init__(self, samples, ticker_data, X_mean, X_std, max_len):
+        self.samples = samples
+        self.ticker_data = ticker_data
+        self.X_mean = X_mean
+        self.X_std = X_std
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        ticker, target_date, y_vec, y_w_vec = self.samples[idx]
+        info = self.ticker_data[ticker]
+        
+        dates = info['dates']
+        feats = info['feats']
+        target_np64 = np.datetime64(target_date)
+        idx_end = np.searchsorted(dates, target_np64, side='right')
+        
+        hist_feats = feats[max(0, idx_end - self.max_len):idx_end]
+        L = len(hist_feats)
+        
+        static_feats = np.tile(info['static'], (L, 1))
+        seq = np.concatenate([hist_feats, static_feats], axis=1)
+        
+        seq_norm = (torch.tensor(seq, dtype=torch.float32) - self.X_mean) / self.X_std
+        return seq_norm, torch.tensor(y_vec, dtype=torch.float32), torch.tensor(y_w_vec, dtype=torch.float32)
+
+def collate_fn(batch):
+    seqs, ys, yws = zip(*batch)
+    lengths = torch.tensor([len(s) for s in seqs])
+    padded_seqs = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=0.0)
+    ys = torch.stack(ys)
+    yws = torch.stack(yws)
+    
+    L_max = padded_seqs.shape[1]
+    mask = torch.arange(L_max)[None, :] >= lengths[:, None]
+    
+    return padded_seqs, ys, yws, mask
 
 class EarlyStopping:
     def __init__(self, patience=5, min_delta=1e-4):
@@ -66,31 +149,38 @@ def masked_weighted_mse_loss(pred, target, weights):
     mask = ~torch.isnan(target)
     if mask.sum() == 0:
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    
     diff = pred[mask] - target[mask]
     w = weights[mask]
-    loss = (w * (diff ** 2)).mean()
-    return loss
+    return (w * (diff ** 2)).mean()
 
 def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, verbose=True):
-    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Initializing Top-K Time-Decayed Embedding Network...")
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Initializing Dual-Head Sequence Transformer...")
     
-    # 1. Base Setup
+    # Base Setup
     horizons = config.get("ml_target_horizons", [1, 3, 5, 10, 15])
     horizon_weights = config.get("ml_horizon_weights", {1: 1.0, 3: 0.8, 5: 0.6, 10: 0.4, 15: 0.2})
     target_metrics = config.get("ml_target_metrics", ["return", "volatility", "volume"])
-    output_dim = len(horizons) * len(target_metrics) # e.g. 5 * 3 = 15
+    output_macro_dim = len(horizons) * len(target_metrics)
+    output_ar_dim = 3 # (return, volatility, log_volume)
+    max_seq_len = config.get("ml_max_seq_len", 3780)
     
-    # 2. Compute Return & Volatility Snapshots
     if drip_daily_returns is not None:
         annual_returns = drip_daily_returns.resample('YE').apply(lambda x: (1 + x).prod() - 1)
         annual_vols = drip_daily_returns.resample('YE').std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+        daily_ret = drip_daily_returns.copy()
     else:
         annual_returns = daily_returns.resample('YE').apply(lambda x: (1 + x).prod() - 1)
         annual_vols = daily_returns.resample('YE').std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+        daily_ret = daily_returns.copy()
         
     daily_log_vol = np.log1p(volume_matrix).diff().dropna(how='all')
     annual_log_vol = daily_log_vol.resample('YE').sum().reindex(index=annual_returns.index, columns=price_matrix.columns).fillna(0)
+    
+    # Feature engineering for sequences
+    daily_logv = np.log1p(volume_matrix)
+    daily_vol = daily_ret.rolling(21, min_periods=1).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    daily_vol = daily_vol.fillna(0.0)
+    daily_ret = daily_ret.fillna(0.0)
     
     metric_sources = {
         "return": annual_returns,
@@ -98,51 +188,80 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
         "volume": annual_log_vol
     }
 
-    # 3. Assemble Dataset
-    features = config.get("ml_training_features", ["hist_momentum", "hist_volatility", "hist_volume", "sector", "industry", "state", "quoteType", "exchange"])
-    
     categorical_cols = ["sector", "industry", "state", "quoteType", "exchange"]
-    numerical_cols = ["hist_momentum", "hist_volatility", "hist_volume"]
-    
     master_encoded = pd.get_dummies(master_df, columns=[c for c in categorical_cols if c in master_df.columns], drop_first=True)
     all_feature_cols = [c for c in master_encoded.columns if any(c.startswith(cat + "_") for cat in categorical_cols)]
     
-    if "hist_momentum" not in master_encoded.columns:
-        master_encoded["hist_momentum"] = 0.0
-        master_encoded["hist_volatility"] = 0.0
-        master_encoded["hist_volume"] = 0.0
+    ticker_data = {}
+    for ticker in master_df.index:
+        if ticker not in daily_ret.columns: continue
+        
+        df_t = pd.DataFrame({
+            'ret': daily_ret[ticker],
+            'vol': daily_vol[ticker],
+            'logv': daily_logv[ticker]
+        }).dropna()
+        
+        if len(df_t) < 252: continue
+        
+        feat_vec = master_encoded.loc[ticker, all_feature_cols].astype(float).values
+        ticker_data[ticker] = {
+            'dates': df_t.index.values,
+            'feats': df_t.values,
+            'static': feat_vec
+        }
     
-    X_samples, Y_samples, Y_weights = [], [], []
-    valid_years = annual_returns.index
+    # 1. Filter Tickers with < 20 Years of History (as per User Request)
+    # -------------------------------------------------------------------------
+    min_history_years = config.get("ml_validation_horizon_years", 20)
+    required_days = min_history_years * TRADING_DAYS_PER_YEAR
+    
+    eligible_ticker_data = {}
+    for ticker, info in ticker_data.items():
+        if len(info['feats']) >= required_days:
+            eligible_ticker_data[ticker] = info
+        elif verbose:
+            print(f"  [Member A] Excluding '{ticker}': Insufficient history ({len(info['feats'])} days < {required_days})")
+            
+    ticker_data = eligible_ticker_data
+    if not ticker_data:
+        raise ValueError(f"No tickers found with at least {min_history_years} years of historical data.")
+
+    # Compute Normalization Stats efficiently
+    all_dyn = np.vstack([info['feats'] for info in ticker_data.values()])
+    all_static = np.vstack([info['static'] for info in ticker_data.values()])
+    
+    dyn_mean = all_dyn.mean(axis=0)
+    dyn_std  = all_dyn.std(axis=0) + 1e-8
+    static_mean = all_static.mean(axis=0)
+    static_std  = all_static.std(axis=0) + 1e-8
+    
+    X_mean = torch.tensor(np.concatenate([dyn_mean, static_mean]), dtype=torch.float32)
+    X_std  = torch.tensor(np.concatenate([dyn_std, static_std]), dtype=torch.float32)
+    
+    input_dim = X_mean.shape[0]
+
+    # Sample Generation
+    samples = []
+    Y_samples, Y_weights = [], []
+    valid_years = sorted(annual_returns.index)
     
     half_life = config.get("ml_time_decay_half_life", 10)
     max_year = valid_years[-1].year if len(valid_years) > 0 else 2026
     
     for i in range(1, len(valid_years) - 1):
-        for ticker in master_df.index:
-            if ticker not in annual_returns.columns: continue
-            
-            p_prior = price_matrix[ticker].loc[:valid_years[i]].dropna()
-            v_prior = volume_matrix[ticker].loc[:valid_years[i]].dropna()
-            
-            if len(p_prior) < TRADING_DAYS_PER_YEAR: continue
-            
-            mom = (p_prior.iloc[-1] / p_prior.iloc[-TRADING_DAYS_PER_YEAR]) - 1
-            vol = p_prior.pct_change().tail(TRADING_DAYS_PER_YEAR).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-            logv = np.log1p(v_prior.tail(TRADING_DAYS_PER_YEAR).sum())
-            
-            # Point-in-time features
-            feat_vec = master_encoded.loc[ticker, all_feature_cols].astype(float).tolist()
-            # prepend numerical
-            feat_vec = [float(mom), float(vol), float(logv)] + feat_vec
-            
+        target_date = valid_years[i]
+        for ticker, info in ticker_data.items():
+            first_valid_date = pd.Timestamp(info['dates'][0])
+            if target_date < first_valid_date + pd.Timedelta(days=365):
+               continue
+               
             y_vec = []
             y_w_vec = []
             
-            # Time decay weighting based on the current year
             time_w = 1.0
             if half_life is not None:
-                time_w = 2.0 ** (-(max_year - valid_years[i].year) / half_life)
+                time_w = 2.0 ** (-(max_year - target_date.year) / half_life)
                 
             has_valid = False
             for h in horizons:
@@ -151,86 +270,123 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
                         val = metric_sources[metric][ticker].iloc[i+1 : i+h+1].mean()
                         y_vec.append(val if pd.notna(val) else np.nan)
                         y_w_vec.append(horizon_weights[h] * time_w)
-                        if pd.notna(val):
-                            has_valid = True
+                        if pd.notna(val): has_valid = True
                 else:
                     y_vec.extend([np.nan] * len(target_metrics))
                     y_w_vec.extend([horizon_weights[h] * time_w] * len(target_metrics))
                     
             if has_valid:
-                X_samples.append(feat_vec)
+                samples.append((ticker, target_date, y_vec, y_w_vec))
                 Y_samples.append(y_vec)
-                Y_weights.append(y_w_vec)
-                
-    X_tensor = torch.tensor(X_samples, dtype=torch.float32)
+    
     Y_tensor = torch.tensor(Y_samples, dtype=torch.float32)
-    W_tensor = torch.tensor(Y_weights, dtype=torch.float32)
-    
-    # Normalize
-    X_mean = X_tensor.mean(dim=0, keepdim=True)
-    X_std  = X_tensor.std(dim=0, keepdim=True) + 1e-8
-    X_norm = (X_tensor - X_mean) / X_std
-    
-    # Safe Y normalization
     Y_mean = torch.nanmean(Y_tensor, dim=0, keepdim=True)
-    
     Y_std = []
     for col in range(Y_tensor.shape[1]):
         col_data = Y_tensor[:, col]
         col_data = col_data[~torch.isnan(col_data)]
-        if len(col_data) > 1:
-            Y_std.append(col_data.std().item() + 1e-8)
-        else:
-            Y_std.append(1.0)
+        Y_std.append(col_data.std().item() + 1e-8 if len(col_data) > 1 else 1.0)
     Y_std = torch.tensor(Y_std, dtype=torch.float32).unsqueeze(0)
     
-    Y_norm = (Y_tensor - Y_mean) / Y_std
-
-    model = AssetEmbeddingNet(input_dim=X_norm.shape[1], config=config, output_dim=output_dim)
-    optimizer = optim.Adam(model.parameters(), lr=config.get("ml_learning_rate", 0.001))
+    # Store normalized targets based on TEMPORAL SPLIT (as per User Request)
+    # -------------------------------------------------------------------------
+    val_mode = config.get("ml_validation_mode", "absolute")
+    val_years = config.get("ml_validation_horizon_years", 20)
+    val_pct = config.get("ml_validation_percent", 0.20)
     
+    # Identify the global timeline cutoff
+    max_dt = pd.Timestamp(valid_years[-1])
+    if val_mode == "absolute":
+        cutoff_date = max_dt - pd.DateOffset(years=val_years)
+    else:
+        # Proportional: Find the date at the Nth percentile of the total year-range
+        timeline_len = (max_dt - pd.Timestamp(valid_years[0])).days
+        cutoff_date = pd.Timestamp(valid_years[0]) + pd.Timedelta(days=int(timeline_len * (1.0 - val_pct)))
+        
+    train_samples = []
+    val_samples = []
+    
+    for (ticker, td, yv, ywv) in samples:
+        # Normalize target
+        n_yv = (torch.tensor(yv) - Y_mean.squeeze(0)) / Y_std.squeeze(0)
+        sample_tuple = (ticker, td, n_yv.tolist(), ywv)
+        
+        if pd.Timestamp(td) < cutoff_date:
+            train_samples.append(sample_tuple)
+        else:
+            val_samples.append(sample_tuple)
+            
+    if verbose:
+        print(f"  [Member A] Temporal Split Cutoff: {cutoff_date.date()}")
+        print(f"  [Member A] Train Samples: {len(train_samples)} (Pre-{cutoff_date.year})")
+        print(f"  [Member A] Val Samples:   {len(val_samples)} ({cutoff_date.year}+)")
+
+    train_ds = TransformerDataset(train_samples, ticker_data, X_mean, X_std, max_seq_len)
+    val_ds   = TransformerDataset(val_samples, ticker_data, X_mean, X_std, max_seq_len)
+    
+    batch_size = config.get("ml_batch_size", 32)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    model = AssetTransformerNet(input_dim=input_dim, config=config, output_macro_dim=output_macro_dim, output_ar_dim=output_ar_dim)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=config.get("ml_learning_rate", 0.001))
     epochs = config.get("ml_epochs", 150)
-    batch_size = config.get("ml_batch_size", 64)
     early_stopping = EarlyStopping(patience=10, min_delta=1e-4)
 
-    # 80/20 train/val split
-    num_samples = X_norm.shape[0]
-    indices = torch.randperm(num_samples)
-    val_size = int(0.2 * num_samples)
-    
-    train_indices = indices[val_size:]
-    val_indices = indices[:val_size]
-    
-    train_X, train_Y, train_W = X_norm[train_indices], Y_norm[train_indices], W_tensor[train_indices]
-    val_X, val_Y, val_W = X_norm[val_indices], Y_norm[val_indices], W_tensor[val_indices]
-    
-    dataset = torch.utils.data.TensorDataset(train_X, train_Y, train_W)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
     if verbose:
-        print(f"[{time.strftime('%H:%M:%S')}] [Member A] Training {len(train_indices)} samples / Validating {len(val_indices)} samples. Output dim: {output_dim}")
+        print(f"[{time.strftime('%H:%M:%S')}] [Member A] Training {len(train_ds)} limit: {max_seq_len} tokens / Valid {len(val_ds)}. (Device: {device})")
 
     best_val_loss = float('inf')
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        for b_x, b_y, b_w in loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", disable=not verbose, leave=False)
+        for b_x, b_y, b_w, b_mask in pbar:
+            b_x, b_y, b_w, b_mask = b_x.to(device), b_y.to(device), b_w.to(device), b_mask.to(device)
             optimizer.zero_grad()
-            _, pred = model(b_x)
-            loss = masked_weighted_mse_loss(pred, b_y, b_w)
+            
+            ar_preds, macro_preds, _ = model(b_x, src_key_padding_mask=b_mask)
+            
+            valid_ar_mask = ~b_mask[:, 1:] 
+            target_ar = b_x[:, 1:, :3] 
+            diff_ar = ar_preds[:, :-1, :][valid_ar_mask] - target_ar[valid_ar_mask]
+            
+            ar_loss = (diff_ar ** 2).mean() if valid_ar_mask.sum() > 0 else 0.0
+            macro_loss = masked_weighted_mse_loss(macro_preds, b_y, b_w)
+            
+            loss = ar_loss + macro_loss
             if loss.requires_grad and not torch.isnan(loss) and loss.item() > 0:
                 loss.backward()
                 optimizer.step()
-                total_loss += loss.item()
-        
+                curr_loss = loss.item()
+                total_loss += curr_loss
+                pbar.set_postfix({"loss": f"{curr_loss:.4f}"})
+                
         model.eval()
+        val_loss_sum = 0
+        vbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", disable=not verbose, leave=False)
         with torch.no_grad():
-            _, val_pred = model(val_X)
-            val_loss = masked_weighted_mse_loss(val_pred, val_Y, val_W).item()
+            for b_x, b_y, b_w, b_mask in vbar:
+                b_x, b_y, b_w, b_mask = b_x.to(device), b_y.to(device), b_w.to(device), b_mask.to(device)
+                ar_preds, macro_preds, _ = model(b_x, src_key_padding_mask=b_mask)
+                valid_ar_mask = ~b_mask[:, 1:] 
+                target_ar = b_x[:, 1:, :3] 
+                diff_ar = ar_preds[:, :-1, :][valid_ar_mask] - target_ar[valid_ar_mask]
+                ar_loss = (diff_ar ** 2).mean() if valid_ar_mask.sum() > 0 else 0.0
+                macro_loss = masked_weighted_mse_loss(macro_preds, b_y, b_w)
+                v_loss = (ar_loss + macro_loss).item()
+                val_loss_sum += v_loss
+                vbar.set_postfix({"v_loss": f"{v_loss:.4f}"})
+                
+        val_loss = val_loss_sum / max(1, len(val_loader))
         
         if verbose and (epoch + 1) % 10 == 0:
-            print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch+1}/{epochs} | Train Loss: {total_loss/len(loader):.4f} | Val Loss: {val_loss:.4f}")
+            print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch+1}/{epochs} | Train Dual-Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f}")
             
         early_stopping(val_loss)
         best_val_loss = early_stopping.best_loss
@@ -239,34 +395,28 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
                 print(f"[{time.strftime('%H:%M:%S')}] Early stopping triggered at epoch {epoch+1}")
             break
 
-    # Extract Embeddings
+    # Extract Current Embeddings for all assets
     model.eval()
     embeddings = {}
     asset_predictions = {}
     
     with torch.no_grad():
-        for ticker in master_df.index:
-            if ticker not in annual_returns.columns: continue
-            p_prior = price_matrix[ticker].dropna()
-            v_prior = volume_matrix[ticker].dropna()
+        for ticker, info in ticker_data.items():
+            feats = info['feats'][-max_seq_len:]
+            L = len(feats)
+            static_feats = np.tile(info['static'], (L, 1))
+            seq = np.concatenate([feats, static_feats], axis=1)
             
-            if len(p_prior) < TRADING_DAYS_PER_YEAR: continue
-            
-            mom = (p_prior.iloc[-1] / p_prior.iloc[-TRADING_DAYS_PER_YEAR]) - 1
-            vol = p_prior.pct_change().tail(TRADING_DAYS_PER_YEAR).std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-            logv = np.log1p(v_prior.tail(TRADING_DAYS_PER_YEAR).sum())
-            
-            feat_vec = master_encoded.loc[ticker, all_feature_cols].astype(float).tolist()
-            feat_vec = [float(mom), float(vol), float(logv)] + feat_vec
-            
-            x_t = torch.tensor([feat_vec], dtype=torch.float32)
+            x_t = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
             x_norm = (x_t - X_mean) / X_std
+            x_norm = x_norm.to(device)
             
-            emb, pred = model(x_norm)
-            embeddings[ticker] = emb.squeeze(0).numpy()
+            # Predict
+            mask = torch.zeros((1, L), dtype=torch.bool).to(device)
+            _, pred, emb = model(x_norm, src_key_padding_mask=mask)
+            embeddings[ticker] = emb.squeeze(0).cpu().numpy()
             
-            # Denormalize predictions
-            pred_raw = (pred.squeeze(0) * Y_std.squeeze(0) + Y_mean.squeeze(0)).numpy()
+            pred_raw = (pred.squeeze(0).cpu() * Y_std.squeeze(0) + Y_mean.squeeze(0)).numpy()
             preds = {}
             idx = 0
             for h in horizons:
@@ -276,7 +426,7 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
                     idx += 1
             asset_predictions[ticker] = preds
             
-    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Generated dynamic embeddings & predictions for {len(embeddings)} assets.")
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Generated dynamic sequence embeddings for {len(embeddings)} assets.")
     
     return {
         "dynamic_embeddings": embeddings,
@@ -286,46 +436,112 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
         "volume_matrix": volume_matrix,
         "daily_returns": daily_returns,
         "drip_daily_returns": drip_daily_returns,
-        "val_loss": best_val_loss
+        "val_loss": best_val_loss,
+        "model_state": model.state_dict(),
+        "X_mean": X_mean,
+        "X_std": X_std,
+        "Y_mean": Y_mean,
+        "Y_std": Y_std,
+        "input_dim": input_dim,
+        "output_macro_dim": output_macro_dim,
+        "output_ar_dim": output_ar_dim
     }
 
 def run_ml_grid_search(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None):
-    """
-    Runs a grid search over specified hyperparameters in PIPELINE_CONFIG.
-    Returns a pandas DataFrame of results.
-    """
-    print(f"[{time.strftime('%H:%M:%S')}] Starting Grid Search...")
-    
-    # Expand lists or single values into iterations
+    print(f"[{time.strftime('%H:%M:%S')}] Starting Sequence Transformer Grid Search...")
     lrs = config.get("grid_lrs", [config.get("ml_learning_rate", 0.001)])
-    batch_sizes = config.get("grid_batch_sizes", [config.get("ml_batch_size", 64)])
-    hidden_dims = config.get("grid_hidden_layers", [config.get("ml_hidden_layers", [128, 64, 32])])
+    batch_sizes = config.get("grid_batch_sizes", [config.get("ml_batch_size", 32)])
+    d_models = config.get("grid_d_models", [config.get("ml_d_model", 64)])
     
     results = []
-    
     for lr in lrs:
         for bs in batch_sizes:
-            for hd in hidden_dims:
+            for dm in d_models:
                 run_config = config.copy()
                 run_config["ml_learning_rate"] = lr
                 run_config["ml_batch_size"] = bs
-                run_config["ml_hidden_layers"] = hd
+                run_config["ml_d_model"] = dm
                 
-                print(f"\\n--- Testing Config: LR={lr}, BatchSize={bs}, HiddenDims={hd} ---")
-                
+                print(f"\\n--- Testing Config: LR={lr}, BatchSize={bs}, d_model={dm} ---")
                 cache = train_pytorch_embedding_model(
                     master_df, price_matrix, volume_matrix, daily_returns, 
-                    run_config, 
-                    drip_daily_returns=drip_daily_returns,
-                    verbose=False
+                    run_config, drip_daily_returns=drip_daily_returns, verbose=False
                 )
-                
-                results.append({
-                    "LR": lr,
-                    "Batch Size": bs,
-                    "Hidden Dims": str(hd),
-                    "Val MSE": cache["val_loss"]
-                })
+                results.append({"LR": lr, "Batch Size": bs, "d_model": dm, "Val MSE": cache["val_loss"]})
                 
     df = pd.DataFrame(results).sort_values("Val MSE").reset_index(drop=True)
     return df
+
+def save_embedding_cache(cache_data, folder="cache"):
+    """
+    Saves only the essential embedding results and model state to disk.
+    Raw price/volume matrices are EXCLUDED to save space (they are re-loaded from CSV anyway).
+    """
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+        
+    model_path = os.path.join(folder, "asset_transformer.pt")
+    data_path = os.path.join(folder, "embedding_results.pkl")
+    
+    # 1. Save results dict (embeddings & predictions)
+    save_dict = {
+        "dynamic_embeddings": cache_data.get("dynamic_embeddings"),
+        "asset_predictions": cache_data.get("asset_predictions"),
+        "val_loss": cache_data.get("val_loss")
+    }
+    with open(data_path, "wb") as f:
+        pickle.dump(save_dict, f)
+        
+    # 2. Save model state and normalization stats
+    # We assume 'model' and 'stats' are stored in the cache_data if we just trained
+    # or passed separately. For simplicity, let's just save what we need.
+    if "model_state" in cache_data:
+        torch.save({
+            "model_state": cache_data["model_state"],
+            "X_mean": cache_data["X_mean"],
+            "X_std": cache_data["X_std"],
+            "Y_mean": cache_data["Y_mean"],
+            "Y_std": cache_data["Y_std"],
+            "input_dim": cache_data.get("input_dim"),
+            "output_macro_dim": cache_data.get("output_macro_dim"),
+            "output_ar_dim": cache_data.get("output_ar_dim")
+        }, model_path)
+    
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Cache saved to '{folder}/'")
+
+def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, folder="cache"):
+    """
+    Loads saved model and embeddings from disk if they exist.
+    """
+    model_path = os.path.join(folder, "asset_transformer.pt")
+    data_path = os.path.join(folder, "embedding_results.pkl")
+    
+    if not os.path.exists(model_path) or not os.path.exists(data_path):
+        return None
+        
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Loading existing cache from '{folder}/'...")
+    
+    try:
+        # 1. Load data results
+        with open(data_path, "rb") as f:
+            data = pickle.load(f)
+            
+        # 2. Load model state (optional if purely using cached embeddings, but good for future inference)
+        checkpoint = torch.jit.load(model_path) if model_path.endswith(".zip") else torch.load(model_path, map_location='cpu')
+        
+        # Re-assemble the DATA_CACHE
+        cache = {
+            "dynamic_embeddings": data["dynamic_embeddings"],
+            "asset_predictions": data["asset_predictions"],
+            "master_df": master_df,
+            "price_matrix": price_matrix,
+            "volume_matrix": volume_matrix,
+            "daily_returns": daily_returns,
+            "drip_daily_returns": drip_daily_returns,
+            "val_loss": data.get("val_loss"),
+            "model_checkpoint": checkpoint # Store for external inference use
+        }
+        return cache
+    except Exception as e:
+        print(f"  [WARNING] Failed to load cache: {e}")
+        return None

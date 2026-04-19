@@ -16,7 +16,11 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import time
+import os
 from typing import Dict, Tuple
+
+# Enable GPU globally if available
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class PortfolioTransformerRL(nn.Module):
     def __init__(self, input_dim, config):
@@ -149,7 +153,7 @@ def build_rl_dataset(dataset, user_profile, config):
         tickers.append(ticker)
         feature_vectors.append(full_vec)
         
-    tensor_x = torch.tensor([feature_vectors], dtype=torch.float32)
+    tensor_x = torch.tensor([feature_vectors], dtype=torch.float32).to(DEVICE)
     return tensor_x, tickers
 
 from _sim_worker import simulate_rl_environment_step
@@ -174,7 +178,7 @@ def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=T
         if verbose:
             print(f"[{time.strftime('%H:%M:%S')}] [Member D] WARM START: Using existing agent weights.")
     else:
-        agent = PortfolioTransformerRL(input_dim, config)
+        agent = PortfolioTransformerRL(input_dim, config).to(DEVICE)
     
     # 2. Setup Optimizer - needs to be tied to the current agent instance
     lr = config.get("rl_learning_rate", 0.0001)
@@ -186,7 +190,7 @@ def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=T
         print(f"[{time.strftime('%H:%M:%S')}] [Member D] Starting RL Training Loop for {episodes} episodes...")
         
     history = []
-    last_action_weights = torch.zeros((1, len(tickers)))
+    last_action_weights = torch.zeros((1, len(tickers))).to(DEVICE)
     
     for ep in range(episodes):
         agent.train()
@@ -200,8 +204,9 @@ def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=T
         last_action_weights = action_weights # Store for fallback
         
         # Phase 4: Environment interaction (Simulator)
-        action_numpy = action_weights.detach().numpy()
-        reward_scalar, metrics = simulate_rl_environment_step(action_numpy, tickers, dataset, user_profile, config)
+        # Move weights to CPU for non-differentiable NumPy simulator
+        action_numpy = action_weights.detach().cpu().numpy()
+        reward_scalar, metrics = simulate_rl_environment_step(action_numpy, tickers, dataset, user_profile, config, debug_path=True)
         
         # Phase 5: Policy Gradient Update
         loss = -float(reward_scalar) * log_prob.sum()
@@ -218,7 +223,7 @@ def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=T
             "GFR": metrics.get("GFR", 0)
         })
         
-        if verbose and (ep + 1) % 10 == 0:
+        if verbose:
             print(f"[{time.strftime('%H:%M:%S')}] Episode {ep+1}/{episodes} | Reward: {reward_scalar:.4f} | ETV: ${metrics.get('ETV',0):,.0f} | GFR: {metrics.get('GFR',0):.2f}")
             
     # Final Evaluation (greedy, no sampling noise)
@@ -240,7 +245,7 @@ def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=T
 
     # Final Verification Sim (to get full metrics with optional debug paths)
     final_reward, final_metrics = simulate_rl_environment_step(
-        final_weights_tensor.detach().numpy(), 
+        final_weights_tensor.detach().cpu().numpy(), 
         tickers, 
         dataset, 
         user_profile, 

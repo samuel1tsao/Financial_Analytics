@@ -16,6 +16,7 @@ This is the label fed to the two-tower recommendation model.
 
 import numpy as np
 import pandas as pd
+import joblib
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -399,6 +400,54 @@ def simulate_batch(
     return results
 
 
+def _run_single_year_path(year_idx, start_year_idx, num_years, annual_returns, start_capital, goals, mode, max_horizon_years, debug_path):
+    """
+    Helper function for parallel execution. Simulates a single historical start-year path.
+    """
+    actual_start_date = annual_returns.index[start_year_idx].year
+    current_balance = start_capital
+    bankrupt = False
+    trail = []
+    
+    # Decide how many years this specific simulation will run
+    sim_horizon = max_horizon_years if mode == "loop" else (num_years - start_year_idx)
+
+    for step_year_idx in range(sim_horizon):
+        # Calculate data index (supports looping via modulo)
+        data_idx = (start_year_idx + step_year_idx) % num_years
+        yr_return = annual_returns.iloc[data_idx]
+        
+        # Update balance
+        current_balance = current_balance * (1 + yr_return)
+        actual_year_in_sim = step_year_idx + 1
+        
+        step_str = f"Y{actual_year_in_sim}: ${current_balance:,.0f} ({yr_return:+.1%})"
+        
+        # Check for goals
+        if actual_year_in_sim in goals:
+            withdrawal = goals[actual_year_in_sim]
+            current_balance -= withdrawal
+            step_str += f" | GOAL -${withdrawal:,.0f} -> ${current_balance:,.0f}"
+            if current_balance < 0:
+                bankrupt = True
+                step_str += " [BANKRUPT] ❌"
+                trail.append(step_str)
+                break 
+        
+        trail.append(step_str)
+
+    log_str = ""
+    if debug_path:
+        status = "✅" if not bankrupt else "❌"
+        log_str = f"    Path {actual_start_date} (Horizon {sim_horizon}): {' -> '.join(trail)} {status}"
+        
+    return {
+        "bankrupt": bankrupt,
+        "terminal_value": current_balance if not bankrupt else None,
+        "log": log_str
+    }
+
+
 # ── Lightweight Annual Evaluation ─────────────────────────────────────────────
 # Complements backtest_portfolio (daily-granularity training-label generator).
 # This function uses annual rolling windows for quick GFR/ETV assessment.
@@ -431,8 +480,17 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config, 
     weight_series = pd.Series({t: weights[t] for t in active_tickers})
     weight_series = weight_series / weight_series.sum()  # ensure sum=1.0
     
-    # Dot product is now NaN-safe because it only sees stocks we actually bought
-    portfolio_returns = sim_returns.dot(weight_series)
+    # FIX: Dynamically reapportion weights to assets that are actively trading.
+    # If a stock hasn't IPO'd yet (NaN return), its weight shifts proportionally to public stocks.
+    valid_returns_mask = sim_returns.notna()
+    daily_raw_weights = valid_returns_mask * weight_series 
+    daily_weight_sums = daily_raw_weights.sum(axis=1)
+    
+    # Normalize daily weights to 1.0, fallback to 0.0 if NO stocks are trading
+    daily_normalized_weights = daily_raw_weights.div(daily_weight_sums, axis=0).fillna(0.0)
+    
+    # Dot product is now NaN-safe and mathematically accurate for available universe
+    portfolio_returns = (sim_returns.fillna(0.0) * daily_normalized_weights).sum(axis=1)
     annual_returns = portfolio_returns.resample('YE').apply(lambda x: (1+x).prod() - 1)
 
     max_horizon_years = max(user_profile['goals'].keys()) if user_profile['goals'] else 1
@@ -441,58 +499,31 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config, 
     terminal_values = []
 
     if debug_path:
-        print(f"\n  [SIMULATOR DEBUG] Mode: {mode.upper()} | Available Data: {len(annual_returns)} years | Goal Horizon: {max_horizon_years} years")
+        print(f"\n  [SIMULATOR DEBUG] Parallel Mode: ON | Cores: {joblib.cpu_count()} | Available Data: {len(annual_returns)} years | Goal Horizon: {max_horizon_years} years")
 
-    # Rolling window: try starting at every year in our history
+    # Rolling window: Parallelized execution across cores
     num_years = len(annual_returns)
-    for start_year_idx in range(num_years):
-        actual_start_date = annual_returns.index[start_year_idx].year
-        
-        # In 'ignore' mode, we only count scenarios where we have enough history 
-        # for at least the FIRST major goal, or at least 5 years.
-        # But for 'loop' mode, we can always simulate the full horizon.
-        if mode == "ignore" and (num_years - start_year_idx) < min(max_horizon_years, 5):
-            continue
+    
+    results = joblib.Parallel(n_jobs=-1)(
+        joblib.delayed(_run_single_year_path)(
+            i, i, num_years, annual_returns, start_capital, 
+            user_profile['goals'], mode, max_horizon_years, debug_path
+        )
+        for i in range(num_years)
+        if not (mode == "ignore" and (num_years - i) < min(max_horizon_years, 5))
+    )
 
-        current_balance = start_capital
-        bankrupt = False
-        trail = []
-        
-        # Decide how many years this specific simulation will run
-        sim_horizon = max_horizon_years if mode == "loop" else (num_years - start_year_idx)
-
-        for year_idx in range(sim_horizon):
-            # Calculate data index (supports looping via modulo)
-            data_idx = (start_year_idx + year_idx) % num_years
-            yr_return = annual_returns.iloc[data_idx]
-            
-            # Update balance
-            current_balance = current_balance * (1 + yr_return)
-            actual_year_in_sim = year_idx + 1
-            
-            step_str = f"Y{actual_year_in_sim}: ${current_balance:,.0f} ({yr_return:+.1%})"
-            
-            # Check for goals
-            if actual_year_in_sim in user_profile['goals']:
-                withdrawal = user_profile['goals'][actual_year_in_sim]
-                current_balance -= withdrawal
-                step_str += f" | GOAL -${withdrawal:,.0f} -> ${current_balance:,.0f}"
-                if current_balance < 0:
-                    bankrupt = True
-                    step_str += " [BANKRUPT] ❌"
-                    trail.append(step_str)
-                    break 
-            
-            trail.append(step_str)
-
-        total_simulations += 1
-        if not bankrupt:
+    successful_simulations = 0
+    total_simulations = len(results)
+    terminal_values = []
+    
+    for res in results:
+        if not res["bankrupt"]:
             successful_simulations += 1
-            terminal_values.append(current_balance)
-            if debug_path:
-                print(f"    Path {actual_start_date} (Horizon {sim_horizon}): {' -> '.join(trail)} ✅")
-        elif debug_path:
-             print(f"    Path {actual_start_date} (Horizon {sim_horizon}): {' -> '.join(trail)} ❌")
+            terminal_values.append(res["terminal_value"])
+        
+        if debug_path and res["log"]:
+            print(res["log"])
 
     GFR = successful_simulations / total_simulations if total_simulations > 0 else 0
     ETV = np.median(terminal_values) if len(terminal_values) > 0 else 0
