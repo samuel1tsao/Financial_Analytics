@@ -138,7 +138,13 @@ DEFAULT_PIPELINE_CONFIG = {
     "rl_dropout": 0.1,
     "rl_learning_rate": 0.001,
     "rl_episodes": 1000,
-
+    # -----------------------
+    # Grid Search Constants
+    # -----------------------
+    "grid_lrs": [0.001],
+    "grid_batch_sizes": [32],
+    "grid_d_models": [64],
+    "grid_embedding_dims": [8, 16, 32],
     # -----------------------
     # Reward Function (Inverse Exponential)
     # -----------------------
@@ -168,6 +174,9 @@ DEFAULT_PIPELINE_CONFIG = {
     "ml_validation_percent": 0.20,
     "ml_cache_dir": "cache",
     "ml_force_retrain": False,
+    "ml_checkpoint_frequency": 1,           # Save every N epochs
+    "ml_resume_mode": "auto",               # 'auto', 'restart', or 'load_final'
+    "ml_keep_backups": True,
 }
 
 

@@ -341,8 +341,37 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
         print(f"[{time.strftime('%H:%M:%S')}] [Member A] Training {len(train_ds)} limit: {max_seq_len} tokens / Valid {len(val_ds)}. (Device: {device})")
 
     best_val_loss = float('inf')
+    start_epoch = 0
+    resume_mode = config.get("ml_resume_mode", "auto")
+    cache_dir = config.get("ml_cache_dir", "cache")
+    
+    # Ensure cache directory exists before training starts
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # DYNAMIC CHECKPOINT NAMING
+    fname_base = get_transformer_filename_base(config)
+    checkpoint_path = os.path.join(cache_dir, f"checkpoint_{fname_base}.pt")
+    
+    if resume_mode == "restart" and os.path.exists(checkpoint_path):
+        if verbose: print(f"  [Member A] Restart Mode: Deleting existing checkpoint '{checkpoint_path}'...")
+        os.remove(checkpoint_path)
+    
+    if resume_mode != "restart" and os.path.exists(checkpoint_path):
+        if verbose: print(f"  [Member A] Resume Mode: Loading checkpoint for {fname_base} from '{checkpoint_path}'...")
+        try:
+            # Check for standard model vs JIT
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state'])
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            early_stopping.best_loss = best_val_loss
+            early_stopping.counter = checkpoint.get('early_stop_counter', 0)
+            if verbose: print(f"  [Member A] Successfully resumed from Epoch {start_epoch+1}. Previous Best Val Loss: {best_val_loss:.4f}")
+        except Exception as e:
+            print(f"  [WARNING] Failed to load checkpoint: {e}. Starting from scratch.")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         total_loss = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", disable=not verbose, leave=False)
@@ -388,8 +417,25 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
         if verbose and (epoch + 1) % 10 == 0:
             print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch+1}/{epochs} | Train Dual-Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f}")
             
+        
         early_stopping(val_loss)
         best_val_loss = early_stopping.best_loss
+        
+        # --- CHECKPOINTING ---
+        check_freq = config.get("ml_checkpoint_frequency", 1)
+        if (epoch + 1) % check_freq == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'early_stop_counter': early_stopping.counter,
+                'X_mean': X_mean,
+                'X_std': X_std,
+                'Y_mean': Y_mean,
+                'Y_std': Y_std
+            }, checkpoint_path)
+        
         if early_stopping.early_stop:
             if verbose:
                 print(f"[{time.strftime('%H:%M:%S')}] Early stopping triggered at epoch {epoch+1}")
@@ -452,51 +498,79 @@ def run_ml_grid_search(master_df, price_matrix, volume_matrix, daily_returns, co
     lrs = config.get("grid_lrs", [config.get("ml_learning_rate", 0.001)])
     batch_sizes = config.get("grid_batch_sizes", [config.get("ml_batch_size", 32)])
     d_models = config.get("grid_d_models", [config.get("ml_d_model", 64)])
+    emb_dims = config.get("grid_embedding_dims", [config.get("ml_embedding_dim", 8)])
     
     results = []
     for lr in lrs:
         for bs in batch_sizes:
             for dm in d_models:
-                run_config = config.copy()
-                run_config["ml_learning_rate"] = lr
-                run_config["ml_batch_size"] = bs
-                run_config["ml_d_model"] = dm
-                
-                print(f"\\n--- Testing Config: LR={lr}, BatchSize={bs}, d_model={dm} ---")
-                cache = train_pytorch_embedding_model(
-                    master_df, price_matrix, volume_matrix, daily_returns, 
-                    run_config, drip_daily_returns=drip_daily_returns, verbose=False
-                )
-                results.append({"LR": lr, "Batch Size": bs, "d_model": dm, "Val MSE": cache["val_loss"]})
+                for ed in emb_dims:
+                    run_config = config.copy()
+                    run_config["ml_learning_rate"] = lr
+                    run_config["ml_batch_size"] = bs
+                    run_config["ml_d_model"] = dm
+                    run_config["ml_embedding_dim"] = ed
+                    
+                    print(f"\\n--- Testing Config: LR={lr}, BatchSize={bs}, d_model={dm}, emb_dim={ed} ---")
+                    cache = train_pytorch_embedding_model(
+                        master_df, price_matrix, volume_matrix, daily_returns, 
+                        run_config, drip_daily_returns=drip_daily_returns, verbose=False
+                    )
+                    results.append({
+                        "LR": lr, 
+                        "Batch Size": bs, 
+                        "d_model": dm, 
+                        "Emb Dim": ed, 
+                        "Val MSE": cache["val_loss"]
+                    })
                 
     df = pd.DataFrame(results).sort_values("Val MSE").reset_index(drop=True)
     return df
 
+def get_transformer_filename_base(config):
+    """
+    Generate a unique, clean filename base for the current model architecture.
+    Example: ed8_dm64_lr001
+    """
+    ed = config.get("ml_embedding_dim", 8)
+    dm = config.get("ml_d_model", 64)
+    lr = config.get("ml_learning_rate", 0.001)
+    
+    # Clean LR: 0.001 -> 001
+    lr_clean = str(lr).replace("0.", "").replace(".", "")
+    return f"ed{ed}_dm{dm}_lr{lr_clean}"
+
 def save_embedding_cache(cache_data, folder="cache"):
     """
     Saves only the essential embedding results and model state to disk.
-    Raw price/volume matrices are EXCLUDED to save space (they are re-loaded from CSV anyway).
+    Uses dynamic naming based on the model's architecture.
     """
     if not os.path.exists(folder):
         os.makedirs(folder)
-        
-    model_path = os.path.join(folder, "asset_transformer.pt")
-    data_path = os.path.join(folder, "embedding_results.pkl")
+    
+    # Use config info from cache if available, otherwise default naming
+    fname_base = get_transformer_filename_base(cache_data)
+    model_path = os.path.join(folder, f"checkpoint_{fname_base}.pt")
+    final_path = os.path.join(folder, f"final_{fname_base}.pt")
+    data_path  = os.path.join(folder, f"results_{fname_base}.pkl")
     
     # 1. Save results dict (embeddings & predictions)
     save_dict = {
         "dynamic_embeddings": cache_data.get("dynamic_embeddings"),
         "asset_predictions": cache_data.get("asset_predictions"),
-        "val_loss": cache_data.get("val_loss")
+        "val_loss": cache_data.get("val_loss"),
+        "config_snapshot": {
+            "ed": cache_data.get("ml_embedding_dim"),
+            "dm": cache_data.get("ml_d_model"),
+            "lr": cache_data.get("ml_learning_rate")
+        }
     }
     with open(data_path, "wb") as f:
         pickle.dump(save_dict, f)
         
     # 2. Save model state and normalization stats
-    # We assume 'model' and 'stats' are stored in the cache_data if we just trained
-    # or passed separately. For simplicity, let's just save what we need.
     if "model_state" in cache_data:
-        torch.save({
+        payload = {
             "model_state": cache_data["model_state"],
             "X_mean": cache_data["X_mean"],
             "X_std": cache_data["X_std"],
@@ -504,32 +578,32 @@ def save_embedding_cache(cache_data, folder="cache"):
             "Y_std": cache_data["Y_std"],
             "input_dim": cache_data.get("input_dim"),
             "output_macro_dim": cache_data.get("output_macro_dim"),
-            "output_ar_dim": cache_data.get("output_ar_dim")
-        }, model_path)
+            "output_ar_dim": cache_data.get("output_ar_dim"),
+            "epoch": cache_data.get("epoch", 999) # If saving final
+        }
+        torch.save(payload, final_path)
     
-    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Cache saved to '{folder}/'")
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Results and model saved to '{folder}/{fname_base}'")
 
 def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, folder="cache"):
     """
-    Loads saved model and embeddings from disk if they exist.
+    Loads saved model and embeddings from disk if they exist for the SPECIFIC config.
     """
-    model_path = os.path.join(folder, "asset_transformer.pt")
-    data_path = os.path.join(folder, "embedding_results.pkl")
+    fname_base = get_transformer_filename_base(config)
+    final_path = os.path.join(folder, f"final_{fname_base}.pt")
+    data_path  = os.path.join(folder, f"results_{fname_base}.pkl")
     
-    if not os.path.exists(model_path) or not os.path.exists(data_path):
+    if not os.path.exists(final_path) or not os.path.exists(data_path):
         return None
         
-    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Loading existing cache from '{folder}/'...")
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Found existing model for architecture {fname_base}. Loading...")
     
     try:
-        # 1. Load data results
         with open(data_path, "rb") as f:
             data = pickle.load(f)
             
-        # 2. Load model state (optional if purely using cached embeddings, but good for future inference)
-        checkpoint = torch.jit.load(model_path) if model_path.endswith(".zip") else torch.load(model_path, map_location='cpu')
+        checkpoint = torch.load(final_path, map_location='cpu')
         
-        # Re-assemble the DATA_CACHE
         cache = {
             "dynamic_embeddings": data["dynamic_embeddings"],
             "asset_predictions": data["asset_predictions"],
@@ -539,9 +613,9 @@ def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, 
             "daily_returns": daily_returns,
             "drip_daily_returns": drip_daily_returns,
             "val_loss": data.get("val_loss"),
-            "model_checkpoint": checkpoint # Store for external inference use
+            "model_checkpoint": checkpoint # Store full state for later inference
         }
         return cache
     except Exception as e:
-        print(f"  [WARNING] Failed to load cache: {e}")
+        print(f"  [WARNING] Failed to load cache for {fname_base}: {e}")
         return None
