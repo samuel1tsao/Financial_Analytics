@@ -372,6 +372,28 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
             print(f"  [WARNING] Failed to load checkpoint: {e}. Starting from scratch.")
 
     for epoch in range(start_epoch, epochs):
+        # Manual stop flag: create this file to stop training cleanly
+        stop_flag_path = os.path.join(cache_dir, "STOP_TRAINING")
+
+        if os.path.exists(stop_flag_path):
+            if verbose:
+                print(f"[{time.strftime('%H:%M:%S')}] [Member A] Stop flag detected. Saving checkpoint and exiting training loop.")
+            torch.save({
+                'epoch': max(epoch - 1, start_epoch - 1),
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'early_stop_counter': early_stopping.counter,
+                'X_mean': X_mean,
+                'X_std': X_std,
+                'Y_mean': Y_mean,
+                'Y_std': Y_std
+            }, checkpoint_path)
+            try:
+                os.remove(stop_flag_path)
+            except Exception:
+                pass
+            break
         model.train()
         total_loss = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", disable=not verbose, leave=False)
@@ -474,6 +496,32 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
             
     print(f"[{time.strftime('%H:%M:%S')}] [Member A] Generated dynamic sequence embeddings for {len(embeddings)} assets.")
     
+    result_cache = {
+        "dynamic_embeddings": embeddings,
+        "asset_predictions": asset_predictions,
+        "master_df": master_df,
+        "price_matrix": price_matrix,
+        "volume_matrix": volume_matrix,
+        "daily_returns": daily_returns,
+        "drip_daily_returns": drip_daily_returns,
+        "val_loss": best_val_loss,
+        "model_state": model.state_dict(),
+        "X_mean": X_mean,
+        "X_std": X_std,
+        "Y_mean": Y_mean,
+        "Y_std": Y_std,
+        "input_dim": input_dim,
+        "output_macro_dim": output_macro_dim,
+        "output_ar_dim": output_ar_dim,
+        "ml_embedding_dim": config.get("ml_embedding_dim"),
+        "ml_d_model": config.get("ml_d_model"),
+        "ml_learning_rate": config.get("ml_learning_rate"),
+        "epoch": epoch
+    }
+
+    # Always save final artifacts at end of training, including early-stop exits
+    save_embedding_cache(result_cache, folder=cache_dir)
+
     return {
         "dynamic_embeddings": embeddings,
         "asset_predictions": asset_predictions,
@@ -619,3 +667,82 @@ def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, 
     except Exception as e:
         print(f"  [WARNING] Failed to load cache for {fname_base}: {e}")
         return None
+
+# HELPER FUNCTIONS IF WE NEED - NOT CURRENTLY USING THESE
+def save_training_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    best_val_loss,
+    early_stopper,
+    X_mean,
+    X_std,
+    Y_mean,
+    Y_std,
+    input_dim,
+    output_macro_dim,
+    output_ar_dim,
+    path="cache/asset_transformer_checkpoint.pt"
+):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    torch.save({
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+        "early_stopping_counter": early_stopper.counter,
+        "early_stopping_best_loss": early_stopper.best_loss,
+        "early_stopping_triggered": early_stopper.early_stop,
+        "X_mean": X_mean,
+        "X_std": X_std,
+        "Y_mean": Y_mean,
+        "Y_std": Y_std,
+        "input_dim": input_dim,
+        "output_macro_dim": output_macro_dim,
+        "output_ar_dim": output_ar_dim,
+    }, path)
+
+    print(f"[Member A] Checkpoint saved to {path}")
+
+
+def load_training_checkpoint(path, config, device):
+    if not os.path.exists(path):
+        return None
+
+    ckpt = torch.load(path, map_location=device)
+
+    model = AssetTransformerNet(
+        input_dim=ckpt["input_dim"],
+        config=config,
+        output_macro_dim=ckpt["output_macro_dim"],
+        output_ar_dim=ckpt["output_ar_dim"]
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state"])
+
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=config.get("ml_learning_rate", 0.001)
+    )
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+
+    early_stopper = EarlyStopping(
+        patience=config.get("ml_patience", 5),
+        min_delta=config.get("ml_min_delta", 1e-4)
+    )
+    early_stopper.counter = ckpt.get("early_stopping_counter", 0)
+    early_stopper.best_loss = ckpt.get("early_stopping_best_loss", None)
+    early_stopper.early_stop = ckpt.get("early_stopping_triggered", False)
+
+    return {
+        "model": model,
+        "optimizer": optimizer,
+        "start_epoch": ckpt["epoch"] + 1,
+        "best_val_loss": ckpt["best_val_loss"],
+        "early_stopper": early_stopper,
+        "X_mean": ckpt["X_mean"],
+        "X_std": ckpt["X_std"],
+        "Y_mean": ckpt["Y_mean"],
+        "Y_std": ckpt["Y_std"],
+    }
