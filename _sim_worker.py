@@ -492,6 +492,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config, 
     # Dot product is now NaN-safe and mathematically accurate for available universe
     portfolio_returns = (sim_returns.fillna(0.0) * daily_normalized_weights).sum(axis=1)
     annual_returns = portfolio_returns.resample('YE').apply(lambda x: (1+x).prod() - 1)
+    portfolio_ann_vol = float(portfolio_returns.std() * np.sqrt(252)) # 252 trading days in a year?
 
     max_horizon_years = max(user_profile['goals'].keys()) if user_profile['goals'] else 1
     start_capital = user_profile['start_cap']
@@ -541,6 +542,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config, 
         "ETV": ETV,
         "max_terminal": max_terminal,
         "min_terminal": min_terminal,
+        "portfolio_ann_vol": portfolio_ann_vol,
         "Objective_Function_Score": objective_score,
         "Total_Simulations": total_simulations
     }
@@ -595,6 +597,7 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     # TEMPORARY CHANGE BUT CAN ADD THESE CONSTANTS TO USER_PROFILES INSTEAD IF THIS CHANGE IS GOOD
     # Conservative -> stronger failure aversion
     # Aggressive   -> stronger upside preference
+    # THESE VALUES ARE EXTREMELY TUNABLE - kinda of arbitrary right now
     term_k = base_term_k * (0.85 + 0.55 * risk01)          # ~1.7 to ~2.8 if base=2.0
     penalty_rate = base_penalty_rate * (1.4 - 0.8 * risk01) # ~0.66 to ~0.30 if base=0.5
     lambda_term = base_lambda_term * (0.75 + 0.90 * risk01) # ~0.84 to ~1.56 if base=1.0
@@ -602,6 +605,7 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     
     ETV = metrics["ETV"]
     GFR = metrics["GFR"] # 0.0 to 1.0 (1.0 means all goals funded without bankruptcy)
+    portfolio_ann_vol = metrics.get("portfolio_ann_vol", 0.0)
     
     # 4. Compute Inverse-Exponential Terminal Reward
     # Sigmoid-like scaling: heavily penalizes small balances, rewards large balances exponentially until saturation.
@@ -613,7 +617,22 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     # (1 - GFR) represents the fraction of simulations that went bankrupt or missed goals
     goal_penalty = penalty_rate * (1.0 - GFR)
     
+    # 5.5 Under-risk penalty:
+    # Aggressive users should not end up with ultra-safe portfolios.
+    # Conservative users get little/no penalty for low volatility.
+    under_risk_strength = config.get("reward_under_risk_strength", 0.75) #doesn't exist in constants yet
+
+    # target volatility floor rises with risk tolerance
+    target_vol_floor = 0.08 + 0.18 * risk01   # ~8% conservative, ~26% aggressive
+
+    under_risk_gap = max(0.0, target_vol_floor - portfolio_ann_vol)
+    under_risk_penalty = (under_risk_gap ** 2) * under_risk_strength * risk01
+
     # 6. Final Scalar Reward
-    reward = (lambda_term * terminal_reward) - (lambda_goal * goal_penalty)
+    reward = (
+        (lambda_term * terminal_reward)
+        - (lambda_goal * goal_penalty)
+        - under_risk_penalty
+    )
     
     return float(reward), metrics
