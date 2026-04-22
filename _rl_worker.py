@@ -220,7 +220,9 @@ def train_rl_agent(dataset, user_profile, config, existing_agent=None, verbose=T
             "reward": reward_scalar,
             "loss": loss.item(),
             "ETV": metrics.get("ETV", 0),
-            "GFR": metrics.get("GFR", 0)
+            "GFR": metrics.get("GFR", 0),
+            "max_terminal": metrics.get("max_terminal", 0),
+            "min_terminal": metrics.get("min_terminal", 0),
         })
         
         if verbose:

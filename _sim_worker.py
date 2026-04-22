@@ -533,7 +533,17 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config, 
     alpha = 1.0
     objective_score = (alpha * ETV) if GFR >= GFR_OBJECTIVE_THRESHOLD else (alpha * ETV) * (GFR / GFR_OBJECTIVE_THRESHOLD)
 
-    return {"GFR": GFR, "ETV": ETV, "Objective_Function_Score": objective_score, "Total_Simulations": total_simulations}
+    max_terminal = np.max(terminal_values) if len(terminal_values) > 0 else 0
+    min_terminal = np.min(terminal_values) if len(terminal_values) > 0 else 0
+
+    return {
+        "GFR": GFR,
+        "ETV": ETV,
+        "max_terminal": max_terminal,
+        "min_terminal": min_terminal,
+        "Objective_Function_Score": objective_score,
+        "Total_Simulations": total_simulations
+    }
 
 # ── RL Environment Step ───────────────────────────────────────────────────────
 
@@ -562,6 +572,10 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     goals = user_profile.get("goals", {})
     total_goal_cost = sum(goals.values())
     max_horizon = max(goals.keys()) if goals else 10
+
+    #USING RISK TO ADJUST PENALTY AND REWARDS FOR DIFFERENT PROFILES
+    risk = float(user_profile.get("risk_tolerance", 5.0))
+    risk01 = np.clip(risk / 10.0, 0.0, 1.0)   # map to [0, 1]
     
     net_starting_value = max(start_cap - total_goal_cost, 10000.0)
     baseline_growth = config.get("reward_baseline_growth", 0.06)  # 6% baseline growth
@@ -572,10 +586,19 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     if term_target is None or term_target <= 0.0:
         term_target = dynamic_term_target
         
-    term_k = config.get("reward_terminal_k", 2.0)
-    penalty_rate = config.get("reward_goal_penalty_rate", 0.5)
-    lambda_term = config.get("reward_lambda_terminal", 1.0)
-    lambda_goal = config.get("reward_lambda_goal", 1.0)
+    # Base defaults from config (used as anchors)
+    base_term_k = config.get("reward_terminal_k", 2.0)
+    base_penalty_rate = config.get("reward_goal_penalty_rate", 0.5)
+    base_lambda_term = config.get("reward_lambda_terminal", 1.0)
+    base_lambda_goal = config.get("reward_lambda_goal", 1.0)
+
+    # TEMPORARY CHANGE BUT CAN ADD THESE CONSTANTS TO USER_PROFILES INSTEAD IF THIS CHANGE IS GOOD
+    # Conservative -> stronger failure aversion
+    # Aggressive   -> stronger upside preference
+    term_k = base_term_k * (0.85 + 0.55 * risk01)          # ~1.7 to ~2.8 if base=2.0
+    penalty_rate = base_penalty_rate * (1.4 - 0.8 * risk01) # ~0.66 to ~0.30 if base=0.5
+    lambda_term = base_lambda_term * (0.75 + 0.90 * risk01) # ~0.84 to ~1.56 if base=1.0
+    lambda_goal = base_lambda_goal * (1.7 - 1.1 * risk01)   # ~1.59 to ~0.60 if base=1.0
     
     ETV = metrics["ETV"]
     GFR = metrics["GFR"] # 0.0 to 1.0 (1.0 means all goals funded without bankruptcy)
