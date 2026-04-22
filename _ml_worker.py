@@ -158,6 +158,27 @@ def masked_weighted_mse_loss(pred, target, weights):
     return (w * (diff ** 2)).mean()
 
 def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, verbose=True):
+    #now load_final does something
+    resume_mode = config.get("ml_resume_mode", "auto")
+    if resume_mode == "load_final":
+        cache = load_embedding_cache(
+            master_df,
+            price_matrix,
+            volume_matrix,
+            daily_returns,
+            config,
+            drip_daily_returns=drip_daily_returns,
+            folder=config.get("ml_cache_dir", "cache")
+        )
+
+        if cache is None:
+            raise FileNotFoundError(
+                "[Member A] load_final mode: No cached model found for this config."
+            )
+
+        print("[Member A] load_final mode: Loaded cached model. Skipping training.")
+        return cache
+    
     print(f"[{time.strftime('%H:%M:%S')}] [Member A] Initializing Dual-Head Sequence Transformer...")
     
     # Base Setup
