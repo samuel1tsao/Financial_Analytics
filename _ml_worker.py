@@ -35,11 +35,14 @@ class AssetTransformerNet(nn.Module):
         
         self.input_proj = nn.Linear(input_dim, self.d_model)
         self.pos_encoder = PositionalEncoding(self.d_model, max_len=max(self.max_seq_len, 5000))
-        
+        #maybe try 0.3
+        self.dropout = nn.Dropout(config.get("ml_dropout", 0.2))
+
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=config.get("ml_nhead", 4),
             dim_feedforward=config.get("ml_dim_feedforward", 128),
+            dropout=config.get("ml_dropout", 0.2),
             batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
@@ -50,7 +53,8 @@ class AssetTransformerNet(nn.Module):
         self.emb_dim = config.get("ml_embedding_dim", 8)
         self.bottleneck = nn.Sequential(
             nn.Linear(self.d_model, self.emb_dim),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(config.get("ml_dropout", 0.2))
         )
         
         self.head_macro = nn.Linear(self.emb_dim, output_macro_dim)
@@ -335,7 +339,7 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
     
     optimizer = optim.Adam(model.parameters(), lr=config.get("ml_learning_rate", 0.001))
     epochs = config.get("ml_epochs", 150)
-    early_stopping = EarlyStopping(patience=10, min_delta=1e-4)
+    early_stopping = EarlyStopping(patience=5, min_delta=1e-3)
 
     if verbose:
         print(f"[{time.strftime('%H:%M:%S')}] [Member A] Training {len(train_ds)} limit: {max_seq_len} tokens / Valid {len(val_ds)}. (Device: {device})")
@@ -395,7 +399,12 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
                 pass
             break
         model.train()
-        total_loss = 0
+
+        # SEPARATING THE TWO LOSSES TO MORE EASILY DEBUG/TRACK
+        train_total_loss = 0.0
+        train_ar_loss_sum = 0.0
+        train_macro_loss_sum = 0.0
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", disable=not verbose, leave=False)
         for b_x, b_y, b_w, b_mask in pbar:
             b_x, b_y, b_w, b_mask = b_x.to(device), b_y.to(device), b_w.to(device), b_mask.to(device)
@@ -414,12 +423,30 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
             if loss.requires_grad and not torch.isnan(loss) and loss.item() > 0:
                 loss.backward()
                 optimizer.step()
-                curr_loss = loss.item()
-                total_loss += curr_loss
-                pbar.set_postfix({"loss": f"{curr_loss:.4f}"})
-                
+                #curr_loss = loss.item()
+                #total_loss += curr_loss
+                #pbar.set_postfix({"loss": f"{curr_loss:.4f}"})
+            
+            train_total_loss += loss.item()
+            train_ar_loss_sum += ar_loss.item()
+            train_macro_loss_sum += macro_loss.item()
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "ar": f"{ar_loss.item():.4f}",
+                "macro": f"{macro_loss.item():.4f}",
+            })
+        
+        train_loss = train_total_loss / max(1, len(train_loader))
+        train_ar_loss = train_ar_loss_sum / max(1, len(train_loader))
+        train_macro_loss = train_macro_loss_sum / max(1, len(train_loader))
+
         model.eval()
-        val_loss_sum = 0
+
+        # Separating AR and MACRO loss
+        val_total_loss = 0.0
+        val_ar_loss_sum = 0.0
+        val_macro_loss_sum = 0.0
+
         vbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", disable=not verbose, leave=False)
         with torch.no_grad():
             for b_x, b_y, b_w, b_mask in vbar:
@@ -428,17 +455,29 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
                 valid_ar_mask = ~b_mask[:, 1:] 
                 target_ar = b_x[:, 1:, :3] 
                 diff_ar = ar_preds[:, :-1, :][valid_ar_mask] - target_ar[valid_ar_mask]
-                ar_loss = (diff_ar ** 2).mean() if valid_ar_mask.sum() > 0 else 0.0
+                ar_loss = (diff_ar ** 2).mean() if valid_ar_mask.sum() > 0 else torch.tensor(0.0, device=device)
                 macro_loss = masked_weighted_mse_loss(macro_preds, b_y, b_w)
-                v_loss = (ar_loss + macro_loss).item()
-                val_loss_sum += v_loss
-                vbar.set_postfix({"v_loss": f"{v_loss:.4f}"})
+                v_loss = ar_loss + macro_loss
+                val_total_loss += v_loss.item()
+                val_ar_loss_sum += ar_loss.item()
+                val_macro_loss_sum += macro_loss.item()
+
+                vbar.set_postfix({
+                    "v_loss": f"{v_loss.item():.4f}",
+                    "v_ar": f"{ar_loss.item():.4f}",
+                    "v_macro": f"{macro_loss.item():.4f}",
+                })
                 
-        val_loss = val_loss_sum / max(1, len(val_loader))
-        
+        val_loss = val_total_loss / max(1, len(val_loader))
+        val_ar_loss = val_ar_loss_sum / max(1, len(val_loader))
+        val_macro_loss = val_macro_loss_sum / max(1, len(val_loader))
+
         if verbose and (epoch + 1) % 10 == 0:
-            print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch+1}/{epochs} | Train Dual-Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f}")
-            
+            print(
+                f"[{time.strftime('%H:%M:%S')}] Epoch {epoch+1}/{epochs} | "
+                f"Train Total: {train_loss:.4f} | Train AR: {train_ar_loss:.4f} | Train Macro: {train_macro_loss:.4f} | "
+                f"Val Total: {val_loss:.4f} | Val AR: {val_ar_loss:.4f} | Val Macro: {val_macro_loss:.4f}"
+            )
         
         early_stopping(val_loss)
         best_val_loss = early_stopping.best_loss
@@ -723,7 +762,8 @@ def load_training_checkpoint(path, config, device):
 
     optimizer = optim.Adam(
         model.parameters(),
-        lr=config.get("ml_learning_rate", 0.001)
+        lr=config.get("ml_learning_rate", 0.001),
+        weight_decay=config.get("ml_weight_decay", 1e-4)
     )
     optimizer.load_state_dict(ckpt["optimizer_state"])
 

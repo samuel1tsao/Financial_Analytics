@@ -123,7 +123,7 @@ DEFAULT_PIPELINE_CONFIG = {
     "ml_target_metrics": ["return", "volatility", "volume"],
     "ml_target_horizons": [1, 3, 5, 10, 15],
     "ml_horizon_weights": {1: 1.0, 3: 0.8, 5: 0.6, 10: 0.4, 15: 0.2},
-    "ml_epochs": 150,
+    "ml_epochs": 50,
     "ml_batch_size": 32,             # Lowered from 64 to fit sequence model into memory
     "ml_learning_rate": 0.001,
     "ml_time_decay_half_life": 10,
