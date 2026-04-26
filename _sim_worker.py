@@ -584,9 +584,11 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     dynamic_term_target = net_starting_value * ((1.0 + baseline_growth) ** max_horizon)
     
     # Allow config override, else use the logical dynamic target
-    term_target = config.get("reward_terminal_target", None)
-    if term_target is None or term_target <= 0.0:
-        term_target = dynamic_term_target
+    global_target = config.get("reward_terminal_target", None)
+    # if term_target is None or term_target <= 0.0:
+    #     term_target = dynamic_term_target
+
+    term_target = 0.5 * dynamic_term_target + 0.5 * global_target
         
     # Base defaults from config (used as anchors)
     base_term_k = config.get("reward_terminal_k", 2.0)
@@ -611,16 +613,25 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     # Sigmoid-like scaling: heavily penalizes small balances, rewards large balances exponentially until saturation.
     # We normalize ETV to the target to keep exponents numerically stable.
     normalized_balance = (ETV - term_target) / max(term_target, 1.0)
-    terminal_reward = 1.0 / (1.0 + np.exp(-term_k * normalized_balance))
+    #terminal_reward = 1.0 / (1.0 + np.exp(-term_k * normalized_balance))
+
+    # THIS TERMINAL_REWAWRD IS CENTERED AROUND ZERO AND CAN BE NEGATIVE
+    terminal_reward = (2.0 / (1.0 + np.exp(-term_k * normalized_balance))) - 1.0
     
     # 5. Compute Goal Penalty 
     # (1 - GFR) represents the fraction of simulations that went bankrupt or missed goals
-    goal_penalty = penalty_rate * (1.0 - GFR)
+    #goal_penalty = penalty_rate * (1.0 - GFR)
     
+    target_gfr = 0.98 - 0.13 * risk01
+    target_gfr = np.clip(target_gfr, 0.85, 0.99)
+
+    gfr_shortfall = max(0.0, target_gfr - GFR)
+    goal_penalty = penalty_rate * (gfr_shortfall ** 2)
+
     # 5.5 Under-risk penalty:
     # Aggressive users should not end up with ultra-safe portfolios.
     # Conservative users get little/no penalty for low volatility.
-    under_risk_strength = config.get("reward_under_risk_strength", 0.75) #doesn't exist in constants yet
+    under_risk_strength = config.get("reward_under_risk_strength", 1.5) #doesn't exist in constants yet
 
     # target volatility floor rises with risk tolerance
     target_vol_floor = 0.08 + 0.18 * risk01   # ~8% conservative, ~26% aggressive

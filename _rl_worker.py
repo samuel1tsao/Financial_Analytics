@@ -140,20 +140,100 @@ def build_rl_dataset(dataset, user_profile, config):
     tickers = []
     feature_vectors = []
     
+    # ADDING BACK SOME HIGHER LEVEL FEATURES THAT WERE PUT INTO TRANSFORMER
+    # HOPE TO MIMIC SKIP CONNECTIONS IN CNNs
+    daily_returns = dataset.get("drip_daily_returns") or dataset["daily_returns"]
+
     for ticker, emb in embeddings.items():
         if ticker not in master_df.index:
             continue
-            
-        static_features = master_df.loc[ticker, all_feature_cols].astype(float).tolist()
-        
-        # Input Vector structure: 
-        # [Autoencoder_Embedding, User_Risk, Start_Cap_Ratio, Goal_Timeline(100), Static_Identity...]
-        full_vec = list(emb) + [risk_tolerance, start_cap / 100000.0] + goal_vec + static_features
-        
+
+        # --- Compute numeric features per ticker ---
+        ann_vol = 0.0
+        ann_ret = 0.0
+        momentum_1y = 0.0
+
+        if ticker in daily_returns.columns:
+            r = daily_returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
+
+            if len(r) >= 50:
+                ann_vol = float(r.std() * np.sqrt(252))
+
+                mean_daily = float(r.mean())
+                mean_daily = np.clip(mean_daily, -0.20, 0.20)
+                ann_ret = float((1.0 + mean_daily) ** 252 - 1.0)
+
+                if len(r) >= 252:
+                    momentum_1y = float((1.0 + r.tail(252)).prod() - 1.0)
+
+                # clip AFTER all values are computed
+                ann_vol = np.clip(ann_vol, 0.0, 2.0)
+                ann_ret = np.clip(ann_ret, -1.0, 5.0)
+                momentum_1y = np.clip(momentum_1y, -1.0, 5.0)
+
+        numeric_features = np.array(
+            [ann_vol, ann_ret, momentum_1y],
+            dtype=np.float32
+        )
+
+        numeric_features = np.nan_to_num(
+            numeric_features,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0
+        ).tolist()
+
+        # --- Existing features ---
+        static_features = master_df.loc[ticker, all_feature_cols].astype(float).values
+
+        static_features = np.nan_to_num(
+            static_features,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0
+        ).tolist()
+        emb_clean = np.nan_to_num(
+            np.array(emb, dtype=np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0
+        ).tolist()
+        full_vec = (
+            emb_clean
+            + numeric_features
+            + [risk_tolerance, start_cap / 100000.0]
+            + goal_vec
+            + static_features
+        )
+
+        # MUST be inside loop
         tickers.append(ticker)
         feature_vectors.append(full_vec)
-        
-    tensor_x = torch.tensor([feature_vectors], dtype=torch.float32).to(DEVICE)
+
+    feature_vectors = np.nan_to_num(
+        np.array(feature_vectors, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+
+    print("[RL DEBUG] embeddings:", len(embeddings))
+    print("[RL DEBUG] master_df rows:", len(master_df))
+    print("[RL DEBUG] feature_vectors:", len(feature_vectors))
+    print("[RL DEBUG] tickers:", len(tickers))
+
+    if len(feature_vectors) == 0:
+        print("[RL DEBUG] No feature vectors were created.")
+        print("[RL DEBUG] First 5 embedding tickers:", list(embeddings.keys())[:5])
+        print("[RL DEBUG] First 5 master_df index:", list(master_df.index)[:5])
+        return torch.empty((0, 0, 0), dtype=torch.float32).to(DEVICE), []
+
+    tensor_x = torch.tensor(feature_vectors, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+    print("[RL DEBUG] tensor_x shape:", tensor_x.shape)
+    print("[RL DEBUG] tensor_x has NaN:", torch.isnan(tensor_x).any().item())
+    print("[RL DEBUG] tensor_x has Inf:", torch.isinf(tensor_x).any().item())
+
     return tensor_x, tickers
 
 from _sim_worker import simulate_rl_environment_step
