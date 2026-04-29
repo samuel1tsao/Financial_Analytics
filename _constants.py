@@ -82,6 +82,54 @@ GFR_OBJECTIVE_THRESHOLD = 0.90
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# RL REWARD FUNCTION CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════
+
+# Growth: CAGR is multiplied by this to convert to reward points (10% CAGR → 10 pts)
+CAGR_REWARD_SCALE         = 100.0
+
+# Drawdown: MDD is multiplied by this before being scaled by the risk factor
+MDD_PENALTY_SCALE         = 4.0
+
+# Risk factor: penalty_multiplier = (MAX_RISK_OFFSET - user_risk_tolerance)
+# Risk 1 → multiplier 10 | Risk 10 → multiplier 1
+MAX_RISK_OFFSET           = 11.0
+
+# GFR exponential penalty: penalty = (exp(GFR_EXP_STEEPNESS * miss) - 1) * GFR_EXP_SCALE
+GFR_EXP_STEEPNESS         = 3.0
+GFR_EXP_SCALE             = 2.0
+GFR_MISS_FLAT_PENALTY     = 10.0
+GFR_PERFECT_REWARD        = 10.0
+
+# Number of top assets to select by weight — used consistently in BOTH training and evaluation.
+# Replaces the old MIN_ACTIVE_WEIGHT threshold, which caused a train/eval mismatch:
+# training used top-K fallback while evaluation used a hard weight cutoff.
+TOP_K_ASSETS              = 10
+MIN_ACTIVE_WEIGHT         = 0.001   # kept only for display/log filtering
+
+# Random asset subset size per training iteration.
+# Instead of presenting all ~6500 assets to the Transformer every step, we sample a random
+# subset. This: (1) speeds up attention O(N²→n²), (2) gives stronger per-asset gradient signal,
+# (3) forces the policy to learn general feature patterns rather than memorizing specific tickers.
+# Set to None to disable subsetting and use the full universe.
+RL_ASSET_SUBSET_SIZE      = 500
+
+# Number of walk-forward snapshots to sample per RL episode
+WF_SNAPSHOTS_PER_EPISODE  = 8
+
+# User condition vector dimensions
+GOAL_TIMELINE_SLOTS       = 31     # Year 0 through Year 30
+CAPITAL_NORMALIZER        = 1_000_000.0
+RISK_NORMALIZER           = 10.0
+
+# Simulation start year for monthly-shifted evaluation
+SIM_MONTHLY_START_YEAR    = 2006
+
+# Debug: max years to log per path
+DEBUG_LOG_MAX_YEARS       = 5
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # DEFAULT PIPELINE CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -92,7 +140,7 @@ DEFAULT_PIPELINE_CONFIG = {
     "data_source_mode":  DataSyncMode.OFFLINE_CSV_ONLY,
     "data_start_date": "1962-01-01",
     "training_cutoff_date": "2015-01-01",
-    "simulation_start_date": "2015-01-01",
+    "simulation_start_date": "2006-01-01",
     "simulation_end_date": "2026-12-31",
     "scrape_delay": 0.3,
     "yf_chunk_size": 300,
@@ -123,7 +171,7 @@ DEFAULT_PIPELINE_CONFIG = {
     "ml_target_metrics": ["return", "volatility", "volume"],
     "ml_target_horizons": [1, 3, 5, 10, 15],
     "ml_horizon_weights": {1: 1.0, 3: 0.8, 5: 0.6, 10: 0.4, 15: 0.2},
-    "ml_epochs": 150,
+    "ml_epochs": 300,
     "ml_batch_size": 32,             # Lowered from 64 to fit sequence model into memory
     "ml_learning_rate": 0.001,
     "ml_time_decay_half_life": 10,
@@ -137,7 +185,15 @@ DEFAULT_PIPELINE_CONFIG = {
     "rl_dim_feedforward": 256,
     "rl_dropout": 0.1,
     "rl_learning_rate": 0.001,
-    "rl_episodes": 1000,
+    "rl_episodes": 10000000,
+    "rl_force_rebuild": True,
+    "rl_initial_mu_bias": 0.0,
+    "rl_checkpoint_frequency": 10,
+    "sim_paths_per_episode": 50,          # (Legacy) Number of start-dates for full evaluation
+    "rl_paths_per_step": 5,               # Sim paths per gradient update step (stochastic training)
+    "rl_verbose_every": 10,                # Print progress every N iterations
+    "debug_path": False,                   # Global toggle for per‑episode sample‑path logging
+    "rl_parallel_cores": -1,               # Use all cores by default (set to 1 for tiny jobs)
     # -----------------------
     # Grid Search Constants
     # -----------------------
@@ -146,18 +202,14 @@ DEFAULT_PIPELINE_CONFIG = {
     "grid_d_models": [64],
     "grid_embedding_dims": [8, 16, 32],
     # -----------------------
-    # Reward Function (Inverse Exponential)
+    # Reward Function (see RL REWARD FUNCTION CONSTANTS above)
     # -----------------------
-    "reward_terminal_target": 1000000.0, # Target for inverse exp scaling
-    "reward_terminal_k": 2.0,            # Exp scaling factor
-    "reward_goal_penalty_rate": 0.5,     # Penalty per percentage missed
-    "reward_lambda_goal": 1.0,           # Weight for goal penalty loss
     
     # -----------------------
     # Simulation Parameters
     # -----------------------
-    "sim_horizon_mode": "ignore",        # 'ignore' (truncate) or 'loop' (cyclical padding)
-    "simulation_start_date": "2015-01-01",
+    "sim_horizon_mode": "loop",           # 'ignore' (truncate) or 'loop' (cyclical padding)
+    "simulation_start_date": "2006-01-01",
     "simulation_end_date": "2026-12-31",
     "reward_lambda_terminal": 1.0,       # Weight for terminal wealth loss
 
@@ -165,6 +217,7 @@ DEFAULT_PIPELINE_CONFIG = {
     # Simulation & Thresholds
     # -----------------------
     "sim_glide_path_tau": 8.0,
+    "sim_cvar_percentile": None,            # None = mean of ALL paths (recommended). Set to e.g. 20 to use CVaR worst-20% instead.
 
     # -----------------------
     # Validation & Splitting
@@ -177,6 +230,14 @@ DEFAULT_PIPELINE_CONFIG = {
     "ml_checkpoint_frequency": 1,           # Save every N epochs
     "ml_resume_mode": "auto",               # 'auto', 'restart', or 'load_final'
     "ml_keep_backups": True,
+
+    # -----------------------
+    # Walk-Forward Analysis
+    # -----------------------
+    "wf_enabled": False,                    # Set to True to enable point-in-time simulation
+    "wf_start_year": 2000,                  # Start point-in-time embeddings from this year
+    "wf_step_months": 1,                    # How many months between generated snapshots
+    "wf_force_rebuild": False,              # Set to True to overwrite existing snapshots
 }
 
 
@@ -185,24 +246,41 @@ DEFAULT_PIPELINE_CONFIG = {
 # ═══════════════════════════════════════════════════════════════════════
 
 TEST_PROFILES = [
-    {
-        "profile_name": "Conservative Retiree",
-        "risk_tolerance": 2.0,
-        "start_cap": 500000,
-        "goals": {2: 50000, 5: 100000, 10: 200000}
-    },
-    {
-        "profile_name": "Balanced Growth (House + Retirement)",
-        "risk_tolerance": 5.0,
-        "start_cap": 150000,
-        "goals": {5: 60000, 20: 120000}
-    },
-    {
-        "profile_name": "Aggressive Young Investor",
-        "risk_tolerance": 9.0,
-        "start_cap": 50000,
-        "goals": {15: 80000, 30: 200000}
-    },
+    # ── CONSERVATIVE (Risk 1-3) ──────────────────────────────────────────
+    {"profile_name": "Risk-Averse Saver", "risk_tolerance": 1.5, "start_cap": 25000, "goals": {3: 30000, 10: 60000}},
+    {"profile_name": "Conservative Retiree", "risk_tolerance": 2.0, "start_cap": 500000, "goals": {2: 50000, 5: 100000, 10: 200000}},
+    {"profile_name": "Legacy Protector", "risk_tolerance": 1.0, "start_cap": 1500000, "goals": {20: 2000000}},
+    {"profile_name": "Down Payment Safety", "risk_tolerance": 2.5, "start_cap": 80000, "goals": {4: 110000}},
+    {"profile_name": "Rainy Day Buffer", "risk_tolerance": 3.0, "start_cap": 15000, "goals": {5: 25000, 15: 50000}},
+    {"profile_name": "Trust Fund Anchor", "risk_tolerance": 1.8, "start_cap": 2000000, "goals": {10: 2500000, 25: 4000000}},
+    {"profile_name": "Stable Income Seeker", "risk_tolerance": 2.2, "start_cap": 300000, "goals": {5: 350000, 15: 500000, 30: 800000}},
+    {"profile_name": "Low-Volatility Pensioner", "risk_tolerance": 1.2, "start_cap": 1200000, "goals": {5: 1300000, 20: 1800000}},
+    {"profile_name": "Frugal Conservative", "risk_tolerance": 2.8, "start_cap": 50000, "goals": {10: 100000}},
+    {"profile_name": "Bond-Heavy Defensive", "risk_tolerance": 1.5, "start_cap": 100000, "goals": {3: 110000, 7: 130000, 12: 160000}},
+
+    # ── BALANCED (Risk 4-6) ──────────────────────────────────────────────
+    {"profile_name": "Balanced Growth", "risk_tolerance": 5.0, "start_cap": 150000, "goals": {5: 180000, 20: 400000}},
+    {"profile_name": "Mid-Career Climber", "risk_tolerance": 4.5, "start_cap": 250000, "goals": {10: 450000, 25: 1000000}},
+    {"profile_name": "House & College Fund", "risk_tolerance": 5.5, "start_cap": 100000, "goals": {7: 150000, 18: 300000}},
+    {"profile_name": "Pragmatic High Earner", "risk_tolerance": 6.0, "start_cap": 400000, "goals": {5: 600000, 15: 1200000, 30: 2500000}},
+    {"profile_name": "Moderate Explorer", "risk_tolerance": 4.0, "start_cap": 40000, "goals": {8: 100000}},
+    {"profile_name": "Diversified Builder", "risk_tolerance": 5.8, "start_cap": 120000, "goals": {12: 300000, 28: 800000}},
+    {"profile_name": "Mid-Stage Saver", "risk_tolerance": 4.2, "start_cap": 200000, "goals": {5: 250000, 10: 350000, 20: 600000}},
+    {"profile_name": "Steady Path Wealth", "risk_tolerance": 4.8, "start_cap": 75000, "goals": {10: 150000, 20: 350000, 30: 700000}},
+    {"profile_name": "Balanced Heritage", "risk_tolerance": 5.2, "start_cap": 800000, "goals": {15: 1500000, 30: 3000000}},
+    {"profile_name": "Early Retiree Attempt", "risk_tolerance": 6.0, "start_cap": 350000, "goals": {12: 1000000}},
+
+    # ── AGGRESSIVE (Risk 7-9) ────────────────────────────────────────────
+    {"profile_name": "Aggressive Young Investor", "risk_tolerance": 9.0, "start_cap": 50000, "goals": {15: 200000, 30: 1000000}},
+    {"profile_name": "Tech Bulls Catalyst", "risk_tolerance": 8.0, "start_cap": 10000, "goals": {10: 80000, 20: 400000, 30: 1500000}},
+    {"profile_name": "Crypto-Minded Equity", "risk_tolerance": 8.5, "start_cap": 5000, "goals": {5: 25000, 15: 150000}},
+    {"profile_name": "HNW Risk Taker", "risk_tolerance": 7.5, "start_cap": 1000000, "goals": {10: 3000000, 25: 10000000}},
+    {"profile_name": "Compound Interest Maxi", "risk_tolerance": 7.0, "start_cap": 20000, "goals": {25: 500000, 30: 1000000}},
+    {"profile_name": "Full Growth Engine", "risk_tolerance": 9.0, "start_cap": 100000, "goals": {5: 200000, 10: 500000, 20: 2000000, 30: 5000000}},
+    {"profile_name": "Venture Style Liquid", "risk_tolerance": 8.2, "start_cap": 300000, "goals": {15: 1500000}},
+    {"profile_name": "Speculative Compounder", "risk_tolerance": 7.8, "start_cap": 15000, "goals": {10: 100000, 20: 500000, 30: 2000000}},
+    {"profile_name": "Unconstrained Growth", "risk_tolerance": 9.0, "start_cap": 2500, "goals": {30: 500000}},
+    {"profile_name": "Aggressive Legacy", "risk_tolerance": 7.2, "start_cap": 500000, "goals": {20: 3000000, 30: 8000000}},
 ]
 
 

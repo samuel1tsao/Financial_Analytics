@@ -613,9 +613,189 @@ def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, 
             "daily_returns": daily_returns,
             "drip_daily_returns": drip_daily_returns,
             "val_loss": data.get("val_loss"),
-            "model_checkpoint": checkpoint # Store full state for later inference
+            "model_checkpoint": checkpoint, # Store full state for later inference
+            "ml_embedding_dim": data.get("config_snapshot", {}).get("ed", 8),
+            "ml_d_model": data.get("config_snapshot", {}).get("dm", 64),
+            "ml_learning_rate": data.get("config_snapshot", {}).get("lr", 0.001)
         }
         return cache
     except Exception as e:
         print(f"  [WARNING] Failed to load cache for {fname_base}: {e}")
         return None
+
+def generate_walkforward_embeddings_monthly(model, ticker_data, config, X_mean, X_std, start_year=2000, force_rebuild=False):
+    """
+    Generate historical embedding snapshots at every month-end.
+    Saves results per-ticker to cache/walk_forward_{architecture}/{TICKER}.pt
+    """
+    fname_base = get_transformer_filename_base(config)
+    wf_dir = os.path.join(config.get("ml_cache_dir", "cache"), f"walk_forward_{fname_base}")
+    
+    # Check config override if argument is False
+    if not force_rebuild:
+        force_rebuild = config.get("wf_force_rebuild", False)
+
+    # NEW: Caching Logic
+    existing_snapshots = {}
+    missing_dates_by_ticker = {ticker: set() for ticker in ticker_data.keys()}
+    
+    if not force_rebuild and os.path.isdir(wf_dir):
+        existing_files = set(os.listdir(wf_dir))
+        for ticker in ticker_data.keys():
+            path = os.path.join(wf_dir, f"{ticker}.pt")
+            if f"{ticker}.pt" in existing_files:
+                try:
+                    snaps = torch.load(path, map_location='cpu')
+                    existing_snapshots[ticker] = snaps
+                except:
+                    existing_snapshots[ticker] = {}
+            else:
+                existing_snapshots[ticker] = {}
+    else:
+        existing_snapshots = {ticker: {} for ticker in ticker_data.keys()}
+
+    model.eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    
+    os.makedirs(wf_dir, exist_ok=True)
+    
+    # 1. Identify all month-end dates from start_year onwards
+    # Collect all unique dates across all tickers
+    all_dates = set()
+    for info in ticker_data.values():
+        all_dates.update(info['dates'])
+    
+    all_dates = pd.to_datetime(list(all_dates)).sort_values()
+    all_dates = all_dates[all_dates.year >= start_year]
+    
+    # Identify month ends
+    month_ends = all_dates[all_dates.is_month_end].unique()
+    if len(month_ends) == 0:
+        # Fallback to last day of each month available
+        month_ends = all_dates.to_series().resample('ME').max().dropna().values
+        month_ends = pd.to_datetime(month_ends)
+        
+    month_strs = [dt.strftime("%Y-%m") for dt in month_ends]
+    
+    total_missing_tasks = 0
+    for ticker in ticker_data.keys():
+        for dt_str in month_strs:
+            if dt_str not in existing_snapshots[ticker]:
+                missing_dates_by_ticker[ticker].add(dt_str)
+                total_missing_tasks += 1
+                
+    if total_missing_tasks == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] [Member A] Walk-Forward: all {len(ticker_data)} snapshots fully up-to-date for {fname_base}. Skipping generation.")
+        return
+        
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Walk-Forward: Found {total_missing_tasks} missing ticker-month combinations. Resuming generation...")
+    
+    max_seq_len = config.get("ml_max_seq_len", 1260)
+    
+    # 2. Iterate through each month and perform inference
+    ticker_history = {ticker: existing_snapshots.get(ticker, {}) for ticker in ticker_data.keys()}
+    
+    # Optimization: Only process tickers that actually changed or appeared
+    with torch.no_grad():
+        for i, target_dt in enumerate(tqdm(month_ends, desc="Months")):
+            dt_str = target_dt.strftime("%Y-%m")
+            
+            for ticker, info in ticker_data.items():
+                if dt_str not in missing_dates_by_ticker[ticker]:
+                    continue
+                    
+                dates = pd.to_datetime(info['dates'])
+                mask = dates <= target_dt
+                
+                if mask.sum() < 252: # Require at least 1 year of history
+                    continue
+                
+                # Get the window up to this date
+                idx_end = mask.sum()
+                idx_start = max(0, idx_end - max_seq_len)
+                
+                window_data = info['features'][idx_start:idx_end]
+                
+                # Normalize using global stats
+                x = (window_data - X_mean) / X_std
+                
+                # Pad if necessary
+                if len(x) < max_seq_len:
+                    pad_len = max_seq_len - len(x)
+                    x = torch.cat([torch.zeros(pad_len, x.shape[1]), x], dim=0)
+                
+                x = x.unsqueeze(0).to(device) # Batch dimension
+                
+                # Inference
+                _, _, embedding = model(x)
+                ticker_history[ticker][dt_str] = embedding.squeeze(0).cpu().numpy()
+                
+    # 3. Save per-ticker to disk
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Saving {len(ticker_history)} ticker snapshots to {wf_dir}...")
+    for ticker, snapshots in ticker_history.items():
+        if snapshots:
+            path = os.path.join(wf_dir, f"{ticker}.pt")
+            torch.save(snapshots, path)
+            
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Walk-Forward Generation Complete.")
+
+def load_walkforward_embedding(ticker, date, config):
+    """
+    Loads the point-in-time embedding for a ticker for a specific date (YYYY-MM).
+    """
+    fname_base = get_transformer_filename_base(config)
+    wf_dir = os.path.join(config.get("ml_cache_dir", "cache"), f"walk_forward_{fname_base}")
+    path = os.path.join(wf_dir, f"{ticker}.pt")
+    
+    if not os.path.exists(path):
+        return None
+        
+    # Attempt to find the specific month or the nearest previous month
+    try:
+        snapshots = torch.load(path, map_location='cpu')
+        target_key = date.strftime("%Y-%m") if hasattr(date, 'strftime') else str(date)[:7]
+        
+        if target_key in snapshots:
+            return snapshots[target_key]
+        
+        # Fallback: Find most recent month before target
+        valid_keys = sorted([k for k in snapshots.keys() if k < target_key])
+        if valid_keys:
+            return snapshots[valid_keys[-1]]
+            
+    except Exception as e:
+        pass
+        
+    return None
+
+def load_all_walkforward_snapshots(config):
+    """
+    Loads ALL cached ticker snapshots and regroups them by date for RL training.
+    Returns: { "YYYY-MM": { ticker: embedding_array } }
+    """
+    fname_base = get_transformer_filename_base(config)
+    wf_dir = os.path.join(config.get("ml_cache_dir", "cache"), f"walk_forward_{fname_base}")
+    
+    if not os.path.isdir(wf_dir):
+        return {}
+        
+    import time
+    from tqdm import tqdm
+    print(f"[{time.strftime('%H:%M:%S')}] [Member A] Loading Walk-Forward snapshots from {wf_dir}...")
+    
+    snapshots_by_date = {} # { date_str: { ticker: emb } }
+    
+    ticker_files = [f for f in os.listdir(wf_dir) if f.endswith(".pt")]
+    for f in tqdm(ticker_files, desc="Loading Cache", leave=False):
+        ticker = f.replace(".pt", "")
+        try:
+            ticker_data = torch.load(os.path.join(wf_dir, f), map_location='cpu')
+            for date_str, emb in ticker_data.items():
+                if date_str not in snapshots_by_date:
+                    snapshots_by_date[date_str] = {}
+                snapshots_by_date[date_str][ticker] = emb
+        except:
+            continue
+            
+    return snapshots_by_date

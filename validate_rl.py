@@ -31,8 +31,9 @@ def main():
     print("Starting RL Agent Training Loop...")
     result = train_rl_agent(dataset_cache, profile, config, verbose=True)
     
-    print("RL Validation Successful!")
-    print(f"Final Reward: {result['final_reward']}")
+    print("\nRL Validation Successful!")
+    if result['training_history']:
+        print(f"Final Reward: {result['training_history'][-1]['reward']:.3f}")
     print(f"Selected Assets: {len(result['portfolio_weights'])}")
 
 if __name__ == '__main__':
