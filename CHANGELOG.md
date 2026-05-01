@@ -5,7 +5,59 @@ Format: `[TYPE]` — one of `FIX`, `FEAT`, `TUNE`, `REFACTOR`, `DOCS`.
 
 ---
 
-## [Unreleased] — Active Development
+## 2026-05-01
+
+### REFACTOR — Per-Agent Parallelization Optimization
+**File:** `_rl_worker.py`, `_constants.py`  
+**Motivation:** IPC (Inter-Process Communication) overhead was high when dispatching individual simulation paths. Serializing the 6,601-element weight vector 30 times per step (3 agents × 10 paths) was bottlenecking throughput.  
+**Change:** 
+- **Batching per Agent:** Refactored parallel execution to dispatch only $N$ tasks (one per agent). Each task handles its full path batch internally.
+- **Worker-Side Aggregation:** Metrics and rewards are now computed inside the worker process, returning only scalar results to the main thread.
+- **Increased Sampling:** Increased `rl_paths_per_step` from 5 to 10 to improve gradient stability.
+**Impact:** Drastically reduced serialization overhead; training speed remains high even with increased simulation counts.
+
+---
+
+## 2026-04-30
+
+### FEAT — Multi-Agent Ensemble RL Training
+**File:** `_rl_worker.py`, `_constants.py`  
+**Motivation:** Single-agent RL is prone to local optima and high variance. Training an ensemble of agents improves stability, as the final recommendation is the averaged consensus of multiple independent learners.  
+**Change:** 
+- **Ensemble Initialization:** `train_rl_agent` now initializes $N$ independent `PortfolioTransformerRL` agents (controlled by `rl_ensemble_size`).
+- **Concurrent Training:** All $N$ agents are trained in parallel within each iteration.
+- **Batched Checkpointing:** The checkpoint file now stores a list of states for all agents and their respective optimizers, allowing seamless resume of the full ensemble.
+- **Consensus Evaluation:** `_greedy_evaluate_fast` now averages the policy outputs of all ensemble members to produce a robust final allocation.
+
+---
+
+### REFACTOR — Parallelized Simulation Execution (Joblib)
+**File:** `_rl_worker.py`  
+**Motivation:** CPU-bound simulations for an ensemble of $N$ agents each running $P$ paths became a major bottleneck when executed sequentially ($N \times P$ simulations).  
+**Change:** Refactored the training loop to batch all $N \times P$ simulations into a single task list, executed concurrently using `joblib.Parallel`.  
+**Impact:** 
+- **Hardware Utilization:** Saturates all available CPU cores (via `rl_parallel_cores`) during the simulation phase.
+- **Throughput Boost:** Training speed for a 3-agent ensemble is now nearly identical to a single-agent run on multi-core systems.
+
+---
+
+### FEAT — Robust Per-Agent Observability
+**File:** `_rl_worker.py`  
+**Change:** Overhauled training logs to display detailed **Allocation**, **Simulation Metrics**, and **Reward Math** for every agent in the ensemble independently.  
+**Impact:** Enables visual verification of agent diversity and progress, allowing the user to see if individual ensemble members are exploring different regions of the asset universe.
+
+---
+
+## 2026-04-28
+**File:** `_rl_worker.py`, `_sim_worker.py`, `_constants.py`  
+**Motivation:** The previous single-head model was forced to find a single static portfolio that satisfied both pre-goal safety and post-goal growth. This often resulted in a "Safe Asset Trap" where the model stayed in conservative assets even after goals were met, missing out on long-term compounding.  
+**Change:** 
+- **Dual Policy Heads:** The Transformer now outputs two independent Gaussian distributions: `pre-goal` (funding focus) and `post-goal` (growth focus).
+- **Simplified State Space:** User condition vector reduced from 33-dim to 4-dim: `[risk, capital, goal_year_normalized, goal_ratio]`.
+- **Single-Goal Episodes:** Multi-goal profiles are decomposed into single-goal training episodes via `decompose_profiles()`, providing a cleaner gradient signal for funding-specific strategies.
+- **Switching Logic:** The simulator now supports weight switching at the `goal_year` boundary.
+- **Terminal Horizon:** All episodes now run for a fixed 30-year horizon to reward post-goal capital growth.
+**Impact:** Enables "Waterfall Allocation" where strategies shift automatically from target-funding to growth-maximizing as goal milestones are passed.
 
 ---
 

@@ -13,10 +13,13 @@ No other module should hard-code these values.
 # FILE PATHS — CSV cache locations for the data pipeline
 # ═══════════════════════════════════════════════════════════════════════
 
-MASTER_FILE  = "sp1500_master_research_dataset.csv"
-PRICE_FILE   = "sp1500_price_matrix.csv"
-VOLUME_FILE  = "sp1500_volume_matrix.csv"
-DIV_CACHE    = "sp1500_dividends.csv"
+import os
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MASTER_FILE  = os.path.join(_BASE_DIR, "sp1500_master_research_dataset.csv")
+PRICE_FILE   = os.path.join(_BASE_DIR, "sp1500_price_matrix.csv")
+VOLUME_FILE  = os.path.join(_BASE_DIR, "sp1500_volume_matrix.csv")
+DIV_CACHE    = os.path.join(_BASE_DIR, "sp1500_dividends.csv")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -95,11 +98,18 @@ MDD_PENALTY_SCALE         = 4.0
 # Risk 1 → multiplier 10 | Risk 10 → multiplier 1
 MAX_RISK_OFFSET           = 11.0
 
-# GFR exponential penalty: penalty = (exp(GFR_EXP_STEEPNESS * miss) - 1) * GFR_EXP_SCALE
-GFR_EXP_STEEPNESS         = 3.0
-GFR_EXP_SCALE             = 2.0
-GFR_MISS_FLAT_PENALTY     = 10.0
-GFR_PERFECT_REWARD        = 10.0
+# GFR bracketed penalty/reward structure (Success Rate over N paths)
+# 1.0 -> +10 | 0.8 -> 0 | 0.6 -> -5 | 0.4 -> -10 | 0.2 -> -20 | 0.0 -> -30
+GFR_BRACKETS = [
+    (1.0,  10.0),
+    (0.8,   0.0),
+    (0.6,  -5.0),
+    (0.4, -10.0),
+    (0.2, -20.0),
+    (0.0, -30.0)
+]
+GFR_MISS_FLAT_PENALTY     = 0.0     # (Deprecated in favor of GFR_BRACKETS)
+GFR_PERFECT_REWARD        = 10.0    # (Explicit bonus for 1.0)
 
 # Number of top assets to select by weight — used consistently in BOTH training and evaluation.
 # Replaces the old MIN_ACTIVE_WEIGHT threshold, which caused a train/eval mismatch:
@@ -117,13 +127,18 @@ RL_ASSET_SUBSET_SIZE      = 500
 # Number of walk-forward snapshots to sample per RL episode
 WF_SNAPSHOTS_PER_EPISODE  = 8
 
-# User condition vector dimensions
-GOAL_TIMELINE_SLOTS       = 31     # Year 0 through Year 30
+# User condition vector dimensions (single-goal: risk, capital, goal_year, goal_ratio)
+USER_CONDITION_DIM        = 4
 CAPITAL_NORMALIZER        = 1_000_000.0
 RISK_NORMALIZER           = 10.0
+GOAL_YEAR_NORMALIZER      = 30.0    # Normalize goal year to [0, 1]
 
 # Simulation start year for monthly-shifted evaluation
 SIM_MONTHLY_START_YEAR    = 2006
+
+# All single-goal episodes simulate to this terminal horizon
+# (post-goal capital keeps compounding under the growth-phase weights)
+SIM_TERMINAL_HORIZON      = 30
 
 # Debug: max years to log per path
 DEBUG_LOG_MAX_YEARS       = 5
@@ -186,12 +201,17 @@ DEFAULT_PIPELINE_CONFIG = {
     "rl_dropout": 0.1,
     "rl_learning_rate": 0.001,
     "rl_episodes": 10000000,
-    "rl_force_rebuild": True,
+    "rl_force_rebuild": False,
     "rl_initial_mu_bias": 0.0,
     "rl_checkpoint_frequency": 10,
     "sim_paths_per_episode": 50,          # (Legacy) Number of start-dates for full evaluation
-    "rl_paths_per_step": 5,               # Sim paths per gradient update step (stochastic training)
+    "rl_paths_per_step": 10,              # Sim paths per gradient update step (stochastic training)
     "rl_verbose_every": 10,                # Print progress every N iterations
+    "rl_ensemble_size": 3,                 # Number of agents to train and average together
+    "rl_convergence_window": 500,          # Rolling window size for reward smoothing
+    "rl_convergence_patience": 5000,       # Iterations without improvement before convergence
+    "rl_convergence_min_delta": 0.5,       # Minimum reward improvement to reset patience
+    "rl_early_stopping": False,            # If True, halt training on convergence detection
     "debug_path": False,                   # Global toggle for per‑episode sample‑path logging
     "rl_parallel_cores": -1,               # Use all cores by default (set to 1 for tiny jobs)
     # -----------------------
@@ -247,41 +267,71 @@ DEFAULT_PIPELINE_CONFIG = {
 
 TEST_PROFILES = [
     # ── CONSERVATIVE (Risk 1-3) ──────────────────────────────────────────
-    {"profile_name": "Risk-Averse Saver", "risk_tolerance": 1.5, "start_cap": 25000, "goals": {3: 30000, 10: 60000}},
-    {"profile_name": "Conservative Retiree", "risk_tolerance": 2.0, "start_cap": 500000, "goals": {2: 50000, 5: 100000, 10: 200000}},
-    {"profile_name": "Legacy Protector", "risk_tolerance": 1.0, "start_cap": 1500000, "goals": {20: 2000000}},
-    {"profile_name": "Down Payment Safety", "risk_tolerance": 2.5, "start_cap": 80000, "goals": {4: 110000}},
-    {"profile_name": "Rainy Day Buffer", "risk_tolerance": 3.0, "start_cap": 15000, "goals": {5: 25000, 15: 50000}},
-    {"profile_name": "Trust Fund Anchor", "risk_tolerance": 1.8, "start_cap": 2000000, "goals": {10: 2500000, 25: 4000000}},
-    {"profile_name": "Stable Income Seeker", "risk_tolerance": 2.2, "start_cap": 300000, "goals": {5: 350000, 15: 500000, 30: 800000}},
-    {"profile_name": "Low-Volatility Pensioner", "risk_tolerance": 1.2, "start_cap": 1200000, "goals": {5: 1300000, 20: 1800000}},
-    {"profile_name": "Frugal Conservative", "risk_tolerance": 2.8, "start_cap": 50000, "goals": {10: 100000}},
-    {"profile_name": "Bond-Heavy Defensive", "risk_tolerance": 1.5, "start_cap": 100000, "goals": {3: 110000, 7: 130000, 12: 160000}},
+    {"profile_name": "Risk-Averse Saver", "risk_tolerance": 1.5, "start_cap": 25000, "monthly_contrib": 0, "goals": {3: 30000, 10: 60000}},
+    {"profile_name": "Conservative Retiree", "risk_tolerance": 2.0, "start_cap": 500000, "monthly_contrib": 0, "goals": {2: 50000, 5: 100000, 10: 200000}},
+    {"profile_name": "Legacy Protector", "risk_tolerance": 1.0, "start_cap": 1500000, "monthly_contrib": 0, "goals": {20: 2000000}},
+    {"profile_name": "Down Payment Safety", "risk_tolerance": 2.5, "start_cap": 80000, "monthly_contrib": 0, "goals": {4: 110000}},
+    {"profile_name": "Rainy Day Buffer", "risk_tolerance": 3.0, "start_cap": 15000, "monthly_contrib": 0, "goals": {5: 25000, 15: 50000}},
+    {"profile_name": "Trust Fund Anchor", "risk_tolerance": 1.8, "start_cap": 2000000, "monthly_contrib": 0, "goals": {10: 2500000, 25: 4000000}},
+    {"profile_name": "Stable Income Seeker", "risk_tolerance": 2.2, "start_cap": 300000, "monthly_contrib": 0, "goals": {5: 350000, 15: 500000, 30: 800000}},
+    {"profile_name": "Low-Volatility Pensioner", "risk_tolerance": 1.2, "start_cap": 1200000, "monthly_contrib": 0, "goals": {5: 1300000, 20: 1800000}},
+    {"profile_name": "Frugal Conservative", "risk_tolerance": 2.8, "start_cap": 50000, "monthly_contrib": 0, "goals": {10: 100000}},
+    {"profile_name": "Bond-Heavy Defensive", "risk_tolerance": 1.5, "start_cap": 100000, "monthly_contrib": 0, "goals": {3: 110000, 7: 130000, 12: 160000}},
 
     # ── BALANCED (Risk 4-6) ──────────────────────────────────────────────
-    {"profile_name": "Balanced Growth", "risk_tolerance": 5.0, "start_cap": 150000, "goals": {5: 180000, 20: 400000}},
-    {"profile_name": "Mid-Career Climber", "risk_tolerance": 4.5, "start_cap": 250000, "goals": {10: 450000, 25: 1000000}},
-    {"profile_name": "House & College Fund", "risk_tolerance": 5.5, "start_cap": 100000, "goals": {7: 150000, 18: 300000}},
-    {"profile_name": "Pragmatic High Earner", "risk_tolerance": 6.0, "start_cap": 400000, "goals": {5: 600000, 15: 1200000, 30: 2500000}},
-    {"profile_name": "Moderate Explorer", "risk_tolerance": 4.0, "start_cap": 40000, "goals": {8: 100000}},
-    {"profile_name": "Diversified Builder", "risk_tolerance": 5.8, "start_cap": 120000, "goals": {12: 300000, 28: 800000}},
-    {"profile_name": "Mid-Stage Saver", "risk_tolerance": 4.2, "start_cap": 200000, "goals": {5: 250000, 10: 350000, 20: 600000}},
-    {"profile_name": "Steady Path Wealth", "risk_tolerance": 4.8, "start_cap": 75000, "goals": {10: 150000, 20: 350000, 30: 700000}},
-    {"profile_name": "Balanced Heritage", "risk_tolerance": 5.2, "start_cap": 800000, "goals": {15: 1500000, 30: 3000000}},
-    {"profile_name": "Early Retiree Attempt", "risk_tolerance": 6.0, "start_cap": 350000, "goals": {12: 1000000}},
+    {"profile_name": "Balanced Growth", "risk_tolerance": 5.0, "start_cap": 150000, "monthly_contrib": 0, "goals": {5: 180000, 20: 400000}},
+    {"profile_name": "Mid-Career Climber", "risk_tolerance": 4.5, "start_cap": 250000, "monthly_contrib": 0, "goals": {10: 450000, 25: 1000000}},
+    {"profile_name": "House & College Fund", "risk_tolerance": 5.5, "start_cap": 100000, "monthly_contrib": 0, "goals": {7: 150000, 18: 300000}},
+    {"profile_name": "Pragmatic High Earner", "risk_tolerance": 6.0, "start_cap": 400000, "monthly_contrib": 0, "goals": {5: 600000, 15: 1200000, 30: 2500000}},
+    {"profile_name": "Moderate Explorer", "risk_tolerance": 4.0, "start_cap": 40000, "monthly_contrib": 0, "goals": {8: 100000}},
+    {"profile_name": "Diversified Builder", "risk_tolerance": 5.8, "start_cap": 120000, "monthly_contrib": 0, "goals": {12: 300000, 28: 800000}},
+    {"profile_name": "Mid-Stage Saver", "risk_tolerance": 4.2, "start_cap": 200000, "monthly_contrib": 0, "goals": {5: 250000, 10: 350000, 20: 600000}},
+    {"profile_name": "Steady Path Wealth", "risk_tolerance": 4.8, "start_cap": 75000, "monthly_contrib": 0, "goals": {10: 150000, 20: 350000, 30: 700000}},
+    {"profile_name": "Balanced Heritage", "risk_tolerance": 5.2, "start_cap": 800000, "monthly_contrib": 0, "goals": {15: 1500000, 30: 3000000}},
+    {"profile_name": "Early Retiree Attempt", "risk_tolerance": 6.0, "start_cap": 350000, "monthly_contrib": 0, "goals": {12: 1000000}},
 
     # ── AGGRESSIVE (Risk 7-9) ────────────────────────────────────────────
-    {"profile_name": "Aggressive Young Investor", "risk_tolerance": 9.0, "start_cap": 50000, "goals": {15: 200000, 30: 1000000}},
-    {"profile_name": "Tech Bulls Catalyst", "risk_tolerance": 8.0, "start_cap": 10000, "goals": {10: 80000, 20: 400000, 30: 1500000}},
-    {"profile_name": "Crypto-Minded Equity", "risk_tolerance": 8.5, "start_cap": 5000, "goals": {5: 25000, 15: 150000}},
-    {"profile_name": "HNW Risk Taker", "risk_tolerance": 7.5, "start_cap": 1000000, "goals": {10: 3000000, 25: 10000000}},
-    {"profile_name": "Compound Interest Maxi", "risk_tolerance": 7.0, "start_cap": 20000, "goals": {25: 500000, 30: 1000000}},
-    {"profile_name": "Full Growth Engine", "risk_tolerance": 9.0, "start_cap": 100000, "goals": {5: 200000, 10: 500000, 20: 2000000, 30: 5000000}},
-    {"profile_name": "Venture Style Liquid", "risk_tolerance": 8.2, "start_cap": 300000, "goals": {15: 1500000}},
-    {"profile_name": "Speculative Compounder", "risk_tolerance": 7.8, "start_cap": 15000, "goals": {10: 100000, 20: 500000, 30: 2000000}},
-    {"profile_name": "Unconstrained Growth", "risk_tolerance": 9.0, "start_cap": 2500, "goals": {30: 500000}},
-    {"profile_name": "Aggressive Legacy", "risk_tolerance": 7.2, "start_cap": 500000, "goals": {20: 3000000, 30: 8000000}},
+    {"profile_name": "Aggressive Young Investor", "risk_tolerance": 9.0, "start_cap": 50000, "monthly_contrib": 0, "goals": {15: 200000, 30: 1000000}},
+    {"profile_name": "Tech Bulls Catalyst", "risk_tolerance": 8.0, "start_cap": 10000, "monthly_contrib": 0, "goals": {10: 80000, 20: 400000, 30: 1500000}},
+    {"profile_name": "Crypto-Minded Equity", "risk_tolerance": 8.5, "start_cap": 5000, "monthly_contrib": 0, "goals": {5: 25000, 15: 150000}},
+    {"profile_name": "HNW Risk Taker", "risk_tolerance": 7.5, "start_cap": 1000000, "monthly_contrib": 0, "goals": {10: 3000000, 25: 10000000}},
+    {"profile_name": "Compound Interest Maxi", "risk_tolerance": 7.0, "start_cap": 20000, "monthly_contrib": 0, "goals": {25: 500000, 30: 1000000}},
+    {"profile_name": "Full Growth Engine", "risk_tolerance": 9.0, "start_cap": 100000, "monthly_contrib": 0, "goals": {5: 200000, 10: 500000, 20: 2000000, 30: 5000000}},
+    {"profile_name": "Venture Style Liquid", "risk_tolerance": 8.2, "start_cap": 300000, "monthly_contrib": 0, "goals": {15: 1500000}},
+    {"profile_name": "Speculative Compounder", "risk_tolerance": 7.8, "start_cap": 15000, "monthly_contrib": 0, "goals": {10: 100000, 20: 500000, 30: 2000000}},
+    {"profile_name": "Unconstrained Growth", "risk_tolerance": 9.0, "start_cap": 2500, "monthly_contrib": 0, "goals": {30: 500000}},
+    {"profile_name": "Aggressive Legacy", "risk_tolerance": 7.2, "start_cap": 500000, "monthly_contrib": 0, "goals": {20: 3000000, 30: 8000000}},
 ]
+
+
+def decompose_profiles(profiles=None):
+    """
+    Decompose multi-goal profiles into single-goal episodes.
+
+    Each profile with N goals becomes N single-goal entries, each with:
+        goal_year:   the year of the single goal
+        goal_amount: the target amount for that year
+        goals:       {goal_year: goal_amount}  (kept for sim backward-compat)
+
+    This lets the RL agent learn the optimal pre-goal/post-goal allocation
+    for each specific horizon, rather than trying to satisfy all goals at once.
+    """
+    if profiles is None:
+        profiles = TEST_PROFILES
+
+    single_goal_profiles = []
+    for p in profiles:
+        for year, amount in p["goals"].items():
+            single_goal_profiles.append({
+                "profile_name": f"{p['profile_name']} (Y{year})",
+                "risk_tolerance": p["risk_tolerance"],
+                "start_cap": p["start_cap"],
+                "monthly_contrib": p.get("monthly_contrib", 0),
+                "goal_year": int(year),
+                "goal_amount": float(amount),
+                "goals": {int(year): float(amount)},
+            })
+    return single_goal_profiles
 
 
 # ═══════════════════════════════════════════════════════════════════════

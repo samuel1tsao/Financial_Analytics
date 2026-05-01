@@ -168,6 +168,24 @@ Closing the loop end-to-end.
 *   **9.2 Self-Supervised ML Scoring:** Generate 100k randomized portfolios to train a neural network to predict success probability.
 *   **9.3 Reinforcement Learning Allocator:** Formulate allocation as an MDP (State, Action, Reward) using PPO/DDPG.
 *   **9.4 Regime-Switching Monte Carlo:** Use Hidden Markov Models (HMM) to simulate prolonged bear/bull regimes.
+*   **9.5 Multi-Phase "Waterfall" Allocation:** (Active) Sequence multiple single-goal inferences to handle complex multi-goal users via the dual-head policy (Pre-Goal $W_1 \to$ Pre-Goal $W_2 \to$ Post-Goal $W_n$).
+
+---
+
+## 13. Multi-Phase Waterfall Allocation (Engineering Spec)
+
+To handle users with multiple goals using the dual-head RL model, we implement a **Waterfall Schedule**. This decouples the complex multi-objective optimization into a sequence of atomic, goal-specific strategy shifts.
+
+### 13.1 Inference Flow
+For a user with goals at $T_1, T_2, \dots, T_n$:
+1.  **Iterative Scoring:** Run the RL Transformer $n$ times, once for each goal condition $(T_i, Amount_i)$.
+2.  **Head Selection:** 
+    *   For the $i$-th goal period $[T_{i-1}, T_i]$, select the `pre-goal` weights from Inference $i$.
+    *   For the final terminal period $[T_n, 30]$, select the `post-goal` weights from Inference $n$.
+3.  **Result:** A weight schedule $S = \{ (0, W_{pre,1}), (T_1, W_{pre,2}), \dots, (T_n, W_{post,n}) \}$.
+
+### 13.2 Simulation Support
+The `_sim_worker.py` engine is updated to accept a weight dictionary keyed by year. At the start of each simulated year, if `year` exists in the schedule, the active `weight_array` is updated. This allows the backtester to evaluate the "Waterfall" performance on original multi-goal profiles while the model only ever has to learn "single-goal funding" and "general growth."
 
 ---
 
@@ -396,22 +414,17 @@ if RL_ASSET_SUBSET_SIZE is not None and RL_ASSET_SUBSET_SIZE < len(all_tickers):
 
 ---
 
-#### 12.8.3 Stochastic Per-Step Gradient Updates (`rl_paths_per_step`)
+#### 12.8.4 Per-Agent Parallelization Optimization (`joblib`)
 
-**File:** `_rl_worker.py`, `_constants.py`
+**File:** `_rl_worker.py`
 
-**Before:** The original training loop ran `sim_paths_per_episode = 50` simulation paths per gradient update, giving a precise but expensive reward estimate.
+**Before:** Simulations were parallelized at the path level ($N$ agents $\times$ $P$ paths = tasks). Because individual simulations are now hyper-fast (<1ms), the IPC (Inter-Process Communication) overhead of serializing the 6,601-element weight vector 30+ times per step was becoming the primary bottleneck.
 
-**After:** Each gradient update uses only `rl_paths_per_step = 5` randomly sampled simulation start dates. The reward is noisier, but the EMA baseline absorbs the variance:
+**After:** Parallel execution is now batched **per agent**. Each of the $N$ agents is a single joblib task. The worker process receives the weight vector once, loops through the $P$ paths internally, and aggregates the results before returning only the final metrics/reward to the main process.
 
-```python
-baseline = 0.99 * baseline + 0.01 * float(reward)
-loss = -(reward - baseline) * log_prob.mean()
-```
-
-**Impact:** ~10× more gradient updates per wall-clock second. For stochastic REINFORCE, frequent noisy updates empirically converge faster than infrequent precise updates.
-
-**Trade-off:** Higher per-step variance in reward estimates, mitigated by the EMA baseline variance reduction technique (see Section 12.1).
+**Impact:** 
+- **Drastic Overhead Reduction:** Reduces IPC serialization frequency by $P$ times (e.g., from 30 tasks to 3 tasks).
+- **Streamlined Workflow:** Training throughput increased further, enabling larger ensembles without IPC congestion.
 
 ---
 
@@ -421,5 +434,6 @@ loss = -(reward - baseline) * log_prob.mean()
 | :--- | :--- | :--- | :--- |
 | Simulation per path | Pandas `.iloc` + `.prod()` (~100ms) | `np.dot` on cached numpy (<1ms) | ~100× |
 | Transformer input size | ~6,500 assets (full universe) | 500 assets (random subset) | ~169× (attention) |
-| Paths per gradient update | 50 | 5 | ~10× |
-| **Net training throughput** | **~0.01 it/s** | **1+ it/s** | **~100×** |
+| Paths per gradient update | 50 | 10 | ~5× |
+| **Ensemble Concurrency** | Sequential (1x) | **Per-Agent Parallel (Nx)** | **~N-core speedup** |
+| **Net training throughput** | ~0.01 it/s | **25+ it/s (Estimated)** | **~2500×+** |

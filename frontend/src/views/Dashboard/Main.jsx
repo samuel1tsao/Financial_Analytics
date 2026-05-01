@@ -7,6 +7,7 @@ import {
 import useStore from '../../store';
 import api from '../../api/client';
 import AssetModal from '../../components/AssetModal';
+import BalanceStepTable from '../../components/BalanceStepTable';
 
 // ─── Formatters ──────────────────────────────────────────────────────────────
 const fmt = (val) => {
@@ -96,6 +97,22 @@ export default function DashboardMain() {
   const activePortfolio = portfolios.find((p) => p.id === activePortfolioId)
     || portfolios.find((p) => p.is_current)
     || null;
+
+  let weights = {};
+  let segments = [];
+  if (activePortfolio) {
+    try {
+      const parsed = JSON.parse(activePortfolio.weight_json);
+      if (Array.isArray(parsed)) {
+        segments = parsed;
+        weights = parsed[0]?.weights || {};
+      } else {
+        weights = parsed;
+      }
+    } catch (e) {
+      console.error("Weights parsing error", e);
+    }
+  }
 
   // Debounce goal input so we don't spam the API while dragging sliders
   useEffect(() => {
@@ -310,194 +327,202 @@ export default function DashboardMain() {
       )}
 
       {simulation && !simLoading && (
-        <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
-          <div style={{
-            flex: 3, minWidth: 500,
-            padding: '1.5rem', borderRadius: '0.75rem',
-            background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
-            border: '1px solid rgba(255,255,255,0.06)',
-          }}>
+        <>
+          <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
             <div style={{
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              marginBottom: '1rem',
+              flex: 3, minWidth: 500,
+              padding: '1.5rem', borderRadius: '0.75rem',
+              background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
+              border: '1px solid rgba(255,255,255,0.06)',
             }}>
-              <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
-                Portfolio Growth Projection
-              </h3>
-              <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
-                ±2σ Confidence Interval · $100K Initial
-              </span>
+              <div style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                marginBottom: '1rem',
+              }}>
+                <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
+                  Portfolio Growth Projection
+                </h3>
+                <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
+                  ±2σ Confidence Interval · $100K Initial
+                </span>
+              </div>
+
+              <ResponsiveContainer width="100%" height={380}>
+                <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="gradUpper" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.25} />
+                      <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
+                    </linearGradient>
+                    <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
+                      <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
+                    </linearGradient>
+                    <linearGradient id="gradLower" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
+                      <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                  <XAxis
+                    dataKey="year"
+                    stroke="#475569" fontSize={12} tickLine={false}
+                    label={{ value: 'Years', position: 'insideBottom', offset: -2, fill: '#64748b', fontSize: 11 }}
+                  />
+                  <YAxis
+                    stroke="#475569" fontSize={11} tickLine={false}
+                    tickFormatter={fmt}
+                    width={65}
+                  />
+                  <Tooltip content={<SimTooltip />} />
+
+                  {/* Confidence band: upper */}
+                  <Area
+                    type="monotone" dataKey="upper" name="Best Case (+2σ)"
+                    stroke="rgba(139,92,246,0.5)" strokeWidth={1.5}
+                    fill="url(#gradUpper)" dot={false}
+                    strokeDasharray="4 2"
+                  />
+
+                  {/* Expected path */}
+                  <Area
+                    type="monotone" dataKey="expected" name="Expected Path"
+                    stroke="#3b82f6" strokeWidth={2.5}
+                    fill="url(#gradExpected)" dot={false}
+                  />
+
+                  {/* Confidence band: lower */}
+                  <Area
+                    type="monotone" dataKey="lower" name="Worst Case (−2σ)"
+                    stroke="rgba(239,68,68,0.4)" strokeWidth={1.5}
+                    fill="url(#gradLower)" dot={false}
+                    strokeDasharray="4 2"
+                  />
+
+                  {/* Goal annotations */}
+                  {simulation.goal_annotations?.map((g, i) => (
+                    <ReferenceLine
+                      key={i}
+                      x={g.year}
+                      stroke={g.is_short_term ? '#f59e0b' : '#4ade80'}
+                      strokeDasharray="3 3"
+                      strokeWidth={1.5}
+                      label={{
+                        value: `${g.label} (Yr ${g.year})`,
+                        position: 'top',
+                        fill: g.is_short_term ? '#f59e0b' : '#4ade80',
+                        fontSize: 11,
+                        fontWeight: 600,
+                      }}
+                    />
+                  ))}
+
+                  <Legend
+                    verticalAlign="top" align="right" height={36}
+                    wrapperStyle={{ fontSize: '0.75rem', color: '#94a3b8' }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
             </div>
 
-            <ResponsiveContainer width="100%" height={380}>
-              <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="gradUpper" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.25} />
-                    <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
-                  </linearGradient>
-                  <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
-                  </linearGradient>
-                  <linearGradient id="gradLower" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
-                    <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-                <XAxis
-                  dataKey="year"
-                  stroke="#475569" fontSize={12} tickLine={false}
-                  label={{ value: 'Years', position: 'insideBottom', offset: -2, fill: '#64748b', fontSize: 11 }}
-                />
-                <YAxis
-                  stroke="#475569" fontSize={11} tickLine={false}
-                  tickFormatter={fmt}
-                  width={65}
-                />
-                <Tooltip content={<SimTooltip />} />
-
-                {/* Confidence band: upper */}
-                <Area
-                  type="monotone" dataKey="upper" name="Best Case (+2σ)"
-                  stroke="rgba(139,92,246,0.5)" strokeWidth={1.5}
-                  fill="url(#gradUpper)" dot={false}
-                  strokeDasharray="4 2"
-                />
-
-                {/* Expected path */}
-                <Area
-                  type="monotone" dataKey="expected" name="Expected Path"
-                  stroke="#3b82f6" strokeWidth={2.5}
-                  fill="url(#gradExpected)" dot={false}
-                />
-
-                {/* Confidence band: lower */}
-                <Area
-                  type="monotone" dataKey="lower" name="Worst Case (−2σ)"
-                  stroke="rgba(239,68,68,0.4)" strokeWidth={1.5}
-                  fill="url(#gradLower)" dot={false}
-                  strokeDasharray="4 2"
-                />
-
-                {/* Goal annotations */}
-                {simulation.goal_annotations?.map((g, i) => (
-                  <ReferenceLine
-                    key={i}
-                    x={g.year}
-                    stroke={g.is_short_term ? '#f59e0b' : '#4ade80'}
-                    strokeDasharray="3 3"
-                    strokeWidth={1.5}
-                    label={{
-                      value: `${g.label} (Yr ${g.year})`,
-                      position: 'top',
-                      fill: g.is_short_term ? '#f59e0b' : '#4ade80',
-                      fontSize: 11,
-                      fontWeight: 600,
+            <div style={{
+              flex: 1, minWidth: 280,
+              padding: '1.5rem', borderRadius: '0.75rem',
+              background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
+              border: '1px solid rgba(255,255,255,0.06)',
+            }}>
+              <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '0.9rem', marginBottom: '1rem' }}>
+                Interactive Sandbox
+              </h3>
+              <p style={{ color: '#94a3b8', fontSize: '0.75rem', marginBottom: '1.5rem' }}>
+                Test how big purchases or cash-outs affect your long-term growth by overriding your baseline goals here.
+              </p>
+              
+              {customGoals.map((g, i) => (
+                <div key={i} style={{ marginBottom: '1.5rem', paddingBottom: '1.5rem', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                  <input 
+                    type="text" 
+                    value={g.name} 
+                    onChange={e => {
+                      const ng = [...customGoals];
+                      ng[i].name = e.target.value;
+                      setCustomGoals(ng);
+                    }}
+                    style={{
+                      width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                      color: '#f1f5f9', padding: '0.4rem', borderRadius: '0.3rem', fontSize: '0.8rem', marginBottom: '0.8rem',
                     }}
                   />
-                ))}
+                  
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
+                    <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Amount: {fmt(g.amount)}</label>
+                  </div>
+                  <input 
+                    type="range" min="0" max="250000" step="5000"
+                    value={g.amount}
+                    onChange={e => {
+                      const ng = [...customGoals];
+                      ng[i].amount = Number(e.target.value);
+                      setCustomGoals(ng);
+                    }}
+                    style={{ width: '100%', cursor: 'pointer', marginBottom: '0.8rem' }}
+                  />
 
-                <Legend
-                  verticalAlign="top" align="right" height={36}
-                  wrapperStyle={{ fontSize: '0.75rem', color: '#94a3b8' }}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-
-          <div style={{
-            flex: 1, minWidth: 280,
-            padding: '1.5rem', borderRadius: '0.75rem',
-            background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
-            border: '1px solid rgba(255,255,255,0.06)',
-          }}>
-            <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '0.9rem', marginBottom: '1rem' }}>
-              Interactive Sandbox
-            </h3>
-            <p style={{ color: '#94a3b8', fontSize: '0.75rem', marginBottom: '1.5rem' }}>
-              Test how big purchases or cash-outs affect your long-term growth by overriding your baseline goals here.
-            </p>
-            
-            {customGoals.map((g, i) => (
-              <div key={i} style={{ marginBottom: '1.5rem', paddingBottom: '1.5rem', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                <input 
-                  type="text" 
-                  value={g.name} 
-                  onChange={e => {
-                    const ng = [...customGoals];
-                    ng[i].name = e.target.value;
-                    setCustomGoals(ng);
-                  }}
-                  style={{
-                    width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
-                    color: '#f1f5f9', padding: '0.4rem', borderRadius: '0.3rem', fontSize: '0.8rem', marginBottom: '0.8rem',
-                  }}
-                />
-                
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
-                  <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Amount: {fmt(g.amount)}</label>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
+                    <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Year: {g.years}</label>
+                  </div>
+                  <input 
+                    type="range" min="1" max="30" step="1"
+                    value={g.years}
+                    onChange={e => {
+                      const ng = [...customGoals];
+                      ng[i].years = Number(e.target.value);
+                      setCustomGoals(ng);
+                    }}
+                    style={{ width: '100%', cursor: 'pointer' }}
+                  />
                 </div>
-                <input 
-                  type="range" min="0" max="250000" step="5000"
-                  value={g.amount}
-                  onChange={e => {
-                    const ng = [...customGoals];
-                    ng[i].amount = Number(e.target.value);
-                    setCustomGoals(ng);
-                  }}
-                  style={{ width: '100%', cursor: 'pointer', marginBottom: '0.8rem' }}
-                />
+              ))}
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
-                  <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Year: {g.years}</label>
-                </div>
-                <input 
-                  type="range" min="1" max="30" step="1"
-                  value={g.years}
-                  onChange={e => {
-                    const ng = [...customGoals];
-                    ng[i].years = Number(e.target.value);
-                    setCustomGoals(ng);
-                  }}
-                  style={{ width: '100%', cursor: 'pointer' }}
-                />
-              </div>
-            ))}
-
-            {simulation.cash_out_events?.length > 0 && (
-              <div style={{ marginTop: '1rem', background: 'rgba(245,158,11,0.08)', padding: '0.75rem', borderRadius: '0.4rem', border: '1px solid rgba(245,158,11,0.15)' }}>
-                <p style={{ color: '#f59e0b', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.4rem' }}>
-                  CASH-OUT EVENT LOG
-                </p>
-                {simulation.cash_out_events.map((ev, i) => (
-                  <p key={i} style={{ color: '#e2e8f0', fontSize: '0.75rem', margin: '0.2rem 0' }}>
-                    <strong>Yr {ev.year}</strong>: {ev.goal_name} (-{fmt(ev.amount)})
+              {simulation.cash_out_events?.length > 0 && (
+                <div style={{ marginTop: '1rem', background: 'rgba(245,158,11,0.08)', padding: '0.75rem', borderRadius: '0.4rem', border: '1px solid rgba(245,158,11,0.15)' }}>
+                  <p style={{ color: '#f59e0b', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                    CASH-OUT EVENT LOG
                   </p>
-                ))}
-              </div>
-            )}
+                  {simulation.cash_out_events.map((ev, i) => (
+                    <p key={i} style={{ color: '#e2e8f0', fontSize: '0.75rem', margin: '0.2rem 0' }}>
+                      <strong>Yr {ev.year}</strong>: {ev.goal_name} (-{fmt(ev.amount)})
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
+          
+          <BalanceStepTable 
+            steps={simulation.step_balances} 
+            segments={segments}
+            portfolioName={activePortfolio?.profile_name || 'Portfolio'} 
+          />
+        </>
       )}
 
       {/* Portfolio Allocation Cards */}
       {activePortfolio ? (
-        <>
+        <div style={{ marginTop: '2rem' }}>
           <h3 style={{
             color: '#e2e8f0', fontWeight: 600, fontSize: '1rem',
             marginBottom: '0.75rem',
           }}>
-            Allocation Breakdown
+            Allocation Breakdown {segments.length > 0 && '(Phase 1)'}
           </h3>
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
             gap: '0.75rem',
           }}>
-            {Object.entries(activePortfolio.weights)
+            {Object.entries(weights)
               .sort(([, a], [, b]) => b - a)
               .map(([ticker, weight]) => (
                 <div
@@ -541,7 +566,7 @@ export default function DashboardMain() {
                 </div>
               ))}
           </div>
-        </>
+        </div>
       ) : (
         <p style={{ color: '#64748b' }}>Select a portfolio from the sidebar to view details.</p>
       )}

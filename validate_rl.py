@@ -9,7 +9,7 @@ from _rl_worker import train_rl_agent
 def main():
     config = DEFAULT_PIPELINE_CONFIG.copy()
     config["data_source_mode"] = DataSyncMode.OFFLINE_CSV_ONLY
-    config["rl_episodes"] = 5  # Small number of episodes for validation
+    config["rl_episodes"] = 50  # Small number of episodes for validation
     
     print("Loading Dataset...")
     tickers = []

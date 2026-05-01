@@ -16,7 +16,6 @@ This is the label fed to the two-tower recommendation model.
 
 import numpy as np
 import pandas as pd
-import joblib
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -410,12 +409,12 @@ from _constants import (
     MIN_ACTIVE_WEIGHT,
     TOP_K_ASSETS,
     SIM_MONTHLY_START_YEAR,
+    SIM_TERMINAL_HORIZON,
     DEBUG_LOG_MAX_YEARS,
     CAGR_REWARD_SCALE,
     MDD_PENALTY_SCALE,
     MAX_RISK_OFFSET,
-    GFR_EXP_STEEPNESS,
-    GFR_EXP_SCALE,
+    GFR_BRACKETS,
     GFR_MISS_FLAT_PENALTY,
     GFR_PERFECT_REWARD,
 )
@@ -429,10 +428,17 @@ def _extract_yearly_chunk(daily_returns, start_idx, year_number):
     chunk_start = (start_idx + (year_number - 1) * TRADING_DAYS_PER_YEAR) % n_days
     chunk_end   = (start_idx + year_number * TRADING_DAYS_PER_YEAR) % n_days
 
-    if chunk_end > chunk_start:
-        return daily_returns.iloc[chunk_start:chunk_end]
-    # Wrap around: take the tail then the head
-    return pd.concat([daily_returns.iloc[chunk_start:], daily_returns.iloc[:chunk_end]])
+    if hasattr(daily_returns, "iloc"):
+        if chunk_end > chunk_start:
+            return daily_returns.iloc[chunk_start:chunk_end]
+        # Wrap around
+        return pd.concat([daily_returns.iloc[chunk_start:], daily_returns.iloc[:chunk_end]])
+    else:
+        # NumPy path
+        if chunk_end > chunk_start:
+            return daily_returns[chunk_start:chunk_end]
+        # Wrap around
+        return np.vstack((daily_returns[chunk_start:], daily_returns[:chunk_end]))
 
 
 def _update_drawdown(capital, peak, max_drawdown):
@@ -477,7 +483,7 @@ def _blend_portfolio_returns_safe(base_returns, ticker_weights):
 def build_simulation_cache(base_returns, max_horizon_years=30):
     """
     Precompute annual returns for every asset, for every standard simulation start index, for every year.
-    Returns: (dict cache, dataframe clean_returns, dict column_to_idx)
+    Returns: (numpy 3D array cache_array, dict start_idx_to_pos, dataframe clean_returns, dict column_to_idx)
     """
     import time
     print(f"[{time.strftime('%H:%M:%S')}] [Member C] Building Annual Simulation Cache...")
@@ -487,16 +493,18 @@ def build_simulation_cache(base_returns, max_horizon_years=30):
     column_to_idx = {col: i for i, col in enumerate(clean_returns.columns)}
     
     start_indices = _resolve_simulation_starts(clean_returns)
-    cache = {}
+    num_starts = len(start_indices)
+    start_idx_to_pos = {idx: i for i, idx in enumerate(start_indices)}
+    
+    # Use float32 to save memory while maintaining precision for returns
+    cache_array = np.zeros((num_starts, max_horizon_years, num_assets), dtype=np.float32)
     
     # ── HYPER-FAST NUMPY CONVERSION ──
-    # Converting to numpy avoids massive Pandas slicing and .prod() overhead inside the loop
     from _constants import TRADING_DAYS_PER_YEAR
     n_days = len(clean_returns)
-    one_plus_ret = 1.0 + clean_returns.values
+    one_plus_ret = (1.0 + clean_returns.values).astype(np.float32)
     
-    for start_idx in start_indices:
-        year_returns = np.zeros((max_horizon_years, num_assets))
+    for i, start_idx in enumerate(start_indices):
         for year in range(1, max_horizon_years + 1):
             chunk_start = (start_idx + (year - 1) * TRADING_DAYS_PER_YEAR) % n_days
             chunk_end   = (start_idx + year * TRADING_DAYS_PER_YEAR) % n_days
@@ -506,12 +514,10 @@ def build_simulation_cache(base_returns, max_horizon_years=30):
             else:
                 chunk = np.vstack((one_plus_ret[chunk_start:], one_plus_ret[:chunk_end]))
                 
-            year_returns[year - 1, :] = chunk.prod(axis=0) - 1.0
+            cache_array[i, year - 1, :] = chunk.prod(axis=0) - 1.0
             
-        cache[start_idx] = year_returns
-        
-    print(f"[{time.strftime('%H:%M:%S')}] [Member C] Cache built for {len(start_indices)} paths x {max_horizon_years} years x {num_assets} assets.")
-    return cache, clean_returns, column_to_idx
+    print(f"[{time.strftime('%H:%M:%S')}] [Member C] Cache built: {cache_array.shape} (starts x years x assets)")
+    return cache_array, start_idx_to_pos, clean_returns, column_to_idx
 
 
 def _resolve_simulation_starts(portfolio_returns, start_date=None, start_year_idx=None):
@@ -555,11 +561,12 @@ def _aggregate_path_results(results):
 
 def _compute_reward(metrics, user_profile):
     """
-    3-part reward: CAGR growth score – risk-scaled MDD penalty – exponential GFR penalty.
+    3-part reward: Annual return score – risk-scaled MDD penalty – softened GFR penalty.
+    Horizon is always SIM_TERMINAL_HORIZON (30y) since post-goal capital keeps compounding.
     All scaling constants live in _constants.py for easy tuning.
     """
     start_cap  = float(user_profile["start_cap"])
-    horizon    = max(user_profile["goals"].keys()) if user_profile["goals"] else 1
+    horizon    = SIM_TERMINAL_HORIZON
     risk_tol   = float(user_profile["risk_tolerance"])
     actual_wds = metrics.get("AW", sum(user_profile["goals"].values())) # Fallback for old logs
 
@@ -568,19 +575,24 @@ def _compute_reward(metrics, user_profile):
     annual_return = (total_profit / start_cap) / horizon
     return_score = annual_return * CAGR_REWARD_SCALE
 
-    # 2. MDD Penalty — scaled inversely by user's risk tolerance
-    risk_factor = MAX_RISK_OFFSET - risk_tol
-    mdd_penalty = risk_factor * (metrics["MDD"] * MDD_PENALTY_SCALE)
+    # 2. Risk-Scaled MDD Penalty
+    mdd_penalty = metrics["MDD"] * MDD_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
 
-    # 3. GFR Penalty — exponential curve punishes goal misses with increasing severity
-    gfr_miss    = 1.0 - metrics["GFR"]
-    gfr_penalty = (np.exp(GFR_EXP_STEEPNESS * gfr_miss) - 1.0) * GFR_EXP_SCALE
-    if gfr_miss > 0:
-        gfr_penalty += GFR_MISS_FLAT_PENALTY
+    # 3. GFR Bracketed Contribution (Success Rate over N paths)
+    gfr = float(metrics["GFR"])
+    x_coords = [b[0] for b in GFR_BRACKETS]
+    y_coords = [b[1] for b in GFR_BRACKETS]
+    
+    # Sort for interpolation
+    idx_sort = np.argsort(x_coords)
+    x_sorted = np.array(x_coords)[idx_sort]
+    y_sorted = np.array(y_coords)[idx_sort]
+    
+    gfr_contrib = float(np.interp(gfr, x_sorted, y_sorted))
+    gfr_penalty = -min(0, gfr_contrib)
+    gfr_bonus   = max(0, gfr_contrib)
 
-    total_reward = return_score - mdd_penalty - gfr_penalty
-    gfr_bonus = GFR_PERFECT_REWARD if gfr_miss == 0 else 0.0
-    total_reward += gfr_bonus
+    total_reward = return_score + gfr_contrib - mdd_penalty
     
     metrics["reward_components"] = {
         "return_score": return_score,
@@ -596,18 +608,38 @@ def _compute_reward(metrics, user_profile):
 # ── Core Path Runner ──────────────────────────────────────────────────────────
 
 def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, start_capital, goals, mode,
-                         max_horizon_years, debug_path, start_date_str):
+                         max_horizon_years, debug_path, start_date_str,
+                         post_goal_weights=None, goal_year=None):
     """
     Simulate one trajectory using FAST precomputed annual dot products.
+
+    Two-phase allocation:
+        - Years 1..goal_year use `weight_array` (the pre-goal allocation)
+        - Years goal_year+1..max_horizon use `post_goal_weights` (the growth-phase allocation)
+        If post_goal_weights is None, weight_array is used for the entire horizon (legacy behavior).
     """
     capital           = start_capital
     market_multiplier = 1.0
     mi_peak           = 1.0
     max_drawdown      = 0.0
     trail             = []
+    phase_switched    = False
     
     # On-the-fly computation if missing from cache (e.g. custom Walk-Forward dates)
-    if start_idx in sim_cache:
+    if isinstance(sim_cache, tuple):
+        cache_array, start_idx_to_pos = sim_cache
+        if start_idx in start_idx_to_pos:
+            precomputed_returns = cache_array[start_idx_to_pos[start_idx]]
+        else:
+            # Fallback for indices not in the precomputed cache array
+            precomputed_returns = np.zeros((max_horizon_years, clean_returns.shape[1]))
+            for year in range(1, max_horizon_years + 1):
+                chunk = _extract_yearly_chunk(clean_returns, start_idx, year)
+                if hasattr(chunk, "values"):
+                    precomputed_returns[year - 1, :] = (1 + chunk.values).prod(axis=0) - 1
+                else:
+                    precomputed_returns[year - 1, :] = (1 + chunk).prod(axis=0) - 1
+    elif start_idx in sim_cache:
         precomputed_returns = sim_cache[start_idx]
     else:
         precomputed_returns = np.zeros((max_horizon_years, len(clean_returns.columns)))
@@ -619,8 +651,17 @@ def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, star
     actual_withdrawals = 0.0
     
     for year in range(1, max_horizon_years + 1):
+        # Two-phase weight selection: pre-goal vs post-goal
+        if post_goal_weights is not None and goal_year is not None and year > goal_year:
+            w = post_goal_weights
+            if not phase_switched and debug_path:
+                trail.append(f"Y{year}: → GROWTH PHASE")
+                phase_switched = True
+        else:
+            w = weight_array
+
         # FAST VECTOR DOT PRODUCT
-        yr_return = np.dot(weight_array, precomputed_returns[year - 1])
+        yr_return = np.dot(w, precomputed_returns[year - 1])
         capital           *= (1 + yr_return)
         market_multiplier *= (1 + yr_return)
 
@@ -640,13 +681,10 @@ def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, star
         capital, bankrupt, goal_log = _process_goal_withdrawal(capital, year, goals)
 
         # Build debug trail
-        step_str = f"Y{year}: ${capital:,.0f} ({yr_return:+.1%}){goal_log}"
+        phase_tag = " [POST]" if (post_goal_weights is not None and goal_year is not None and year > goal_year) else ""
+        step_str = f"Y{year}: ${capital:,.0f} ({yr_return:+.1%}){goal_log}{phase_tag}"
         if bankrupt:
             trail.append(step_str)
-            # Goal bankrupt: portfolio had money but couldn't cover the withdrawal target.
-            #   → Use the true market-only MDD; the market didn't collapse.
-            # Market bankrupt: portfolio was already wiped out before withdrawal.
-            #   → MDD is truly 100%.
             reason = "goal" if capital_before > 0 else "market"
             reported_mdd = max_drawdown if reason == "goal" else 1.0
             return {"bankrupt": True, "bankrupt_reason": reason, "terminal_value": 0.0,
@@ -670,50 +708,62 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
                                 sim_cache_bundle=None):
     """
     High-precision monthly-shifted portfolio evaluator utilizing FAST Annual Rebalancing cache.
+    Supports two-phase allocation: if recommendations contains 'post_goal_weights',
+    the sim switches to post-goal weights after the goal year.
     """
     import joblib
     weights = recommendations["portfolio_weights"]
+    post_weights_dict = recommendations.get("post_goal_weights")  # None for legacy single-phase
     mode    = config.get("sim_horizon_mode", "loop")
 
     base_returns = dataset.get("drip_daily_returns") if dataset.get("drip_daily_returns") is not None else dataset["daily_returns"]
     
     # Retrieve or build cache
     if sim_cache_bundle is not None:
-        sim_cache, clean_returns, column_to_idx = sim_cache_bundle
+        cache_data, clean_returns, column_to_idx = sim_cache_bundle
+        # If cache_data is a tuple (array, pos_dict), it's the new format
+        sim_cache = cache_data
     else:
-        sim_cache, clean_returns, column_to_idx = build_simulation_cache(base_returns)
+        cache_array, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns)
+        sim_cache = (cache_array, start_idx_to_pos)
 
     # Convert weights dict -> sorted candidates -> two-stage top-K + normalized threshold
     # Mirrors the exact selection logic used in the RL training loop for train/eval consistency.
-    all_candidates = [(t, w) for t, w in weights.items() if t in column_to_idx and w > 0]
-    if not all_candidates:
+    def _build_weight_array(w_dict):
+        all_candidates = [(t, w) for t, w in w_dict.items() if t in column_to_idx and w > 0]
+        if not all_candidates:
+            return None
+        all_candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = all_candidates[:TOP_K_ASSETS]
+        total_w        = sum(w for _, w in top_candidates)
+        norm_candidates = [(t, w / total_w) for t, w in top_candidates]
+        active = [(t, w) for t, w in norm_candidates if w > MIN_ACTIVE_WEIGHT]
+        if not active:
+            active = norm_candidates
+        num_assets   = len(clean_returns.columns)
+        wa = np.zeros(num_assets)
+        for t, w in active:
+            wa[column_to_idx[t]] = w
+        wa /= wa.sum()
+        return wa
+
+    weight_array = _build_weight_array(weights)
+    if weight_array is None:
         return {"GFR": 0, "ETV": 0, "MDD": 1.0, "Objective_Function_Score": 0, "Total_Simulations": 0,
                 "GoalFails": 0, "MarketFails": 0}
 
-    all_candidates.sort(key=lambda x: x[1], reverse=True)
-    top_candidates = all_candidates[:TOP_K_ASSETS]
-    total_w        = sum(w for _, w in top_candidates)
-    norm_candidates = [(t, w / total_w) for t, w in top_candidates]
-
-    # Apply threshold on normalized weights; fallback to all K if everything is below
-    active = [(t, w) for t, w in norm_candidates if w > MIN_ACTIVE_WEIGHT]
-    if not active:
-        active = norm_candidates
-
-    num_assets   = len(clean_returns.columns)
-    weight_array = np.zeros(num_assets)
-    for t, w in active:
-        weight_array[column_to_idx[t]] = w
-    weight_array /= weight_array.sum()
+    post_weight_array = _build_weight_array(post_weights_dict) if post_weights_dict else None
+    goal_year = user_profile.get("goal_year")  # None for legacy multi-goal profiles
 
     # Step 3: Determine simulation start indices
     sim_starts  = _resolve_simulation_starts(clean_returns, start_date, start_year_idx)
-    max_horizon = max(user_profile['goals'].keys()) if user_profile['goals'] else 1
+    max_horizon = SIM_TERMINAL_HORIZON if goal_year else (max(user_profile['goals'].keys()) if user_profile['goals'] else 1)
     start_cap   = user_profile['start_cap']
 
     if debug_path and len(sim_starts) > 1:
         print(f"  [SIMULATOR] Cyclic Mode: {mode.upper()} | "
-              f"Starts: {len(sim_starts)} | Horizon: {max_horizon}y")
+              f"Starts: {len(sim_starts)} | Horizon: {max_horizon}y"
+              f"{' | Two-Phase @ Y' + str(goal_year) if goal_year else ''}")
 
     # ---------------------------------------------------------------
     # 4️⃣ Subsample start‑indices if the user wants fewer paths per episode
@@ -732,7 +782,8 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
         results.append(
             _run_single_sim_path(
                 idx, weight_array, sim_cache, clean_returns, start_cap,
-                user_profile['goals'], mode, max_horizon, debug_path, date_str
+                user_profile['goals'], mode, max_horizon, debug_path, date_str,
+                post_goal_weights=post_weight_array, goal_year=goal_year
             )
         )
 

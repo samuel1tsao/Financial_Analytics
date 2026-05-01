@@ -28,3 +28,7 @@ backend/*.db
 
 # Data files
 *.csv
+
+# Cache and temporary
+cache/
+scratch/

@@ -46,6 +46,8 @@ class QuestionnaireV1(BaseModel):
     fomo_tendency: int = Field(ge=1, le=10, default=5)
     hard_constraints: list[HardConstraint] = []
     current_portfolio: list[HardConstraint] = []
+    reserved_asset: str = "AAPL"
+    reserved_ratio: float = 0.1
 
 
 class QuestionnaireSave(BaseModel):
