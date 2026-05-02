@@ -77,13 +77,26 @@ async def _yfinance_ticker_is_real(ticker: str) -> bool:
     import yfinance as yf
     def _check():
         try:
-            info = yf.Ticker(ticker).fast_info
-            # fast_info has lastPrice or regularMarketPrice if the ticker resolves
-            price = getattr(info, 'last_price', None) or getattr(info, 'regular_market_price', None)
-            return price is not None and price > 0
+            # Create ticker object
+            t_obj = yf.Ticker(ticker)
+            # Use fast_info for minimal network overhead
+            info = t_obj.fast_info
+            
+            # If fast_info works, check for price or currency
+            if info and hasattr(info, 'last_price') and info.last_price is not None:
+                return True
+                
+            # Fallback to history check (1 day) to confirm it exists
+            hist = t_obj.history(period="1d")
+            return not hist.empty
         except Exception:
             return False
-    return await asyncio.to_thread(_check)
+            
+    try:
+        # Wrap the thread call in a timeout to prevent hanging the request
+        return await asyncio.wait_for(asyncio.to_thread(_check), timeout=5.0)
+    except asyncio.TimeoutError:
+        return False
 
 
 async def _sync_single_ticker_background(ticker: str):

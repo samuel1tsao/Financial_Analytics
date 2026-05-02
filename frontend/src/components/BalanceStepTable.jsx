@@ -21,7 +21,7 @@ export default function BalanceStepTable({ steps, segments, portfolioName }) {
   const exportCSV = () => {
     const headers = ['Year', 'Remaining Balance', 'Top Allocation'];
     const rows = steps.map(s => {
-      const seg = segments?.find(seg => seg.year_start === s.year);
+      const seg = segments?.find(seg => seg.horizon_years?.[0] === s.year);
       const topAsset = seg ? Object.entries(seg.weights).sort((a,b) => b[1]-a[1])[0] : null;
       const allocStr = topAsset ? `${topAsset[0]} (${(topAsset[1]*100).toFixed(1)}%)` : 'Steady';
       return [s.year, s.balance.toFixed(2), allocStr];
@@ -77,7 +77,7 @@ export default function BalanceStepTable({ steps, segments, portfolioName }) {
           <tbody>
             {steps.map((step, idx) => {
               // Find the segment that STARTS at this milestone year
-              const nextSegment = segments?.find(seg => seg.year_start === step.year);
+              const nextSegment = segments?.find(seg => seg.horizon_years?.[0] === step.year);
               const topAssets = nextSegment ? 
                 Object.entries(nextSegment.weights)
                   .sort((a,b) => b[1]-a[1])

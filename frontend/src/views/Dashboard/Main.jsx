@@ -80,37 +80,73 @@ function StatCard({ label, value, subtext, color = '#60a5fa' }) {
 export default function DashboardMain() {
   const {
     portfolios, activePortfolioId, hasCompletedQuestionnaire, fetchUserData,
+    deletePortfolio, questionnaire, simCache, setSimCache
   } = useStore();
   const navigate = useNavigate();
 
   const [simulation, setSimulation] = useState(null);
   const [simLoading, setSimLoading] = useState(false);
   const [simError, setSimError] = useState('');
+  const [backtestData, setBacktestData] = useState(null);
+  const [viewMode, setViewMode] = useState('projection'); // 'projection' or 'backtest'
   
-  // Interactive goals state
-  const [customGoals, setCustomGoals] = useState([{ name: 'House Downpayment', amount: 50000, years: 5 }]);
-  const [debouncedGoals, setDebouncedGoals] = useState(customGoals);
+  // Interactive goals state (initialized from active portfolio below)
+  const [customGoals, setCustomGoals] = useState([]);
+  const [debouncedGoals, setDebouncedGoals] = useState([]);
   
   // ETF Modal
   const [etfModal, setEtfModal] = useState(null);
+  const [activeSegmentIdx, setActiveSegmentIdx] = useState(0);
+  const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
 
   const activePortfolio = portfolios.find((p) => p.id === activePortfolioId)
     || portfolios.find((p) => p.is_current)
     || null;
 
+  useEffect(() => {
+    if (activePortfolio && activePortfolio.weights && activePortfolio.weights.goals) {
+      setCustomGoals(activePortfolio.weights.goals);
+      setDebouncedGoals(activePortfolio.weights.goals);
+    }
+  }, [activePortfolio?.id]);
+
   let weights = {};
   let segments = [];
+  let hardConstraints = new Set();
+  let startCap = 100000;
+  let monthlyContrib = 500;
+  
   if (activePortfolio) {
-    try {
-      const parsed = JSON.parse(activePortfolio.weight_json);
-      if (Array.isArray(parsed)) {
-        segments = parsed;
-        weights = parsed[0]?.weights || {};
-      } else {
-        weights = parsed;
-      }
-    } catch (e) {
-      console.error("Weights parsing error", e);
+    const data = activePortfolio.weights;
+    
+    if (data && data.hard_constraints) {
+      data.hard_constraints.forEach(c => hardConstraints.add(c.ticker.toUpperCase()));
+    }
+    
+    // NEW: Extract initial conditions from saved weights
+    // If not in the portfolio JSON (legacy), fallback to current questionnaire answers
+    if (data && data.start_cap) {
+      startCap = data.start_cap;
+    } else if (questionnaire && questionnaire.start_cap) {
+      startCap = questionnaire.start_cap;
+    }
+
+    if (data && data.monthly_contrib) {
+      monthlyContrib = data.monthly_contrib;
+    } else if (questionnaire && questionnaire.monthly_contrib) {
+      monthlyContrib = questionnaire.monthly_contrib;
+    }
+
+    if (Array.isArray(data)) {
+      segments = data;
+      const currentSeg = segments[activeSegmentIdx] || segments[0];
+      weights = currentSeg?.weights || {};
+    } else if (data && data.segments) {
+      segments = data.segments;
+      const currentSeg = segments[activeSegmentIdx] || segments[0];
+      weights = currentSeg?.weights || {};
+    } else {
+      weights = data || {};
     }
   }
 
@@ -125,20 +161,44 @@ export default function DashboardMain() {
     if (!activePortfolio) return;
     let cancelled = false;
     (async () => {
+      const cacheKey = `${activePortfolio.id}_${JSON.stringify(debouncedGoals)}`;
+      
+      if (simCache[cacheKey]) {
+        console.log("Using cached simulation for:", cacheKey);
+        setSimulation(simCache[cacheKey]);
+        setSimLoading(false);
+        return;
+      }
+
       setSimLoading(true);
       setSimError('');
       try {
-        const res = await api.post('/simulate', null, {
-          params: {
-            portfolio_id: activePortfolio.id,
-            initial_investment: 100000,
-            projection_years: 30,
-            custom_goals_json: JSON.stringify(debouncedGoals),
-          },
+        const res = await api.post('/simulate', {
+          portfolio_id: activePortfolio.id,
+          initial_investment: startCap,
+          monthly_contrib: monthlyContrib,
+          projection_years: 30,
+          custom_goals_json: JSON.stringify(debouncedGoals),
         });
-        if (!cancelled) setSimulation(res.data.simulation);
+        
+        try {
+          const backRes = await api.post('/backtest', {
+            portfolio_id: activePortfolio.id,
+            initial_investment: startCap,
+            monthly_contrib: monthlyContrib,
+          });
+          if (!cancelled) setBacktestData(backRes.data);
+        } catch (e) {
+          console.error("Backtest failed", e);
+        }
+
+        if (!cancelled) {
+          setSimulation(res.data.simulation);
+          setSimCache(cacheKey, res.data.simulation);
+        }
       } catch (err) {
-        if (!cancelled) setSimError(err.response?.data?.detail || 'Simulation failed');
+        console.error('Simulation error:', err);
+        if (!cancelled) setSimError('Failed to load growth projection.');
       } finally {
         if (!cancelled) setSimLoading(false);
       }
@@ -210,7 +270,7 @@ export default function DashboardMain() {
   }
 
   // ─── Build chart data ──────────────────────────────────────────────────
-  const chartData = simulation ? simulation.years.map((yr, i) => ({
+  const chartData = (simulation && !simulation.error) ? simulation.years.map((yr, i) => ({
     year: yr,
     expected: simulation.expected_path[i],
     upper: simulation.upper_bound[i],
@@ -245,29 +305,90 @@ export default function DashboardMain() {
             </span>
           )}
         </div>
-        <button
-          onClick={() => navigate('/questionnaire')}
-          style={{
-            padding: '0.5rem 1rem', borderRadius: '0.5rem',
-            background: 'rgba(59,130,246,0.1)',
-            border: '1px solid rgba(59,130,246,0.2)',
-            color: '#60a5fa', cursor: 'pointer',
-            fontWeight: 500, fontSize: '0.8rem',
-            transition: 'all 0.2s',
-          }}
-          onMouseOver={(e) => {
-            e.currentTarget.style.background = 'rgba(59,130,246,0.2)';
-          }}
-          onMouseOut={(e) => {
-            e.currentTarget.style.background = 'rgba(59,130,246,0.1)';
-          }}
-        >
-          Modify Preferences
-        </button>
+        <div style={{ display: 'flex', gap: '0.75rem' }}>
+          {activePortfolio && (
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              {isConfirmingDelete ? (
+                <>
+                  <button
+                    onClick={async () => {
+                      try {
+                        console.log("Custom confirm accepted, calling deletePortfolio...");
+                        await deletePortfolio(activePortfolio.id);
+                        setIsConfirmingDelete(false);
+                      } catch (err) {
+                        console.error("Critical error in delete handler:", err);
+                      }
+                    }}
+                    style={{
+                      padding: '0.5rem 1rem', borderRadius: '0.5rem',
+                      background: '#ef4444', border: '1px solid #ef4444',
+                      color: '#fff', cursor: 'pointer',
+                      fontWeight: 600, fontSize: '0.8rem',
+                    }}
+                  >
+                    Confirm Delete
+                  </button>
+                  <button
+                    onClick={() => setIsConfirmingDelete(false)}
+                    style={{
+                      padding: '0.5rem 1rem', borderRadius: '0.5rem',
+                      background: 'rgba(255,255,255,0.05)',
+                      border: '1px solid rgba(255,255,255,0.1)',
+                      color: '#94a3b8', cursor: 'pointer',
+                      fontWeight: 500, fontSize: '0.8rem',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => setIsConfirmingDelete(true)}
+                  style={{
+                    padding: '0.5rem 1rem', borderRadius: '0.5rem',
+                    background: 'rgba(239,68,68,0.05)',
+                    border: '1px solid rgba(239,68,68,0.2)',
+                    color: '#fca5a5', cursor: 'pointer',
+                    fontWeight: 500, fontSize: '0.8rem',
+                    transition: 'all 0.2s',
+                  }}
+                  onMouseOver={(e) => {
+                    e.currentTarget.style.background = 'rgba(239,68,68,0.15)';
+                  }}
+                  onMouseOut={(e) => {
+                    e.currentTarget.style.background = 'rgba(239,68,68,0.05)';
+                  }}
+                >
+                  Delete Portfolio
+                </button>
+              )}
+            </div>
+          )}
+          <button
+            onClick={() => navigate('/questionnaire')}
+            style={{
+              padding: '0.5rem 1rem', borderRadius: '0.5rem',
+              background: 'rgba(59,130,246,0.1)',
+              border: '1px solid rgba(59,130,246,0.2)',
+              color: '#60a5fa', cursor: 'pointer',
+              fontWeight: 500, fontSize: '0.8rem',
+              transition: 'all 0.2s',
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = 'rgba(59,130,246,0.2)';
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = 'rgba(59,130,246,0.1)';
+            }}
+          >
+            Modify Preferences
+          </button>
+        </div>
       </div>
 
       {/* Stats Summary Row */}
-      {simulation && (
+      {simulation && !simulation.error && (
         <div style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
@@ -316,18 +437,46 @@ export default function DashboardMain() {
         </div>
       )}
 
-      {simError && (
+      {(simError || (simulation && simulation.error)) && (
         <div style={{
           padding: '1rem', borderRadius: '0.5rem',
           background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
           color: '#fca5a5', fontSize: '0.85rem', marginBottom: '1rem',
         }}>
-          {simError}
+          {simError || simulation.error}
         </div>
       )}
 
-      {simulation && !simLoading && (
+      {simulation && !simulation.error && !simLoading && (
         <>
+          {/* View Toggle */}
+          <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.25rem' }}>
+            <button
+              onClick={() => setViewMode('projection')}
+              style={{
+                background: viewMode === 'projection' ? 'rgba(59,130,246,0.15)' : 'transparent',
+                border: viewMode === 'projection' ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
+                color: viewMode === 'projection' ? '#60a5fa' : '#64748b',
+                padding: '0.4rem 1.25rem', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
+                transition: 'all 0.2s'
+              }}
+            >
+              30Y PROJECTION
+            </button>
+            <button
+              onClick={() => setViewMode('backtest')}
+              style={{
+                background: viewMode === 'backtest' ? 'rgba(139,92,246,0.15)' : 'transparent',
+                border: viewMode === 'backtest' ? '1px solid rgba(139,92,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
+                color: viewMode === 'backtest' ? '#a78bfa' : '#64748b',
+                padding: '0.4rem 1.25rem', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
+                transition: 'all 0.2s'
+              }}
+            >
+              HISTORICAL BACKTEST
+            </button>
+          </div>
+
           <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
             <div style={{
               flex: 3, minWidth: 500,
@@ -340,89 +489,52 @@ export default function DashboardMain() {
                 marginBottom: '1rem',
               }}>
                 <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
-                  Portfolio Growth Projection
+                  {viewMode === 'projection' ? 'Portfolio Growth Projection' : '10-Year Historical Backtest'}
                 </h3>
                 <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
-                  ±2σ Confidence Interval · $100K Initial
+                  {viewMode === 'projection' ? '±2σ Confidence · 30 Year Horizon' : `Actual Returns · ${backtestData?.stats?.start_date} to Present`}
                 </span>
               </div>
 
               <ResponsiveContainer width="100%" height={380}>
-                <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="gradUpper" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.25} />
-                      <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
-                    </linearGradient>
-                    <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
-                      <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
-                    </linearGradient>
-                    <linearGradient id="gradLower" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
-                      <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
-                    </linearGradient>
-                  </defs>
-
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-                  <XAxis
-                    dataKey="year"
-                    stroke="#475569" fontSize={12} tickLine={false}
-                    label={{ value: 'Years', position: 'insideBottom', offset: -2, fill: '#64748b', fontSize: 11 }}
-                  />
-                  <YAxis
-                    stroke="#475569" fontSize={11} tickLine={false}
-                    tickFormatter={fmt}
-                    width={65}
-                  />
-                  <Tooltip content={<SimTooltip />} />
-
-                  {/* Confidence band: upper */}
-                  <Area
-                    type="monotone" dataKey="upper" name="Best Case (+2σ)"
-                    stroke="rgba(139,92,246,0.5)" strokeWidth={1.5}
-                    fill="url(#gradUpper)" dot={false}
-                    strokeDasharray="4 2"
-                  />
-
-                  {/* Expected path */}
-                  <Area
-                    type="monotone" dataKey="expected" name="Expected Path"
-                    stroke="#3b82f6" strokeWidth={2.5}
-                    fill="url(#gradExpected)" dot={false}
-                  />
-
-                  {/* Confidence band: lower */}
-                  <Area
-                    type="monotone" dataKey="lower" name="Worst Case (−2σ)"
-                    stroke="rgba(239,68,68,0.4)" strokeWidth={1.5}
-                    fill="url(#gradLower)" dot={false}
-                    strokeDasharray="4 2"
-                  />
-
-                  {/* Goal annotations */}
-                  {simulation.goal_annotations?.map((g, i) => (
-                    <ReferenceLine
-                      key={i}
-                      x={g.year}
-                      stroke={g.is_short_term ? '#f59e0b' : '#4ade80'}
-                      strokeDasharray="3 3"
-                      strokeWidth={1.5}
-                      label={{
-                        value: `${g.label} (Yr ${g.year})`,
-                        position: 'top',
-                        fill: g.is_short_term ? '#f59e0b' : '#4ade80',
-                        fontSize: 11,
-                        fontWeight: 600,
-                      }}
+                {viewMode === 'projection' ? (
+                  <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
+                        <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.05} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                    <XAxis dataKey="year" stroke="#475569" fontSize={12} tickLine={false} />
+                    <YAxis stroke="#475569" fontSize={11} tickLine={false} tickFormatter={fmt} width={65} />
+                    <Tooltip content={<SimTooltip />} />
+                    <Area type="monotone" dataKey="upper" name="Best Case" stroke="rgba(34,197,94,0.4)" fill="rgba(34,197,94,0.05)" dot={false} strokeDasharray="4 2" />
+                    <Area type="monotone" dataKey="expected" name="Expected Path" stroke="#3b82f6" strokeWidth={2.5} fill="url(#gradExpected)" dot={false} />
+                    <Area type="monotone" dataKey="lower" name="Worst Case" stroke="rgba(239,68,68,0.4)" fill="rgba(239,68,68,0.05)" dot={false} strokeDasharray="4 2" />
+                    {simulation.goal_annotations?.map((g, i) => (
+                      <ReferenceLine key={i} x={g.year} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: g.label, position: 'top', fill: '#f59e0b', fontSize: 10 }} />
+                    ))}
+                  </AreaChart>
+                ) : (
+                  <AreaChart data={backtestData?.backtest || []} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="gradBack" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.4} />
+                        <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.05} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                    <XAxis dataKey="date" stroke="#475569" fontSize={10} tickLine={false} tickFormatter={(d) => d.split('-')[0]} />
+                    <YAxis stroke="#475569" fontSize={11} tickLine={false} tickFormatter={fmt} width={65} />
+                    <Tooltip 
+                      contentStyle={{ background: '#0f172a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '0.5rem' }}
+                      labelStyle={{ color: '#94a3b8' }}
+                      formatter={(v) => [fmt(v), "Balance"]}
                     />
-                  ))}
-
-                  <Legend
-                    verticalAlign="top" align="right" height={36}
-                    wrapperStyle={{ fontSize: '0.75rem', color: '#94a3b8' }}
-                  />
-                </AreaChart>
+                    <Area type="monotone" dataKey="balance" name="Historical Performance" stroke="#8b5cf6" strokeWidth={2.5} fill="url(#gradBack)" dot={false} />
+                  </AreaChart>
+                )}
               </ResponsiveContainer>
             </div>
 
@@ -511,19 +623,49 @@ export default function DashboardMain() {
       {/* Portfolio Allocation Cards */}
       {activePortfolio ? (
         <div style={{ marginTop: '2rem' }}>
-          <h3 style={{
-            color: '#e2e8f0', fontWeight: 600, fontSize: '1rem',
-            marginBottom: '0.75rem',
-          }}>
-            Allocation Breakdown {segments.length > 0 && '(Phase 1)'}
-          </h3>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
+              Allocation Breakdown 
+              {segments.length > 0 && segments[activeSegmentIdx] && (
+                <span style={{ color: '#60a5fa', marginLeft: '0.5rem', fontSize: '0.85rem' }}>
+                  (Phase {activeSegmentIdx + 1}: Year {segments[activeSegmentIdx].horizon_years?.[0]}-{segments[activeSegmentIdx].horizon_years?.[1]})
+                </span>
+              )}
+            </h3>
+            
+            {segments.length > 1 && (
+              <div style={{ display: 'flex', gap: '0.4rem', background: 'rgba(15,23,42,0.4)', padding: '0.25rem', borderRadius: '0.5rem' }}>
+                {segments.map((seg, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setActiveSegmentIdx(i)}
+                    style={{
+                      padding: '0.3rem 0.7rem', borderRadius: '0.4rem', fontSize: '0.7rem', fontWeight: 600,
+                      cursor: 'pointer', border: 'none', transition: 'all 0.2s',
+                      background: activeSegmentIdx === i ? '#3b82f6' : 'transparent',
+                      color: activeSegmentIdx === i ? '#fff' : '#94a3b8',
+                    }}
+                  >
+                    Phase {i+1}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
             gap: '0.75rem',
           }}>
             {Object.entries(weights)
-              .sort(([, a], [, b]) => b - a)
+              .sort(([tA, wA], [tB, wB]) => {
+                const isConsA = hardConstraints.has(tA);
+                const isConsB = hardConstraints.has(tB);
+                if (isConsA && !isConsB) return -1;
+                if (!isConsA && isConsB) return 1;
+                return wB - wA;
+              })
               .map(([ticker, weight]) => (
                 <div
                   key={ticker}
@@ -545,8 +687,16 @@ export default function DashboardMain() {
                   }}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ color: '#f1f5f9', fontWeight: 700, fontSize: '1.05rem' }}>
+                    <span style={{ color: '#f1f5f9', fontWeight: 700, fontSize: '1.05rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                       {ticker}
+                      {hardConstraints.has(ticker) && (
+                        <span style={{
+                          fontSize: '0.6rem', padding: '0.15rem 0.4rem', borderRadius: '0.3rem',
+                          background: 'rgba(59,130,246,0.15)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)',
+                        }}>
+                          USER PREFERENCE
+                        </span>
+                      )}
                     </span>
                     <span style={{ color: '#60a5fa', fontWeight: 600, fontSize: '1.05rem' }}>
                       {pct(weight)}

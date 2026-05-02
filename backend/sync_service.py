@@ -104,8 +104,9 @@ async def run_global_sync_background():
             
             SYNC_STATE["processed"] += 1
             
-            # Short yield exactly for FastAPI Event Loop
-            await asyncio.sleep(0.01)
+            # Polite pause between tickers to preserve bandwidth and avoid rate limits
+            # for real-time user requests (like ticker lookups).
+            await asyncio.sleep(2.0)
 
     except Exception as e:
         logger.error(f"Global sync crashed: {e}")

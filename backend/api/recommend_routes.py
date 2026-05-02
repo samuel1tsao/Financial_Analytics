@@ -6,7 +6,9 @@ import schemas
 from database import get_db
 from auth import get_current_user
 from vector_encoder import encode_questionnaire, simulate_portfolio
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["recommendation"])
 
 
@@ -16,16 +18,16 @@ def recommend_portfolio(
     db: Session = Depends(get_db),
 ):
     """
-    Generate a multi-horizon portfolio recommendation using the RL Transformer.
+    Main recommendation endpoint for Questionnaire V1.
+    Uses multi-horizon RL strategy.
     """
-    q = (
-        db.query(models.Questionnaire)
-        .filter(models.Questionnaire.user_id == current_user.id)
-        .order_by(models.Questionnaire.created_at.desc())
-        .first()
-    )
+    # 1. Fetch questionnaire
+    q = db.query(models.Questionnaire).filter(
+        models.Questionnaire.user_id == current_user.id
+    ).order_by(models.Questionnaire.created_at.desc()).first()
+
     if not q:
-        raise HTTPException(status_code=400, detail="No questionnaire found. Complete the questionnaire first.")
+        raise HTTPException(status_code=404, detail="Questionnaire not found.")
 
     answers = json.loads(q.raw_json)
     if "answers" in answers:
@@ -47,7 +49,7 @@ def recommend_portfolio(
         user_id=current_user.id,
         profile_name="RL Multi-Horizon Portfolio",
         is_current=True,
-        weight_json=json.dumps(segments),
+        weight_json=json.dumps(result),
     )
     db.add(portfolio)
     db.commit()
@@ -66,15 +68,17 @@ def recommend_portfolio(
 
 @router.post("/simulate")
 def run_simulation(
+    req: schemas.SimulationRequest,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    portfolio_id: int | None = None,
-    initial_investment: float = 100000,
-    projection_years: int = 30,
 ):
     """
     Run multi-horizon simulation including Balance-At-Step tracking.
     """
+    portfolio_id = req.portfolio_id
+    initial_investment = req.initial_investment
+    projection_years = req.projection_years
+    custom_goals_json = req.custom_goals_json
     if portfolio_id:
         portfolio = db.query(models.Portfolio).filter(
             models.Portfolio.id == portfolio_id,
@@ -89,31 +93,129 @@ def run_simulation(
     if not portfolio:
         raise HTTPException(status_code=404, detail="No portfolio found.")
 
-    segments = json.loads(portfolio.weight_json)
+    data = json.loads(portfolio.weight_json)
+    segments = data.get("segments", data) if isinstance(data, dict) else data
     
-    # Extract goals from latest questionnaire
-    q = db.query(models.Questionnaire).filter(
-        models.Questionnaire.user_id == current_user.id
-    ).order_by(models.Questionnaire.created_at.desc()).first()
-    
+    # Use custom goals from frontend if provided, else fallback to latest questionnaire
     goals = []
-    monthly_contrib = 500
-    if q:
-        ans = json.loads(q.raw_json)
-        if "answers" in ans: ans = ans["answers"]
-        goals = ans.get("goals", [])
-        monthly_contrib = ans.get("monthly_contrib", 500)
+    if custom_goals_json and custom_goals_json != "[]":
+        try:
+            goals = json.loads(custom_goals_json)
+        except Exception as e:
+            logger.warning(f"Failed to parse custom_goals_json: {e}")
+            
+    if not goals:
+        q = db.query(models.Questionnaire).filter(
+            models.Questionnaire.user_id == current_user.id
+        ).order_by(models.Questionnaire.created_at.desc()).first()
+        if q:
+            ans = json.loads(q.raw_json)
+            if "answers" in ans: ans = ans["answers"]
+            goals = ans.get("goals", [])
+    
+    monthly_contrib = 500 # Default
+    # (Optional: fetch monthly_contrib from q if still needed)
 
-    from vector_encoder import simulate_multi_horizon_portfolio
-    sim = simulate_multi_horizon_portfolio(
-        segments=segments,
-        goals=goals,
-        initial_investment=initial_investment,
-        monthly_contrib=monthly_contrib
-    )
+    logger.info(f"Running simulation for user {current_user.email}, portfolio_id={portfolio_id}, goals_count={len(goals)}")
+    try:
+        from vector_encoder import simulate_multi_horizon_portfolio
+        sim = simulate_multi_horizon_portfolio(
+            segments=segments,
+            goals=goals,
+            initial_investment=initial_investment,
+            monthly_contrib=monthly_contrib,
+            projection_years=projection_years
+        )
+        
+        if "error" in sim:
+            logger.warning(f"Simulation returned error for {current_user.email}: {sim['error']}")
 
+        return {
+            "portfolio_id": portfolio.id,
+            "portfolio_name": portfolio.profile_name,
+            "simulation": sim,
+        }
+    except Exception as e:
+        logger.error(f"Simulation crash for {current_user.email}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/backtest")
+def backtest_portfolio(
+    payload: dict, # portfolio_id, initial_investment, monthly_contrib
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Run a historical backtest of the portfolio over the last 10-15 years.
+    """
+    import numpy as np
+    portfolio_id = payload.get("portfolio_id")
+    initial_investment = payload.get("initial_investment", 100000)
+    monthly_contrib = payload.get("monthly_contrib", 500)
+
+    portfolio = db.query(models.Portfolio).filter(
+        models.Portfolio.id == portfolio_id,
+        models.Portfolio.user_id == current_user.id
+    ).first()
+
+    if not portfolio:
+        raise HTTPException(status_code=404, detail="Portfolio not found.")
+
+    data = json.loads(portfolio.weight_json)
+    segments = data.get("segments", [])
+    if not segments and isinstance(data, list):
+        segments = data
+
+    from vector_encoder import RLRecommender, encode_multi_horizon
+    recommender = RLRecommender()
+    if not recommender._initialized or recommender.daily_returns is None:
+        raise HTTPException(status_code=500, detail="Market data unavailable")
+
+    # Use the actual historical returns
+    returns = recommender.daily_returns.fillna(0.0)
+    # We'll backtest over the last 10 years of available data
+    years_to_test = 10
+    days_to_test = years_to_test * 252
+    
+    if len(returns) < days_to_test:
+        days_to_test = len(returns)
+        
+    back_returns = returns.iloc[-days_to_test:]
+    dates = back_returns.index
+    
+    # Simple backtest logic
+    weights_dict = segments[0]["weights"] if segments else {}
+    
+    num_assets = len(returns.columns)
+    wa = np.zeros(num_assets)
+    col_to_idx = {col: i for i, col in enumerate(returns.columns)}
+    for t, wt in weights_dict.items():
+        if t in col_to_idx:
+            wa[col_to_idx[t]] = wt
+    if wa.sum() > 0: wa /= wa.sum()
+    
+    # Vectorized calculation for speed
+    daily_rets = back_returns.values @ wa
+    
+    current_bal = initial_investment
+    path = []
+    path.append({"date": str(dates[0].date()), "balance": round(current_bal, 2)})
+    
+    for i in range(1, len(dates)):
+        current_bal *= (1 + daily_rets[i])
+        # Add monthly contribution
+        if i % 21 == 0:
+            current_bal += monthly_contrib
+        path.append({"date": str(dates[i].date()), "balance": round(current_bal, 2)})
+        
     return {
         "portfolio_id": portfolio.id,
-        "portfolio_name": portfolio.profile_name,
-        "simulation": sim,
+        "backtest": path,
+        "stats": {
+            "start_date": str(dates[0].date()),
+            "end_date": str(dates[-1].date()),
+            "total_return": round((current_bal / initial_investment - 1) * 100, 2),
+            "final_balance": round(current_bal, 2)
+        }
     }

@@ -18,7 +18,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from _constants import (
     DEFAULT_PIPELINE_CONFIG, TOP_K_ASSETS, MIN_ACTIVE_WEIGHT, SIM_TERMINAL_HORIZON,
     RISK_NORMALIZER, CAPITAL_NORMALIZER, GOAL_YEAR_NORMALIZER,
-    TRADING_DAYS_PER_YEAR, CASH_BUCKET_ANNUAL_RATE, DAILY_RETURN_CLAMP, LOAN_DAILY_RATE
+    TRADING_DAYS_PER_YEAR, CASH_BUCKET_ANNUAL_RATE, DAILY_RETURN_CLAMP, LOAN_DAILY_RATE,
+    CACHE_DIR
 )
 from _rl_worker import PortfolioTransformerRL, _softmax_normalize_top_k, _encode_user_condition
 from _data_worker import generate_dataset_member_a
@@ -26,6 +27,9 @@ from _ml_worker import load_embedding_cache
 from _sim_worker import build_simulation_cache, _resolve_simulation_starts
 
 logger = logging.getLogger(__name__)
+
+# Singleton instance for the RL Recommender to avoid reloading data on every request
+_RECOMMENDER_INSTANCE = None
 
 # ─── Asset Universe (Legacy / Fallback) ──────────────────────────────────────
 EQUITY_UNIVERSE = {
@@ -94,12 +98,15 @@ class RLRecommender:
             self.daily_returns = res[3]
             self.drip_daily_returns = res[4]
             
-            emb_cache = load_embedding_cache(self.master_df, self.price_matrix, res[2], self.daily_returns, self.config, drip_daily_returns=self.drip_daily_returns)
+            emb_cache = load_embedding_cache(
+                self.master_df, self.price_matrix, res[2], self.daily_returns, self.config, 
+                drip_daily_returns=self.drip_daily_returns, folder=CACHE_DIR
+            )
             if emb_cache:
                 self.dynamic_embeddings = emb_cache["dynamic_embeddings"]
                 self.X_mean = emb_cache["model_checkpoint"]["X_mean"]
                 self.X_std = emb_cache["model_checkpoint"]["X_std"]
-                logger.info("RL Embeddings loaded successfully")
+                logger.info(f"RL Embeddings loaded successfully from {CACHE_DIR}")
             else:
                 self.dynamic_embeddings = {}
                 logger.error("Failed to load Phase 1 embeddings")
@@ -108,13 +115,10 @@ class RLRecommender:
             self.dynamic_embeddings = {}
 
         # 2. Load Model
-        cache_dir = "cache"
         # checkpoint_rl_v2_dm64_nh4_lr001_id226.pt (example from plan)
         # We'll look for the most recent RL checkpoint if this specific one isn't found
         checkpoint_name = "checkpoint_rl_v2_dm64_nh4_lr001_id226.pt"
-        checkpoint_path = os.path.join(cache_dir, checkpoint_name)
-        if not os.path.exists(checkpoint_path):
-             checkpoint_path = os.path.join("..", cache_dir, checkpoint_name)
+        checkpoint_path = os.path.join(CACHE_DIR, checkpoint_name)
         
         if os.path.exists(checkpoint_path):
             input_dim = 226 # Matches the filename id226
@@ -204,14 +208,38 @@ def encode_multi_horizon(answers: dict) -> dict:
     Generate a series of weight recommendations for multiple goal horizons.
     Handles 'reserved assets' by fixing their weights and scaling the RL recommendation.
     """
-    recommender = RLRecommender()
+    global _RECOMMENDER_INSTANCE
+    if _RECOMMENDER_INSTANCE is None:
+        logger.info("Initializing global RLRecommender instance...")
+        _RECOMMENDER_INSTANCE = RLRecommender()
     
-    risk = answers.get("risk_tolerance", 50)
-    start_cap = answers.get("start_cap", 100000)
-    monthly_contrib = answers.get("monthly_contrib", 500)
+    recommender = _RECOMMENDER_INSTANCE
+    
+    risk = float(answers.get("risk_tolerance", 50))
+    start_cap = float(answers.get("start_cap") or 100000)
+    monthly_contrib = float(answers.get("monthly_contrib") or 500)
     goals = answers.get("goals", [])
-    reserved_ticker = answers.get("reserved_asset", "AAPL").upper()
-    reserved_ratio = answers.get("reserved_ratio", 0.1) # Default 10%
+    
+    # NEW: Handle multiple hard constraints from frontend schema
+    hard_constraints = answers.get("hard_constraints", [])
+    reserved_weights = {}
+    for c in hard_constraints:
+        ticker = c.get("ticker")
+        pct_val = c.get("pct")
+        if ticker and pct_val is not None and str(pct_val).strip() != "":
+            try:
+                reserved_weights[ticker.upper()] = float(pct_val) / 100.0
+            except (ValueError, TypeError):
+                continue
+            
+    total_reserved_ratio = sum(reserved_weights.values())
+    
+    if total_reserved_ratio >= 1.0:
+        # User reserved 100% or more (oops). Cap it at 95% to allow some recommendation or return just constraints.
+        total_reserved_ratio = 1.0
+        scale = 0.0
+    else:
+        scale = 1.0 - total_reserved_ratio
     
     if not goals:
         # Default 30 year horizon if no goals
@@ -244,10 +272,9 @@ def encode_multi_horizon(answers: dict) -> dict:
         # In a multi-horizon setup, we use the pre-goal head for the active goal segment.
         w_pre, _ = recommender.get_weights(profile, list(recommender.dynamic_embeddings.keys()))
         
-        # Integrate reserved asset
-        # Weights = reserved + (1 - reserved_ratio) * w_pre
-        combined_weights = {reserved_ticker: reserved_ratio}
-        scale = 1.0 - reserved_ratio
+        # Integrate reserved assets
+        # Weights = sum(reserved) + (1 - sum(reserved_ratio)) * w_pre
+        combined_weights = reserved_weights.copy()
         for t, wt in w_pre.items():
             combined_weights[t] = combined_weights.get(t, 0) + wt * scale
             
@@ -260,11 +287,13 @@ def encode_multi_horizon(answers: dict) -> dict:
         
     return {
         "risk_score": risk,
+        "start_cap": start_cap,
+        "monthly_contrib": monthly_contrib,
         "segments": segments,
         "goals": sorted_goals,
-        "reserved_asset": reserved_ticker,
-        "reserved_ratio": reserved_ratio
+        "hard_constraints": hard_constraints
     }
+
 
 # ─── Multi-Horizon Simulation ───────────────────────────────────────────────
 
@@ -273,6 +302,7 @@ def simulate_multi_horizon_portfolio(
     goals: list,
     initial_investment: float = 100000,
     monthly_contrib: float = 500,
+    projection_years: int = 30,
 ) -> dict:
     """
     Run a year-by-year simulation switching weights at segment boundaries.
@@ -283,18 +313,24 @@ def simulate_multi_horizon_portfolio(
         # Fallback if no data
         return {"error": "Market data unavailable for simulation"}
 
+    # Use projection_years as a floor for simulation length
+    max_goal_yr = max(g.get("years", 0) for g in goals) if goals else 0
+    total_years = max(max_goal_yr, projection_years)
+
     # 1. Build Simulation Cache
     base_returns = recommender.drip_daily_returns if recommender.drip_daily_returns is not None else recommender.daily_returns
-    sim_cache, clean_returns, column_to_idx = build_simulation_cache(base_returns, max_horizon_years=30)
+    sim_cache, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns, max_horizon_years=total_years)
     
     # 2. Determine start dates for Monte Carlo (use monthly-shifted pool)
     sim_starts = _resolve_simulation_starts(clean_returns)
+    if len(sim_starts) == 0:
+        return {"error": "Insufficient historical data for simulation paths"}
+
     # Take a sample of paths for performance
     rng = np.random.default_rng(42)
-    if len(sim_starts) > 20:
-        sim_starts = rng.choice(sim_starts, size=20, replace=False)
-        
-    total_years = max(g.get("years", 30) for g in goals) if goals else 30
+    num_paths = min(len(sim_starts), 20)
+    sim_starts = rng.choice(sim_starts, size=num_paths, replace=False)
+
     goal_map = {g.get("years"): g.get("amount") for g in goals}
     
     # 3. Pre-process segment weights into year-indexed arrays for speed
@@ -334,7 +370,8 @@ def simulate_multi_horizon_portfolio(
         for yr in range(1, total_years + 1):
             wa = year_weight_arrays[yr-1]
             # Annual return dot product
-            yr_returns = sim_cache[start_idx][yr-1]
+            pos = start_idx_to_pos[start_idx]
+            yr_returns = sim_cache[pos][yr-1]
             portfolio_return = np.dot(wa, yr_returns)
             
             # Growth phase
@@ -396,14 +433,6 @@ def simulate_multi_horizon_portfolio(
                 "is_short_term": y <= 5,
             })
 
-    return {
-        "years": years,
-        "expected_path": expected_path,
-        "upper_bound": upper_bound,
-        "lower_bound": lower_bound,
-        "step_balances": step_balances,
-        "cash_out_events": cash_out_events,
-        "goal_annotations": goal_annotations,
     # 6. Calculate aggregate metrics for the dashboard cards
     # Use CAGR-equivalent considering all cash-outs
     total_withdrawn = sum(e["amount"] for e in cash_out_events)
@@ -434,7 +463,6 @@ def simulate_multi_horizon_portfolio(
             "annual_volatility": round(float(ann_vol * 100), 2),
             "sharpe_ratio": round(float(sharpe), 2),
         },
-    }
     }
 
 # ─── Legacy Wrappers ─────────────────────────────────────────────────────────

@@ -115,7 +115,9 @@ export default function TickerInput({
         setStatus('invalid');
         onValidChange?.(t, false);
       }
-    } catch {
+    } catch (err) {
+      console.error('Lookup error:', err);
+      // If it's a timeout or network error, don't mark as permanently invalid
       setStatus('idle');
       onValidChange?.(t, null);
     }

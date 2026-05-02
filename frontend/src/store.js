@@ -1,6 +1,7 @@
 import { create } from 'zustand';
+import api from './api/client';
 
-const API_BASE = 'http://localhost:8000/api/v1';
+const API_BASE = 'http://localhost:8001/api/v1';
 
 const useStore = create((set, get) => ({
   // ─── Auth State ─────────────────────────────────────────────────────────
@@ -22,6 +23,7 @@ const useStore = create((set, get) => ({
   portfolios: [],
   favorites: [],
   activePortfolioId: null,
+  simCache: {}, // { portfolioId_goalsHash: simulationData }
 
   setActivePortfolio: (id) => set({ activePortfolioId: id }),
 
@@ -61,6 +63,25 @@ const useStore = create((set, get) => ({
       }
     } catch (err) {
       console.error('fetchQuestionnaire error:', err);
+    }
+  },
+
+  setSimCache: (key, data) => set((state) => ({
+    simCache: { ...state.simCache, [key]: data }
+  })),
+
+  deletePortfolio: async (id) => {
+    const { fetchUserData } = get();
+    console.log("Deleting portfolio:", id);
+    try {
+      const res = await api.delete(`/portfolio/${id}`);
+      console.log("Delete response:", res.status, res.data);
+      if (res.status === 200) {
+        await fetchUserData();
+        set({ activePortfolioId: null });
+      }
+    } catch (err) {
+      console.error('deletePortfolio error:', err);
     }
   },
 

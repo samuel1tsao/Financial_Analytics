@@ -43,7 +43,10 @@ class HardConstraint(BaseModel):
 class QuestionnaireV1(BaseModel):
     goals: list[GoalItem] = []
     risk_tolerance: int = Field(ge=1, le=100, default=50)
+    start_cap: float = 100000.0
+    monthly_contrib: float = 500.0
     fomo_tendency: int = Field(ge=1, le=10, default=5)
+    fomo_answers: list[int] = []
     hard_constraints: list[HardConstraint] = []
     current_portfolio: list[HardConstraint] = []
     reserved_asset: str = "AAPL"
@@ -71,6 +74,13 @@ class PortfolioOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class SimulationRequest(BaseModel):
+    portfolio_id: Optional[int] = None
+    initial_investment: float = 100000
+    projection_years: int = 30
+    custom_goals_json: str = "[]"
 
 
 class PortfolioDeleteRequest(BaseModel):

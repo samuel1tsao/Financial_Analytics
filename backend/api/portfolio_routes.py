@@ -63,3 +63,24 @@ def delete_portfolios(
     )
     db.commit()
     return {"deleted": deleted_count}
+
+
+@router.delete("/portfolio/{portfolio_id}")
+def delete_single_portfolio(
+    portfolio_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a specific portfolio."""
+    portfolio = db.query(models.Portfolio).filter(
+        models.Portfolio.id == portfolio_id,
+        models.Portfolio.user_id == current_user.id
+    ).first()
+
+    if not portfolio:
+        raise HTTPException(status_code=404, detail="Portfolio not found.")
+
+    db.delete(portfolio)
+    db.commit()
+
+    return {"message": "Portfolio deleted successfully"}

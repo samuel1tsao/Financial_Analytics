@@ -20,6 +20,8 @@ MASTER_FILE  = os.path.join(_BASE_DIR, "sp1500_master_research_dataset.csv")
 PRICE_FILE   = os.path.join(_BASE_DIR, "sp1500_price_matrix.csv")
 VOLUME_FILE  = os.path.join(_BASE_DIR, "sp1500_volume_matrix.csv")
 DIV_CACHE    = os.path.join(_BASE_DIR, "sp1500_dividends.csv")
+CACHE_DIR    = os.path.join(_BASE_DIR, "cache")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════

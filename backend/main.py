@@ -55,17 +55,18 @@ def on_startup():
     # Sync congressional trades from Capitol Trades (polite: 2s delay between pages)
     try:
         from scrape_capitol_trades import scrape_capitol_trades
-        new_trades = scrape_capitol_trades(pages=3)
-        logger.info(f"Capitol Trades sync: {new_trades} new trades added")
+        import threading
+        # Run scraping in a separate thread to avoid blocking the event loop
+        def run_scrape():
+             try:
+                 new_trades = scrape_capitol_trades(pages=3)
+                 logger.info(f"Capitol Trades sync: {new_trades} new trades added")
+             except Exception as e:
+                 logger.error(f"Capitol Trades sync failed: {e}")
+        
+        threading.Thread(target=run_scrape, daemon=True).start()
     except Exception as e:
-        logger.error(f"Capitol Trades sync failed: {e}")
-
-    # Rebuild congress profile equity histories (must run AFTER trade data is loaded)
-    try:
-        from profile_builder import build_all_profiles
-        build_all_profiles()
-    except Exception as e:
-        logger.error(f"Congress profile build failed: {e}")
+        logger.error(f"Failed to start capitol trades sync thread: {e}")
 
 
 @app.get("/")
@@ -74,4 +75,4 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)

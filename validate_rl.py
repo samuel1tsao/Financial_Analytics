@@ -18,11 +18,19 @@ def main():
     
     print("Training Autoencoder (Fast)...")
     config["ml_epochs"] = 1 # Force fast training
-    dataset_cache = train_pytorch_embedding_model(
+    from _ml_worker import load_embedding_cache
+    
+    dataset_cache = load_embedding_cache(
         master_df, price_matrix, volume_matrix, daily_returns,
         config,
         drip_daily_returns=drip_returns
     )
+    if dataset_cache is None:
+        dataset_cache = train_pytorch_embedding_model(
+            master_df, price_matrix, volume_matrix, daily_returns,
+            config,
+            drip_daily_returns=drip_returns
+        )
     
     print("Checking Test Profile 0...")
     profile = TEST_PROFILES[0]

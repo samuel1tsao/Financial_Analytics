@@ -50,6 +50,8 @@ const FOMO_QUESTIONS = [
 const INITIAL_STATE = {
   goals: [{ name: '', amount: '', years: '' }],
   risk_tolerance: 50,
+  start_cap: 100000,
+  monthly_contrib: 500,
   fomo_answers: Array(FOMO_QUESTIONS.length).fill(null),
   hard_constraints: [{ ticker: '', pct: '' }],
   current_portfolio: [{ ticker: '', pct: '' }],
@@ -78,6 +80,8 @@ export default function QuestionnaireStepper() {
             ...prev,
             goals: a.goals?.length ? a.goals : prev.goals,
             risk_tolerance: a.risk_tolerance ?? prev.risk_tolerance,
+            start_cap: a.start_cap ?? prev.start_cap,
+            monthly_contrib: a.monthly_contrib ?? prev.monthly_contrib,
             hard_constraints: a.hard_constraints?.length
               ? a.hard_constraints.map((c) => ({ ticker: c.ticker, pct: c.pct }))
               : prev.hard_constraints,
@@ -166,6 +170,8 @@ export default function QuestionnaireStepper() {
             years: parseInt(g.years) || 5,
           })),
           risk_tolerance: form.risk_tolerance,
+          start_cap: parseFloat(form.start_cap) || 100000,
+          monthly_contrib: parseFloat(form.monthly_contrib) || 0,
           fomo_tendency: fomoScore,
           hard_constraints: form.hard_constraints
             .filter((c) => c.ticker && c.pct)
@@ -176,13 +182,20 @@ export default function QuestionnaireStepper() {
         },
       };
       await api.post('/questionnaire/save', payload);
+      
+      // Update UI to show we're on the next step
+      setSaving('Generating your customized portfolio...');
+      
       // Auto-generate a recommended portfolio from the saved answers
+      // This is the step that takes time (ML inference)
       await api.post('/recommend');
+      
       await fetchQuestionnaire();
       await fetchUserData();
       navigate('/');
     } catch (err) {
       console.error(err);
+      alert('Failed to save questionnaire. Please check your inputs or try again later.');
     } finally {
       setSaving(false);
     }
@@ -247,7 +260,33 @@ export default function QuestionnaireStepper() {
     switch (step) {
       case 0: // Financial Goals
         return (
-          <div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label style={labelStyle}>Starting Capital ($)</label>
+                <input
+                  type="number"
+                  value={form.start_cap}
+                  onChange={(e) => setForm({ ...form, start_cap: e.target.value })}
+                  placeholder="100000"
+                  style={inputStyle}
+                />
+              </div>
+              <div>
+                <label style={labelStyle}>Monthly Contribution ($)</label>
+                <input
+                  type="number"
+                  value={form.monthly_contrib}
+                  onChange={(e) => setForm({ ...form, monthly_contrib: e.target.value })}
+                  placeholder="500"
+                  style={inputStyle}
+                />
+              </div>
+            </div>
+
+            <hr style={{ border: 'none', borderTop: '1px solid rgba(255,255,255,0.05)' }} />
+
+            <div>
             <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
               Financial Goals
             </h2>
@@ -285,6 +324,7 @@ export default function QuestionnaireStepper() {
             <button onClick={addGoal} style={{
               ...btnSecondary, marginTop: '0.5rem', fontSize: '0.8rem',
             }}>+ Add Another Goal</button>
+            </div>
           </div>
         );
 
@@ -505,7 +545,7 @@ export default function QuestionnaireStepper() {
               ...btnPrimary, opacity: (saving || !stepOk) ? 0.5 : 1,
               cursor: (saving || !stepOk) ? 'not-allowed' : 'pointer',
             }}>
-              {saving ? 'Saving...' : 'Complete & Generate'}
+              {saving ? (typeof saving === 'string' ? saving : 'Saving...') : 'Complete & Generate'}
             </button>
           )}
         </div>

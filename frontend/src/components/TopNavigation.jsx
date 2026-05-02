@@ -47,7 +47,6 @@ export default function TopNavigation() {
             style={{
               padding: '0.5rem 1.25rem',
               borderRadius: '0.5rem',
-              border: 'none',
               cursor: 'pointer',
               fontWeight: 500,
               fontSize: '0.85rem',
