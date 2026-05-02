@@ -284,6 +284,22 @@ def encode_multi_horizon(answers: dict) -> dict:
             "weights": combined_weights
         })
         prev_yr = curr_yr
+
+    # NEW: Add Terminal Growth Phase (Phase N+1)
+    # Uses the 'post-goal' weights from the RL model for the last goal's profile
+    if prev_yr < SIM_TERMINAL_HORIZON:
+        # Re-fetch weights to get mu_post from the last goal context
+        _, w_post = recommender.get_weights(profile, list(recommender.dynamic_embeddings.keys()))
+        
+        combined_post_weights = reserved_weights.copy()
+        for t, wt in w_post.items():
+            combined_post_weights[t] = combined_post_weights.get(t, 0) + wt * scale
+            
+        segments.append({
+            "horizon_years": (prev_yr, SIM_TERMINAL_HORIZON),
+            "goal_name": "Growth Phase",
+            "weights": combined_post_weights
+        })
         
     return {
         "risk_score": risk,
@@ -446,11 +462,41 @@ def simulate_multi_horizon_portfolio(
     
     sharpe = (cagr - 0.02) / ann_vol if ann_vol > 0 else 0
 
+    # 7. Calculate Effective Annual Returns for frontend recalculation
+    # Formula: r_eff = (bal[t] + cashout - contrib) / bal[t-1] - 1
+    # This allows the frontend to reproduce the path locally while changing goal amounts.
+    
+    expected_annual_returns = []
+    upper_annual_returns = []
+    lower_annual_returns = []
+    
+    for yr in range(1, total_years + 1):
+        cashout = goal_map.get(yr, 0)
+        contrib = monthly_contrib * 12
+        
+        # Expected
+        prev_exp = expected_path[yr-1] if expected_path[yr-1] > 0 else 1.0
+        r_exp = (expected_path[yr] + cashout - contrib) / prev_exp - 1
+        expected_annual_returns.append(round(float(r_exp), 6))
+        
+        # Upper
+        prev_upp = upper_bound[yr-1] if upper_bound[yr-1] > 0 else 1.0
+        r_upp = (upper_bound[yr] + cashout - contrib) / prev_upp - 1
+        upper_annual_returns.append(round(float(r_upp), 6))
+        
+        # Lower
+        prev_low = lower_bound[yr-1] if lower_bound[yr-1] > 0 else 1.0
+        r_low = (lower_bound[yr] + cashout - contrib) / prev_low - 1
+        lower_annual_returns.append(round(float(r_low), 6))
+
     return {
         "years": years,
         "expected_path": expected_path,
         "upper_bound": upper_bound,
         "lower_bound": lower_bound,
+        "expected_annual_returns": expected_annual_returns,
+        "upper_annual_returns": upper_annual_returns,
+        "lower_annual_returns": lower_annual_returns,
         "step_balances": step_balances,
         "cash_out_events": cash_out_events,
         "goal_annotations": goal_annotations,

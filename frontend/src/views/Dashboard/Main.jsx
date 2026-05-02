@@ -110,6 +110,69 @@ export default function DashboardMain() {
     }
   }, [activePortfolio?.id]);
 
+  // ─── Local Recalculation Logic ─────────────────────────────────────────────
+  const calculateLocalProjection = (baseSim, goals, startCapital, monthlyInc) => {
+    if (!baseSim || !baseSim.expected_annual_returns) return baseSim;
+
+    const totalYears = baseSim.expected_annual_returns.length;
+    const goalMap = {};
+    goals.forEach(g => {
+      goalMap[g.years] = (goalMap[g.years] || 0) + g.amount;
+    });
+
+    const runPath = (annualReturns) => {
+      let balance = startCapital;
+      let debt = 0;
+      const path = [balance];
+      const contribAnnual = monthlyInc * 12;
+
+      for (let yr = 1; yr <= totalYears; yr++) {
+        const r = annualReturns[yr - 1];
+        balance *= (1 + r);
+        balance += contribAnnual;
+
+        // Debt compounding (10% APR simple approx)
+        debt *= 1.10;
+
+        const needed = goalMap[yr] || 0;
+        if (needed > 0) {
+          if (balance >= needed) {
+            balance -= needed;
+          } else {
+            debt += (needed - balance);
+            balance = 0;
+          }
+        }
+        path.push(Math.max(0, balance - debt));
+      }
+      return path;
+    };
+
+    const expectedPath = runPath(baseSim.expected_annual_returns || []);
+    const upperBound = runPath(baseSim.upper_annual_returns || []);
+    const lowerBound = runPath(baseSim.lower_annual_returns || []);
+
+    // Update stats (rough approximation for CAGR)
+    const finalExp = expectedPath.length > 0 ? expectedPath[expectedPath.length - 1] : 0;
+    const totalWithdrawn = goals.reduce((sum, g) => sum + (g.amount || 0), 0);
+    const cagrBase = (startCapital > 0 && totalYears > 0) ? (finalExp + totalWithdrawn) / startCapital : 0;
+    const cagr = (cagrBase > 0) ? (Math.pow(cagrBase, 1 / totalYears) - 1) * 100 : 0;
+
+    return {
+      ...baseSim,
+      expected_path: expectedPath,
+      upper_bound: upperBound,
+      lower_bound: lowerBound,
+      portfolio_stats: {
+        ...(baseSim.portfolio_stats || {}),
+        projected_final_expected: finalExp,
+        projected_final_upper: upperBound.length > 0 ? upperBound[upperBound.length - 1] : 0,
+        projected_final_lower: lowerBound.length > 0 ? lowerBound[lowerBound.length - 1] : 0,
+        expected_annual_return: (isNaN(cagr) || !isFinite(cagr)) ? "0.00" : cagr.toFixed(2),
+      }
+    };
+  };
+
   let weights = {};
   let segments = [];
   let hardConstraints = new Set();
@@ -159,6 +222,18 @@ export default function DashboardMain() {
   // Fetch simulation whenever the active portfolio or debounced goals change
   useEffect(() => {
     if (!activePortfolio) return;
+    
+    // Determine if we need a backend refresh
+    // Structural changes (add/delete) require a new glide-path from backend
+    const isStructuralChange = simulation === null || 
+                               simulation.error ||
+                               !simulation.expected_annual_returns ||
+                               debouncedGoals.length !== (simulation.goal_annotations?.length || 0);
+    
+    if (!isStructuralChange && simulation) {
+      return;
+    }
+
     let cancelled = false;
     (async () => {
       const cacheKey = `${activePortfolio.id}_${JSON.stringify(debouncedGoals)}`;
@@ -204,7 +279,22 @@ export default function DashboardMain() {
       }
     })();
     return () => { cancelled = true; };
-  }, [activePortfolio?.id, debouncedGoals]);
+  }, [activePortfolio?.id, debouncedGoals.length]);
+
+  // Apply local recalculation to the simulation data
+  const activeSimulation = useMemo(() => {
+    return calculateLocalProjection(simulation, customGoals, startCap, monthlyContrib);
+  }, [simulation, customGoals, startCap, monthlyContrib]);
+
+  // Sync back local simulation to stats
+  const chartData = (activeSimulation && !activeSimulation.error) ? activeSimulation.years.map((yr, i) => ({
+    year: yr,
+    expected: activeSimulation.expected_path[i],
+    upper: activeSimulation.upper_bound[i],
+    lower: activeSimulation.lower_bound[i],
+  })) : [];
+
+  const stats = activeSimulation?.portfolio_stats || {};
 
   // ─── Empty State ─────────────────────────────────────────────────────────
   if (!hasCompletedQuestionnaire && portfolios.length === 0) {
@@ -270,14 +360,7 @@ export default function DashboardMain() {
   }
 
   // ─── Build chart data ──────────────────────────────────────────────────
-  const chartData = (simulation && !simulation.error) ? simulation.years.map((yr, i) => ({
-    year: yr,
-    expected: simulation.expected_path[i],
-    upper: simulation.upper_bound[i],
-    lower: simulation.lower_bound[i],
-  })) : [];
-
-  const stats = simulation?.portfolio_stats || {};
+  // (Removed, moved to useMemo above)
 
   // ─── Active Portfolio View ─────────────────────────────────────────────
   return (
@@ -387,8 +470,18 @@ export default function DashboardMain() {
         </div>
       </div>
 
+      {(simError || (activeSimulation && activeSimulation.error)) && (
+        <div style={{
+          padding: '1rem', borderRadius: '0.5rem',
+          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
+          color: '#fca5a5', fontSize: '0.85rem', marginBottom: '1.5rem',
+        }}>
+          {simError || activeSimulation.error}
+        </div>
+      )}
+
       {/* Stats Summary Row */}
-      {simulation && !simulation.error && (
+      {activeSimulation && !activeSimulation.error && (
         <div style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
@@ -437,17 +530,7 @@ export default function DashboardMain() {
         </div>
       )}
 
-      {(simError || (simulation && simulation.error)) && (
-        <div style={{
-          padding: '1rem', borderRadius: '0.5rem',
-          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
-          color: '#fca5a5', fontSize: '0.85rem', marginBottom: '1rem',
-        }}>
-          {simError || simulation.error}
-        </div>
-      )}
-
-      {simulation && !simulation.error && !simLoading && (
+      {activeSimulation && !activeSimulation.error && !simLoading && (
         <>
           {/* View Toggle */}
           <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.25rem' }}>
@@ -512,7 +595,7 @@ export default function DashboardMain() {
                     <Area type="monotone" dataKey="upper" name="Best Case" stroke="rgba(34,197,94,0.4)" fill="rgba(34,197,94,0.05)" dot={false} strokeDasharray="4 2" />
                     <Area type="monotone" dataKey="expected" name="Expected Path" stroke="#3b82f6" strokeWidth={2.5} fill="url(#gradExpected)" dot={false} />
                     <Area type="monotone" dataKey="lower" name="Worst Case" stroke="rgba(239,68,68,0.4)" fill="rgba(239,68,68,0.05)" dot={false} strokeDasharray="4 2" />
-                    {simulation.goal_annotations?.map((g, i) => (
+                    {activeSimulation.goal_annotations?.map((g, i) => (
                       <ReferenceLine key={i} x={g.year} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: g.label, position: 'top', fill: '#f59e0b', fontSize: 10 }} />
                     ))}
                   </AreaChart>
@@ -594,15 +677,44 @@ export default function DashboardMain() {
                     }}
                     style={{ width: '100%', cursor: 'pointer' }}
                   />
+                  <button
+                    onClick={() => {
+                      const ng = customGoals.filter((_, idx) => idx !== i);
+                      setCustomGoals(ng);
+                    }}
+                    style={{
+                      marginTop: '0.5rem', background: 'transparent', border: 'none',
+                      color: '#ef4444', fontSize: '0.7rem', cursor: 'pointer',
+                      padding: 0, textDecoration: 'underline'
+                    }}
+                  >
+                    Remove Goal
+                  </button>
                 </div>
               ))}
 
-              {simulation.cash_out_events?.length > 0 && (
+              <button
+                onClick={() => {
+                  setCustomGoals([...customGoals, { name: 'New Goal', amount: 50000, years: 10 }]);
+                }}
+                style={{
+                  width: '100%', padding: '0.6rem', borderRadius: '0.4rem',
+                  background: 'rgba(59,130,246,0.1)', border: '1px dashed rgba(59,130,246,0.4)',
+                  color: '#60a5fa', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer',
+                  marginBottom: '1.5rem', transition: 'all 0.2s'
+                }}
+                onMouseOver={e => e.currentTarget.style.background = 'rgba(59,130,246,0.2)'}
+                onMouseOut={e => e.currentTarget.style.background = 'rgba(59,130,246,0.1)'}
+              >
+                + Add Custom Goal
+              </button>
+
+              {activeSimulation.cash_out_events?.length > 0 && (
                 <div style={{ marginTop: '1rem', background: 'rgba(245,158,11,0.08)', padding: '0.75rem', borderRadius: '0.4rem', border: '1px solid rgba(245,158,11,0.15)' }}>
                   <p style={{ color: '#f59e0b', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.4rem' }}>
                     CASH-OUT EVENT LOG
                   </p>
-                  {simulation.cash_out_events.map((ev, i) => (
+                  {activeSimulation.cash_out_events.map((ev, i) => (
                     <p key={i} style={{ color: '#e2e8f0', fontSize: '0.75rem', margin: '0.2rem 0' }}>
                       <strong>Yr {ev.year}</strong>: {ev.goal_name} (-{fmt(ev.amount)})
                     </p>
@@ -613,7 +725,7 @@ export default function DashboardMain() {
           </div>
           
           <BalanceStepTable 
-            steps={simulation.step_balances} 
+            steps={activeSimulation.step_balances} 
             segments={segments}
             portfolioName={activePortfolio?.profile_name || 'Portfolio'} 
           />
