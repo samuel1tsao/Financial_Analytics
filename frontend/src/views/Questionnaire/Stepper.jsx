@@ -188,7 +188,10 @@ export default function QuestionnaireStepper() {
       
       // Auto-generate a recommended portfolio from the saved answers
       // This is the step that takes time (ML inference)
-      await api.post('/recommend');
+      const recommendRes = await api.post('/recommend');
+      if (recommendRes.data?.portfolio?.id) {
+        useStore.getState().setActivePortfolio(recommendRes.data.portfolio.id);
+      }
       
       await fetchQuestionnaire();
       await fetchUserData();

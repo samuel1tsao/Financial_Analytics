@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid,
@@ -33,14 +33,23 @@ function SimTooltip({ active, payload, label }) {
         Year {d.year}
       </p>
       <p style={{ color: '#60a5fa', fontWeight: 600, fontSize: '0.9rem' }}>
-        Expected: {fmt(d.expected)}
+        Current: {fmt(d.expected)}
       </p>
-      <p style={{ color: 'rgba(139,92,246,0.8)', fontSize: '0.8rem' }}>
-        Best Case: {fmt(d.upper)}
-      </p>
-      <p style={{ color: 'rgba(239,68,68,0.7)', fontSize: '0.8rem' }}>
-        Worst Case: {fmt(d.lower)}
-      </p>
+
+      {payload.filter(p => p.dataKey.startsWith('comp_')).map((p, i) => (
+        <p key={i} style={{ color: p.stroke, fontSize: '0.8rem', marginTop: '0.2rem', fontWeight: 500 }}>
+          {p.name}: {fmt(p.value)}
+        </p>
+      ))}
+
+      <div style={{ marginTop: '0.6rem', paddingTop: '0.4rem', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+        <p style={{ color: 'rgba(139,92,246,0.8)', fontSize: '0.75rem' }}>
+          Best Case: {fmt(d.upper)}
+        </p>
+        <p style={{ color: 'rgba(239,68,68,0.7)', fontSize: '0.75rem' }}>
+          Worst Case: {fmt(d.lower)}
+        </p>
+      </div>
     </div>
   );
 }
@@ -93,83 +102,143 @@ export default function DashboardMain() {
   // Interactive goals state (initialized from active portfolio below)
   const [customGoals, setCustomGoals] = useState([]);
   const [debouncedGoals, setDebouncedGoals] = useState([]);
+  const [sandboxStartCap, setSandboxStartCap] = useState(100000);
+  const [sandboxMonthlyContrib, setSandboxMonthlyContrib] = useState(500);
   
   // ETF Modal
   const [etfModal, setEtfModal] = useState(null);
   const [activeSegmentIdx, setActiveSegmentIdx] = useState(0);
   const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
 
-  const activePortfolio = portfolios.find((p) => p.id === activePortfolioId)
-    || portfolios.find((p) => p.is_current)
-    || null;
+  // Comparison State
+  const [selectedComparisons, setSelectedComparisons] = useState([]); // Array of benchmark keys or portfolio IDs
+  const [comparisonSims, setComparisonSims] = useState({});
+
+  const activePortfolio = useMemo(() => {
+    // If we have a specific ID selected, strictly use it. 
+    // Do NOT fallback to is_current if the requested ID isn't in the list yet (wait for sync)
+    if (activePortfolioId) {
+      return portfolios.find((p) => p.id === activePortfolioId) || null;
+    }
+    // Otherwise, fallback to the one marked as current
+    return portfolios.find((p) => p.is_current) || null;
+  }, [portfolios, activePortfolioId]);
 
   useEffect(() => {
-    if (activePortfolio && activePortfolio.weights && activePortfolio.weights.goals) {
-      setCustomGoals(activePortfolio.weights.goals);
-      setDebouncedGoals(activePortfolio.weights.goals);
+    if (activePortfolio && activePortfolio.weights) {
+      const data = activePortfolio.weights;
+      if (data.goals) {
+        setCustomGoals(data.goals);
+        setDebouncedGoals(data.goals);
+      }
+      if (data.start_cap) setSandboxStartCap(data.start_cap);
+      else if (questionnaire?.start_cap) setSandboxStartCap(questionnaire.start_cap);
+      
+      if (data.monthly_contrib) setSandboxMonthlyContrib(data.monthly_contrib);
+      else if (questionnaire?.monthly_contrib) setSandboxMonthlyContrib(questionnaire.monthly_contrib);
     }
   }, [activePortfolio?.id]);
 
   // ─── Local Recalculation Logic ─────────────────────────────────────────────
-  const calculateLocalProjection = (baseSim, goals, startCapital, monthlyInc) => {
+  const calculateLocalProjection = (baseSim, goals, startCapital, monthlyInc, projectionYears = 30) => {
     if (!baseSim || !baseSim.expected_annual_returns) return baseSim;
 
-    const totalYears = baseSim.expected_annual_returns.length;
+    const totalYears = projectionYears;
     const goalMap = {};
     goals.forEach(g => {
       goalMap[g.years] = (goalMap[g.years] || 0) + g.amount;
     });
 
-    const runPath = (annualReturns) => {
-      let balance = startCapital;
-      let debt = 0;
+    const stepBalances = [];
+    const cashOutEvents = [];
+
+    const runPath = (annualReturns, isExpected) => {
+      let balance = Number(startCapital) || 0;
       const path = [balance];
-      const contribAnnual = monthlyInc * 12;
+      const contribAnnual = (Number(monthlyInc) || 0) * 12;
 
       for (let yr = 1; yr <= totalYears; yr++) {
-        const r = annualReturns[yr - 1];
+        // Fallback to last known return if we extend past the simulation data
+        // This prevents NaN while waiting for the background re-fetch
+        const r = (yr - 1 < annualReturns.length) 
+          ? annualReturns[yr - 1] 
+          : (annualReturns.length > 0 ? annualReturns[annualReturns.length - 1] : 0.07);
+        
         balance *= (1 + r);
         balance += contribAnnual;
 
-        // Debt compounding (10% APR simple approx)
-        debt *= 1.10;
-
         const needed = goalMap[yr] || 0;
         if (needed > 0) {
+          let withdrawn = 0;
+          let shortfall = 0;
+
           if (balance >= needed) {
+            withdrawn = needed;
             balance -= needed;
           } else {
-            debt += (needed - balance);
+            withdrawn = balance;
+            shortfall = needed - balance;
             balance = 0;
           }
+
+          if (isExpected) {
+            stepBalances.push({ 
+              year: yr, 
+              balance: balance,
+              shortfall: shortfall,
+              withdrawn: withdrawn,
+              goal_amount: needed
+            });
+            const goalForYear = goals.find(g => g.years === yr) || { name: 'Goal' };
+            cashOutEvents.push({
+              year: yr,
+              amount: withdrawn,
+              shortfall: shortfall,
+              goal_name: goalForYear.name,
+              remaining_expected: balance
+            });
+          }
         }
-        path.push(Math.max(0, balance - debt));
+        path.push(balance);
       }
       return path;
     };
 
-    const expectedPath = runPath(baseSim.expected_annual_returns || []);
-    const upperBound = runPath(baseSim.upper_annual_returns || []);
-    const lowerBound = runPath(baseSim.lower_annual_returns || []);
+    const expectedPath = runPath(baseSim.expected_annual_returns || [], true);
+    const upperBound = runPath(baseSim.upper_annual_returns || [], false);
+    const lowerBound = runPath(baseSim.lower_annual_returns || [], false);
+
+    const goalAnnotations = goals.map(g => ({
+      year: g.years,
+      label: g.name,
+      amount: g.amount,
+      is_short_term: g.years <= 5,
+    }));
 
     // Update stats (rough approximation for CAGR)
     const finalExp = expectedPath.length > 0 ? expectedPath[expectedPath.length - 1] : 0;
-    const totalWithdrawn = goals.reduce((sum, g) => sum + (g.amount || 0), 0);
-    const cagrBase = (startCapital > 0 && totalYears > 0) ? (finalExp + totalWithdrawn) / startCapital : 0;
+    const totalWithdrawn = goals.reduce((sum, g) => sum + (Number(g.amount) || 0), 0);
+    const startCapNum = Number(startCapital) || 1;
+    const cagrBase = (startCapNum > 0 && totalYears > 0) ? (finalExp + totalWithdrawn) / startCapNum : 0;
     const cagr = (cagrBase > 0) ? (Math.pow(cagrBase, 1 / totalYears) - 1) * 100 : 0;
 
     return {
       ...baseSim,
+      years: Array.from({ length: totalYears + 1 }, (_, i) => i),
       expected_path: expectedPath,
       upper_bound: upperBound,
       lower_bound: lowerBound,
+      step_balances: stepBalances,
+      cash_out_events: cashOutEvents.sort((a,b) => a.year - b.year),
+      goal_annotations: goalAnnotations,
       portfolio_stats: {
         ...(baseSim.portfolio_stats || {}),
         projected_final_expected: finalExp,
         projected_final_upper: upperBound.length > 0 ? upperBound[upperBound.length - 1] : 0,
         projected_final_lower: lowerBound.length > 0 ? lowerBound[lowerBound.length - 1] : 0,
         expected_annual_return: (isNaN(cagr) || !isFinite(cagr)) ? "0.00" : cagr.toFixed(2),
-      }
+      },
+      segment_stats: baseSim.segment_stats,
     };
   };
 
@@ -223,12 +292,14 @@ export default function DashboardMain() {
   useEffect(() => {
     if (!activePortfolio) return;
     
-    // Determine if we need a backend refresh
-    // Structural changes (add/delete) require a new glide-path from backend
+    const maxGoalYear = debouncedGoals.length > 0 ? Math.max(30, ...debouncedGoals.map(g => Number(g.years))) : 30;
+    const currentHorizon = simulation?.expected_annual_returns?.length || 0;
+    
     const isStructuralChange = simulation === null || 
                                simulation.error ||
                                !simulation.expected_annual_returns ||
-                               debouncedGoals.length !== (simulation.goal_annotations?.length || 0);
+                               JSON.stringify(debouncedGoals.map(g => g.years)) !== JSON.stringify(simulation.goal_annotations?.map(a => a.year)) ||
+                               currentHorizon < maxGoalYear;
     
     if (!isStructuralChange && simulation) {
       return;
@@ -238,23 +309,23 @@ export default function DashboardMain() {
     (async () => {
       const cacheKey = `${activePortfolio.id}_${JSON.stringify(debouncedGoals)}`;
       
-      if (simCache[cacheKey]) {
-        console.log("Using cached simulation for:", cacheKey);
-        setSimulation(simCache[cacheKey]);
-        setSimLoading(false);
+      if (!activePortfolio.id) {
+        console.warn("Active portfolio has no ID, skipping simulation fetch");
         return;
       }
+      
+        const maxGoalYear = Math.max(30, ...debouncedGoals.map(g => Number(g.years)));
 
-      setSimLoading(true);
-      setSimError('');
-      try {
-        const res = await api.post('/simulate', {
-          portfolio_id: activePortfolio.id,
-          initial_investment: startCap,
-          monthly_contrib: monthlyContrib,
-          projection_years: 30,
-          custom_goals_json: JSON.stringify(debouncedGoals),
-        });
+        setSimLoading(true);
+        setSimError('');
+        try {
+          const res = await api.post('/simulate', {
+            portfolio_id: activePortfolio.id,
+            initial_investment: startCap,
+            monthly_contrib: monthlyContrib,
+            projection_years: maxGoalYear,
+            custom_goals_json: JSON.stringify(debouncedGoals),
+          });
         
         try {
           const backRes = await api.post('/backtest', {
@@ -279,20 +350,77 @@ export default function DashboardMain() {
       }
     })();
     return () => { cancelled = true; };
-  }, [activePortfolio?.id, debouncedGoals.length]);
+  }, [activePortfolio?.id, debouncedGoals, sandboxStartCap, sandboxMonthlyContrib]);
+
+  // ─── Comparison Fetching ──────────────────────────────────────────────────
+  useEffect(() => {
+    const maxGoalYear = Math.max(30, ...customGoals.map(g => Number(g.years)));
+    selectedComparisons.forEach(async (id) => {
+      // Re-fetch if cached version is too short
+      if (comparisonSims[id] && comparisonSims[id].expected_annual_returns?.length >= maxGoalYear) return;
+      
+      try {
+        let res;
+        if (id === 'sp500' || id === 'conservative_60_40') {
+          res = await api.post('/simulate_benchmark', {
+            benchmark_type: id,
+            projection_years: maxGoalYear
+          });
+          setComparisonSims(prev => ({ ...prev, [id]: res.data }));
+        } else {
+          res = await api.post('/simulate', {
+            portfolio_id: id,
+            initial_investment: sandboxStartCap,
+            monthly_contrib: sandboxMonthlyContrib,
+            projection_years: maxGoalYear,
+          });
+          setComparisonSims(prev => ({ ...prev, [id]: res.data.simulation }));
+        }
+      } catch (err) {
+        console.error("Failed to fetch comparison:", id, err);
+      }
+    });
+  }, [selectedComparisons, sandboxStartCap, sandboxMonthlyContrib, customGoals]);
+
+  // Apply local recalculation to comparisons
+  const activeComparisons = useMemo(() => {
+    const maxGoalYear = Math.max(30, ...customGoals.map(g => Number(g.years)));
+    return selectedComparisons.map(id => {
+      const baseSim = comparisonSims[id];
+      if (!baseSim) return null;
+      return {
+        id,
+        name: id === 'sp500' ? 'S&P 500' : id === 'conservative_60_40' ? '60/40 Benchmark' : (portfolios.find(p => p.id === id)?.profile_name || 'Portfolio'),
+        data: calculateLocalProjection(baseSim, customGoals, sandboxStartCap, sandboxMonthlyContrib, maxGoalYear)
+      };
+    }).filter(Boolean);
+  }, [selectedComparisons, comparisonSims, customGoals, sandboxStartCap, sandboxMonthlyContrib]);
 
   // Apply local recalculation to the simulation data
   const activeSimulation = useMemo(() => {
-    return calculateLocalProjection(simulation, customGoals, startCap, monthlyContrib);
-  }, [simulation, customGoals, startCap, monthlyContrib]);
+    const maxGoalYear = Math.max(30, ...customGoals.map(g => Number(g.years)));
+    return calculateLocalProjection(simulation, customGoals, sandboxStartCap, sandboxMonthlyContrib, maxGoalYear);
+  }, [simulation, customGoals, sandboxStartCap, sandboxMonthlyContrib]);
 
   // Sync back local simulation to stats
-  const chartData = (activeSimulation && !activeSimulation.error) ? activeSimulation.years.map((yr, i) => ({
-    year: yr,
-    expected: activeSimulation.expected_path[i],
-    upper: activeSimulation.upper_bound[i],
-    lower: activeSimulation.lower_bound[i],
-  })) : [];
+  const chartData = useMemo(() => {
+    if (!activeSimulation || activeSimulation.error) return [];
+    
+    return activeSimulation.years.map((yr, i) => {
+      const row = {
+        year: yr,
+        expected: activeSimulation.expected_path[i],
+        upper: activeSimulation.upper_bound[i],
+        lower: activeSimulation.lower_bound[i],
+      };
+      
+      activeComparisons.forEach(comp => {
+        row[`comp_${comp.id}`] = comp.data.expected_path[i];
+      });
+      
+      return row;
+    });
+  }, [activeSimulation, activeComparisons]);
 
   const stats = activeSimulation?.portfolio_stats || {};
 
@@ -480,108 +608,142 @@ export default function DashboardMain() {
         </div>
       )}
 
-      {/* Stats Summary Row */}
-      {activeSimulation && !activeSimulation.error && (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-          gap: '0.75rem', marginBottom: '1.5rem',
-        }}>
-          <StatCard
-            label="Expected Return"
-            value={`${stats.expected_annual_return}%`}
-            subtext="Annual average"
-            color="#4ade80"
-          />
-          <StatCard
-            label="Volatility"
-            value={`${stats.annual_volatility}%`}
-            subtext="Annual std dev"
-            color="#facc15"
-          />
-          <StatCard
-            label="Sharpe Ratio"
-            value={stats.sharpe_ratio?.toFixed(2)}
-            subtext="Risk-adjusted return"
-            color="#60a5fa"
-          />
-          <StatCard
-            label="Projected (30yr)"
-            value={fmt(stats.projected_final_expected || 0)}
-            subtext={`Range: ${fmt(stats.projected_final_lower || 0)} — ${fmt(stats.projected_final_upper || 0)}`}
-            color="#c084fc"
-          />
-        </div>
-      )}
+      {/* Stats Summary Row (Always visible shell) */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: '0.75rem', marginBottom: '1.5rem',
+      }}>
+        <StatCard
+          label={`Expected Return ${segments.length > 1 ? `(Phase ${activeSegmentIdx + 1})` : ''}`}
+          value={simLoading && !activeSimulation ? "..." : `${activeSimulation?.segment_stats?.[activeSegmentIdx]?.expected_return || stats.expected_annual_return}%`}
+          subtext={segments.length > 1 ? "Selected phase growth" : "Annual average"}
+          color="#4ade80"
+        />
+        <StatCard
+          label={`Volatility ${segments.length > 1 ? `(Phase ${activeSegmentIdx + 1})` : ''}`}
+          value={simLoading && !activeSimulation ? "..." : `${activeSimulation?.segment_stats?.[activeSegmentIdx]?.volatility || stats.annual_volatility}%`}
+          subtext={segments.length > 1 ? "Selected phase risk" : "Annual std dev"}
+          color="#facc15"
+        />
+        <StatCard
+          label={`Sharpe Ratio ${segments.length > 1 ? `(Phase ${activeSegmentIdx + 1})` : ''}`}
+          value={simLoading && !activeSimulation ? "..." : (activeSimulation?.segment_stats?.[activeSegmentIdx]?.sharpe_ratio ?? stats.sharpe_ratio)}
+          subtext="Risk-adjusted return"
+          color="#60a5fa"
+        />
+        <StatCard
+          label={`Projected (${activeSimulation?.years?.length ? activeSimulation.years.length - 1 : 30}yr)`}
+          value={simLoading && !activeSimulation ? "..." : fmt(stats.projected_final_expected || 0)}
+          subtext={simLoading && !activeSimulation ? "Calculating..." : `Range: ${fmt(stats.projected_final_lower || 0)} — ${fmt(stats.projected_final_upper || 0)}`}
+          color="#c084fc"
+        />
+      </div>
 
-      {/* Simulation Chart */}
-      {simLoading && (
+      {/* View Toggle (Always visible) */}
+      <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.25rem' }}>
+        <button
+          onClick={() => setViewMode('projection')}
+          style={{
+            background: viewMode === 'projection' ? 'rgba(59,130,246,0.15)' : 'transparent',
+            border: viewMode === 'projection' ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
+            color: viewMode === 'projection' ? '#60a5fa' : '#64748b',
+            padding: '0.4rem 1.25rem', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
+            transition: 'all 0.2s'
+          }}
+        >
+          {activeSimulation?.years?.length ? `${activeSimulation.years.length - 1}Y` : '30Y'} PROJECTION
+        </button>
+        <button
+          onClick={() => setViewMode('backtest')}
+          style={{
+            background: viewMode === 'backtest' ? 'rgba(139,92,246,0.15)' : 'transparent',
+            border: viewMode === 'backtest' ? '1px solid rgba(139,92,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
+            color: viewMode === 'backtest' ? '#a78bfa' : '#64748b',
+            padding: '0.4rem 1.25rem', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
+            transition: 'all 0.2s'
+          }}
+        >
+          HISTORICAL BACKTEST
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
         <div style={{
-          padding: '3rem', textAlign: 'center', color: '#64748b',
+          flex: 3, minWidth: 500,
+          display: 'flex', flexDirection: 'column', gap: '1.5rem'
         }}>
           <div style={{
-            width: 40, height: 40, margin: '0 auto 1rem',
-            borderRadius: '50%', border: '3px solid rgba(59,130,246,0.2)',
-            borderTopColor: '#3b82f6',
-            animation: 'spin 1s linear infinite',
-          }} />
-          <p>Running simulation...</p>
-          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-        </div>
-      )}
-
-      {activeSimulation && !activeSimulation.error && !simLoading && (
-        <>
-          {/* View Toggle */}
-          <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.25rem' }}>
-            <button
-              onClick={() => setViewMode('projection')}
-              style={{
-                background: viewMode === 'projection' ? 'rgba(59,130,246,0.15)' : 'transparent',
-                border: viewMode === 'projection' ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
-                color: viewMode === 'projection' ? '#60a5fa' : '#64748b',
-                padding: '0.4rem 1.25rem', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
-                transition: 'all 0.2s'
-              }}
-            >
-              30Y PROJECTION
-            </button>
-            <button
-              onClick={() => setViewMode('backtest')}
-              style={{
-                background: viewMode === 'backtest' ? 'rgba(139,92,246,0.15)' : 'transparent',
-                border: viewMode === 'backtest' ? '1px solid rgba(139,92,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
-                color: viewMode === 'backtest' ? '#a78bfa' : '#64748b',
-                padding: '0.4rem 1.25rem', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600,
-                transition: 'all 0.2s'
-              }}
-            >
-              HISTORICAL BACKTEST
-            </button>
-          </div>
-
-          <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
+            padding: '1.5rem', borderRadius: '0.75rem',
+            background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.06)',
+            position: 'relative'
+          }}>
+          {simLoading && (
             <div style={{
-              flex: 3, minWidth: 500,
-              padding: '1.5rem', borderRadius: '0.75rem',
-              background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
-              border: '1px solid rgba(255,255,255,0.06)',
+              position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+              background: 'rgba(15,23,42,0.4)', backdropFilter: 'blur(4px)',
+              zIndex: 10, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', color: '#64748b',
+              borderRadius: '0.75rem',
             }}>
               <div style={{
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                marginBottom: '1rem',
-              }}>
-                <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
-                  {viewMode === 'projection' ? 'Portfolio Growth Projection' : '10-Year Historical Backtest'}
-                </h3>
-                <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
-                  {viewMode === 'projection' ? '±2σ Confidence · 30 Year Horizon' : `Actual Returns · ${backtestData?.stats?.start_date} to Present`}
-                </span>
-              </div>
+                width: 30, height: 30, marginBottom: '0.75rem',
+                borderRadius: '50%', border: '3px solid rgba(59,130,246,0.2)',
+                borderTopColor: '#3b82f6',
+                animation: 'spin 1s linear infinite',
+              }} />
+              <p style={{ fontSize: '0.8rem' }}>Updating simulation...</p>
+            </div>
+          )}
 
-              <ResponsiveContainer width="100%" height={380}>
-                {viewMode === 'projection' ? (
-                  <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+          <div style={{
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            marginBottom: '1rem',
+          }}>
+            <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
+              {viewMode === 'projection' ? 'Portfolio Growth Projection' : '10-Year Historical Backtest'}
+            </h3>
+            <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
+              {viewMode === 'projection' ? `±2σ Confidence · ${activeSimulation?.years?.length ? activeSimulation.years.length - 1 : 30} Year Horizon` : `Actual Returns · ${backtestData?.stats?.start_date} to Present`}
+            </span>
+          </div>
+
+          {/* Comparison Selector */}
+          {viewMode === 'projection' && (
+            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
+              <span style={{ color: '#64748b', fontSize: '0.7rem', alignSelf: 'center', marginRight: '0.5rem' }}>COMPARE:</span>
+              {[
+                { id: 'sp500', label: 'S&P 500', color: '#f59e0b' },
+                { id: 'conservative_60_40', label: '60/40 Bench', color: '#10b981' },
+                ...portfolios.filter(p => p.id !== activePortfolio?.id).map(p => ({ id: p.id, label: p.profile_name, color: '#ec4899' }))
+              ].map(opt => {
+                const isSelected = selectedComparisons.includes(opt.id);
+                return (
+                  <button
+                    key={opt.id}
+                    onClick={() => {
+                      if (isSelected) setSelectedComparisons(prev => prev.filter(x => x !== opt.id));
+                      else setSelectedComparisons(prev => [...prev, opt.id]);
+                    }}
+                    style={{
+                      background: isSelected ? `${opt.color}22` : 'rgba(255,255,255,0.03)',
+                      border: `1px solid ${isSelected ? opt.color : 'rgba(255,255,255,0.1)'}`,
+                      color: isSelected ? opt.color : '#64748b',
+                      padding: '0.25rem 0.75rem', borderRadius: '2rem', fontSize: '0.65rem',
+                      fontWeight: 600, cursor: 'pointer', transition: 'all 0.2s'
+                    }}
+                  >
+                    {isSelected ? '✓ ' : '+ '}{opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <ResponsiveContainer width="100%" height={380}>
+            {viewMode === 'projection' ? (
+              <AreaChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
                     <defs>
                       <linearGradient id="gradExpected" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
@@ -595,7 +757,25 @@ export default function DashboardMain() {
                     <Area type="monotone" dataKey="upper" name="Best Case" stroke="rgba(34,197,94,0.4)" fill="rgba(34,197,94,0.05)" dot={false} strokeDasharray="4 2" />
                     <Area type="monotone" dataKey="expected" name="Expected Path" stroke="#3b82f6" strokeWidth={2.5} fill="url(#gradExpected)" dot={false} />
                     <Area type="monotone" dataKey="lower" name="Worst Case" stroke="rgba(239,68,68,0.4)" fill="rgba(239,68,68,0.05)" dot={false} strokeDasharray="4 2" />
-                    {activeSimulation.goal_annotations?.map((g, i) => (
+                    
+                    {activeComparisons.map((comp, idx) => {
+                      const colors = ['#f59e0b', '#10b981', '#ec4899', '#8b5cf6', '#06b6d4'];
+                      const color = colors[idx % colors.length];
+                      return (
+                        <Line 
+                          key={comp.id} 
+                          type="monotone" 
+                          dataKey={`comp_${comp.id}`} 
+                          name={comp.name} 
+                          stroke={color} 
+                          strokeWidth={2} 
+                          dot={false} 
+                          strokeDasharray="5 5"
+                        />
+                      );
+                    })}
+
+                    {activeSimulation?.goal_annotations?.map((g, i) => (
                       <ReferenceLine key={i} x={g.year} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: g.label, position: 'top', fill: '#f59e0b', fontSize: 10 }} />
                     ))}
                   </AreaChart>
@@ -619,17 +799,67 @@ export default function DashboardMain() {
                   </AreaChart>
                 )}
               </ResponsiveContainer>
-            </div>
+          </div>
 
-            <div style={{
-              flex: 1, minWidth: 280,
-              padding: '1.5rem', borderRadius: '0.75rem',
-              background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
-              border: '1px solid rgba(255,255,255,0.06)',
-            }}>
+          <BalanceStepTable 
+            steps={activeSimulation?.step_balances} 
+            segments={segments}
+            portfolioName={activePortfolio?.profile_name || 'Portfolio'} 
+          />
+        </div>
+        
+        <div style={{
+          flex: 1, minWidth: 280,
+          display: 'flex', flexDirection: 'column', gap: '1rem'
+        }}>
+          <div style={{
+            padding: '1.5rem', borderRadius: '0.75rem',
+            background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.06)',
+          }}>
               <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '0.9rem', marginBottom: '1rem' }}>
                 Interactive Sandbox
               </h3>
+              
+              {/* Global Portfolio Parameters */}
+              <div style={{ marginBottom: '1.5rem', paddingBottom: '1rem', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+                <div style={{ marginBottom: '1rem' }}>
+                  <label style={{ color: '#94a3b8', fontSize: '0.7rem', fontWeight: 600, display: 'block', marginBottom: '0.4rem' }}>
+                    INITIAL INVESTMENT ($)
+                  </label>
+                  <input 
+                    type="number"
+                    value={sandboxStartCap}
+                    onChange={e => setSandboxStartCap(Number(e.target.value))}
+                    style={{ 
+                      width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                      color: '#f1f5f9', padding: '0.5rem', borderRadius: '0.4rem', fontSize: '0.85rem',
+                      outline: 'none'
+                    }}
+                    onFocus={e => e.target.style.borderColor = '#3b82f6'}
+                    onBlur={e => e.target.style.borderColor = 'rgba(255,255,255,0.1)'}
+                  />
+                </div>
+                
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <label style={{ color: '#94a3b8', fontSize: '0.7rem', fontWeight: 600, display: 'block', marginBottom: '0.4rem' }}>
+                    MONTHLY DEPOSIT ($)
+                  </label>
+                  <input 
+                    type="number"
+                    value={sandboxMonthlyContrib}
+                    onChange={e => setSandboxMonthlyContrib(Number(e.target.value))}
+                    style={{ 
+                      width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                      color: '#f1f5f9', padding: '0.5rem', borderRadius: '0.4rem', fontSize: '0.85rem',
+                      outline: 'none'
+                    }}
+                    onFocus={e => e.target.style.borderColor = '#3b82f6'}
+                    onBlur={e => e.target.style.borderColor = 'rgba(255,255,255,0.1)'}
+                  />
+                </div>
+              </div>
+
               <p style={{ color: '#94a3b8', fontSize: '0.75rem', marginBottom: '1.5rem' }}>
                 Test how big purchases or cash-outs affect your long-term growth by overriding your baseline goals here.
               </p>
@@ -651,31 +881,39 @@ export default function DashboardMain() {
                   />
                   
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
-                    <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Amount: {fmt(g.amount)}</label>
+                    <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Amount ($)</label>
                   </div>
                   <input 
-                    type="range" min="0" max="250000" step="5000"
+                    type="number"
                     value={g.amount}
                     onChange={e => {
                       const ng = [...customGoals];
                       ng[i].amount = Number(e.target.value);
                       setCustomGoals(ng);
                     }}
-                    style={{ width: '100%', cursor: 'pointer', marginBottom: '0.8rem' }}
+                    style={{ 
+                      width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                      color: '#f1f5f9', padding: '0.4rem', borderRadius: '0.3rem', fontSize: '0.85rem', marginBottom: '0.8rem',
+                      outline: 'none'
+                    }}
                   />
 
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
-                    <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Year: {g.years}</label>
+                    <label style={{ color: '#64748b', fontSize: '0.7rem' }}>Target Year</label>
                   </div>
                   <input 
-                    type="range" min="1" max="30" step="1"
+                    type="number"
                     value={g.years}
                     onChange={e => {
                       const ng = [...customGoals];
                       ng[i].years = Number(e.target.value);
                       setCustomGoals(ng);
                     }}
-                    style={{ width: '100%', cursor: 'pointer' }}
+                    style={{ 
+                      width: '100%', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                      color: '#f1f5f9', padding: '0.4rem', borderRadius: '0.3rem', fontSize: '0.85rem', marginBottom: '0.8rem',
+                      outline: 'none'
+                    }}
                   />
                   <button
                     onClick={() => {
@@ -709,125 +947,130 @@ export default function DashboardMain() {
                 + Add Custom Goal
               </button>
 
-              {activeSimulation.cash_out_events?.length > 0 && (
+              {activeSimulation?.cash_out_events?.length > 0 && (
                 <div style={{ marginTop: '1rem', background: 'rgba(245,158,11,0.08)', padding: '0.75rem', borderRadius: '0.4rem', border: '1px solid rgba(245,158,11,0.15)' }}>
                   <p style={{ color: '#f59e0b', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.4rem' }}>
                     CASH-OUT EVENT LOG
                   </p>
                   {activeSimulation.cash_out_events.map((ev, i) => (
-                    <p key={i} style={{ color: '#e2e8f0', fontSize: '0.75rem', margin: '0.2rem 0' }}>
-                      <strong>Yr {ev.year}</strong>: {ev.goal_name} (-{fmt(ev.amount)})
-                    </p>
+                    <div key={i} style={{ marginBottom: '0.5rem', borderBottom: '1px solid rgba(255,255,255,0.03)', paddingBottom: '0.3rem' }}>
+                      <p style={{ color: '#e2e8f0', fontSize: '0.75rem', margin: '0.2rem 0' }}>
+                        <strong>Yr {ev.year}</strong>: {ev.goal_name} 
+                        <span style={{ color: ev.shortfall > 0 ? '#fca5a5' : '#4ade80', marginLeft: '0.4rem' }}>
+                          (-{fmt(ev.amount)})
+                        </span>
+                      </p>
+                      {ev.shortfall > 0 && (
+                        <p style={{ color: '#ef4444', fontSize: '0.65rem', margin: 0, fontWeight: 600 }}>
+                          ⚠ SHORTFALL: {fmt(ev.shortfall)}
+                        </p>
+                      )}
+                    </div>
                   ))}
                 </div>
               )}
             </div>
           </div>
-          
-          <BalanceStepTable 
-            steps={activeSimulation.step_balances} 
-            segments={segments}
-            portfolioName={activePortfolio?.profile_name || 'Portfolio'} 
-          />
-        </>
-      )}
+      </div>
 
       {/* Portfolio Allocation Cards */}
       {activePortfolio ? (
         <div style={{ marginTop: '2rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
-              Allocation Breakdown 
-              {segments.length > 0 && segments[activeSegmentIdx] && (
-                <span style={{ color: '#60a5fa', marginLeft: '0.5rem', fontSize: '0.85rem' }}>
-                  (Phase {activeSegmentIdx + 1}: Year {segments[activeSegmentIdx].horizon_years?.[0]}-{segments[activeSegmentIdx].horizon_years?.[1]})
-                </span>
+          <>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '1rem', margin: 0 }}>
+                Allocation Breakdown 
+                {segments.length > 0 && segments[activeSegmentIdx] && (
+                  <span style={{ color: '#60a5fa', marginLeft: '0.5rem', fontSize: '0.85rem' }}>
+                    (Phase {activeSegmentIdx + 1}: Year {segments[activeSegmentIdx].horizon_years?.[0]}-{segments[activeSegmentIdx].horizon_years?.[1]})
+                  </span>
+                )}
+              </h3>
+              
+              {segments.length > 1 && (
+                <div style={{ display: 'flex', gap: '0.4rem', background: 'rgba(15,23,42,0.4)', padding: '0.25rem', borderRadius: '0.5rem' }}>
+                  {segments.map((seg, i) => (
+                    <button
+                      key={i}
+                      onClick={() => setActiveSegmentIdx(i)}
+                      style={{
+                        padding: '0.3rem 0.7rem', borderRadius: '0.4rem', fontSize: '0.7rem', fontWeight: 600,
+                        cursor: 'pointer', border: 'none', transition: 'all 0.2s',
+                        background: activeSegmentIdx === i ? '#3b82f6' : 'transparent',
+                        color: activeSegmentIdx === i ? '#fff' : '#94a3b8',
+                      }}
+                    >
+                      Phase {i+1}
+                    </button>
+                  ))}
+                </div>
               )}
-            </h3>
-            
-            {segments.length > 1 && (
-              <div style={{ display: 'flex', gap: '0.4rem', background: 'rgba(15,23,42,0.4)', padding: '0.25rem', borderRadius: '0.5rem' }}>
-                {segments.map((seg, i) => (
-                  <button
-                    key={i}
-                    onClick={() => setActiveSegmentIdx(i)}
+            </div>
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+              gap: '0.75rem',
+            }}>
+              {Object.entries(weights)
+                .sort(([tA, wA], [tB, wB]) => {
+                  const isConsA = hardConstraints.has(tA);
+                  const isConsB = hardConstraints.has(tB);
+                  if (isConsA && !isConsB) return -1;
+                  if (!isConsA && isConsB) return 1;
+                  return wB - wA;
+                })
+                .map(([ticker, weight]) => (
+                  <div
+                    key={ticker}
                     style={{
-                      padding: '0.3rem 0.7rem', borderRadius: '0.4rem', fontSize: '0.7rem', fontWeight: 600,
-                      cursor: 'pointer', border: 'none', transition: 'all 0.2s',
-                      background: activeSegmentIdx === i ? '#3b82f6' : 'transparent',
-                      color: activeSegmentIdx === i ? '#fff' : '#94a3b8',
+                      padding: '1rem 1.25rem', borderRadius: '0.75rem',
+                      background: 'rgba(15, 23, 42, 0.6)', cursor: 'pointer',
+                      backdropFilter: 'blur(12px)',
+                      border: '1px solid rgba(255,255,255,0.06)',
+                      transition: 'border-color 0.2s, transform 0.2s',
+                    }}
+                    onClick={() => setEtfModal(ticker)}
+                    onMouseOver={(e) => {
+                      e.currentTarget.style.borderColor = 'rgba(139,92,246,0.3)';
+                      e.currentTarget.style.transform = 'translateY(-2px)';
+                    }}
+                    onMouseOut={(e) => {
+                      e.currentTarget.style.borderColor = 'rgba(255,255,255,0.06)';
+                      e.currentTarget.style.transform = 'translateY(0)';
                     }}
                   >
-                    Phase {i+1}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
-            gap: '0.75rem',
-          }}>
-            {Object.entries(weights)
-              .sort(([tA, wA], [tB, wB]) => {
-                const isConsA = hardConstraints.has(tA);
-                const isConsB = hardConstraints.has(tB);
-                if (isConsA && !isConsB) return -1;
-                if (!isConsA && isConsB) return 1;
-                return wB - wA;
-              })
-              .map(([ticker, weight]) => (
-                <div
-                  key={ticker}
-                  style={{
-                    padding: '1rem 1.25rem', borderRadius: '0.75rem',
-                    background: 'rgba(15, 23, 42, 0.6)', cursor: 'pointer',
-                    backdropFilter: 'blur(12px)',
-                    border: '1px solid rgba(255,255,255,0.06)',
-                    transition: 'border-color 0.2s, transform 0.2s',
-                  }}
-                  onClick={() => setEtfModal(ticker)}
-                  onMouseOver={(e) => {
-                    e.currentTarget.style.borderColor = 'rgba(139,92,246,0.3)';
-                    e.currentTarget.style.transform = 'translateY(-2px)';
-                  }}
-                  onMouseOut={(e) => {
-                    e.currentTarget.style.borderColor = 'rgba(255,255,255,0.06)';
-                    e.currentTarget.style.transform = 'translateY(0)';
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ color: '#f1f5f9', fontWeight: 700, fontSize: '1.05rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      {ticker}
-                      {hardConstraints.has(ticker) && (
-                        <span style={{
-                          fontSize: '0.6rem', padding: '0.15rem 0.4rem', borderRadius: '0.3rem',
-                          background: 'rgba(59,130,246,0.15)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)',
-                        }}>
-                          USER PREFERENCE
-                        </span>
-                      )}
-                    </span>
-                    <span style={{ color: '#60a5fa', fontWeight: 600, fontSize: '1.05rem' }}>
-                      {pct(weight)}
-                    </span>
-                  </div>
-                  <div style={{
-                    marginTop: '0.6rem', height: 5, borderRadius: 3,
-                    background: 'rgba(255,255,255,0.06)', overflow: 'hidden',
-                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ color: '#f1f5f9', fontWeight: 700, fontSize: '1.05rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        {ticker}
+                        {hardConstraints.has(ticker) && (
+                          <span style={{
+                            fontSize: '0.6rem', padding: '0.15rem 0.4rem', borderRadius: '0.3rem',
+                            background: 'rgba(59,130,246,0.15)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)',
+                          }}>
+                            USER PREFERENCE
+                          </span>
+                        )}
+                      </span>
+                      <span style={{ color: '#60a5fa', fontWeight: 600, fontSize: '1.05rem' }}>
+                        {pct(weight)}
+                      </span>
+                    </div>
                     <div style={{
-                      height: '100%', width: `${weight * 100}%`,
-                      borderRadius: 3,
-                      background: 'linear-gradient(90deg, #3b82f6, #8b5cf6)',
-                      transition: 'width 0.5s ease',
-                    }} />
+                      marginTop: '0.6rem', height: 5, borderRadius: 3,
+                      background: 'rgba(255,255,255,0.06)', overflow: 'hidden',
+                    }}>
+                      <div style={{
+                        height: '100%', width: `${weight * 100}%`,
+                        borderRadius: 3,
+                        background: 'linear-gradient(90deg, #3b82f6, #8b5cf6)',
+                        transition: 'width 0.5s ease',
+                      }} />
+                    </div>
                   </div>
-                </div>
-              ))}
-          </div>
+                ))}
+            </div>
+          </>
         </div>
       ) : (
         <p style={{ color: '#64748b' }}>Select a portfolio from the sidebar to view details.</p>

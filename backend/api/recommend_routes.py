@@ -11,6 +11,9 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["recommendation"])
 
+# Simple in-memory cache for benchmarks to avoid redundant heavy MC simulations
+_BENCHMARK_CACHE = {}
+
 
 @router.post("/recommend")
 def recommend_portfolio(
@@ -96,34 +99,12 @@ def run_simulation(
     data = json.loads(portfolio.weight_json)
     segments = data.get("segments", data) if isinstance(data, dict) else data
     
-    # Use custom goals from frontend if provided, else fallback to latest questionnaire
-    goals = []
-    if custom_goals_json and custom_goals_json != "[]":
-        try:
-            goals = json.loads(custom_goals_json)
-        except Exception as e:
-            logger.warning(f"Failed to parse custom_goals_json: {e}")
-            
-    if not goals:
-        q = db.query(models.Questionnaire).filter(
-            models.Questionnaire.user_id == current_user.id
-        ).order_by(models.Questionnaire.created_at.desc()).first()
-        if q:
-            ans = json.loads(q.raw_json)
-            if "answers" in ans: ans = ans["answers"]
-            goals = ans.get("goals", [])
-    
-    monthly_contrib = 500 # Default
-    # (Optional: fetch monthly_contrib from q if still needed)
-
-    logger.info(f"Running simulation for user {current_user.email}, portfolio_id={portfolio_id}, goals_count={len(goals)}")
+    # No longer tracking goals or cash deposits in backend simulation
+    logger.info(f"Running simulation for user {current_user.email}, portfolio_id={portfolio_id}, active_id={portfolio.id}")
     try:
         from vector_encoder import simulate_multi_horizon_portfolio
         sim = simulate_multi_horizon_portfolio(
             segments=segments,
-            goals=goals,
-            initial_investment=initial_investment,
-            monthly_contrib=monthly_contrib,
             projection_years=projection_years
         )
         
@@ -154,13 +135,22 @@ def backtest_portfolio(
     initial_investment = payload.get("initial_investment", 100000)
     monthly_contrib = payload.get("monthly_contrib", 500)
 
-    portfolio = db.query(models.Portfolio).filter(
-        models.Portfolio.id == portfolio_id,
-        models.Portfolio.user_id == current_user.id
-    ).first()
+    if portfolio_id:
+        portfolio = db.query(models.Portfolio).filter(
+            models.Portfolio.id == portfolio_id,
+            models.Portfolio.user_id == current_user.id,
+        ).first()
+    else:
+        portfolio = db.query(models.Portfolio).filter(
+            models.Portfolio.user_id == current_user.id,
+            models.Portfolio.is_current == True,
+        ).first()
 
     if not portfolio:
+        logger.error(f"Backtest failed: Portfolio {portfolio_id} not found for user {current_user.email}")
         raise HTTPException(status_code=404, detail="Portfolio not found.")
+
+    logger.info(f"Running backtest for user {current_user.email}, portfolio_id={portfolio.id}")
 
     data = json.loads(portfolio.weight_json)
     segments = data.get("segments", [])
@@ -219,3 +209,37 @@ def backtest_portfolio(
             "final_balance": round(current_bal, 2)
         }
     }
+
+
+@router.post("/simulate_benchmark")
+def run_simulation_benchmark(
+    req: schemas.SimulationBenchmarkRequest,
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Run simulation for a standard benchmark (S&P500, etc) with caching.
+    """
+    cache_key = f"{req.benchmark_type}_{req.projection_years}"
+    if cache_key in _BENCHMARK_CACHE:
+        logger.info(f"Using cached benchmark simulation for: {cache_key}")
+        return _BENCHMARK_CACHE[cache_key]
+
+    logger.info(f"Calculating fresh benchmark simulation for: {cache_key}")
+    if req.benchmark_type == "sp500":
+        segments = [{"horizon_years": (0, req.projection_years), "weights": {"VOO": 1.0}}]
+    elif req.benchmark_type == "conservative_60_40":
+        segments = [{"horizon_years": (0, req.projection_years), "weights": {"VOO": 0.6, "BND": 0.4}}]
+    else:
+        raise HTTPException(status_code=400, detail="Invalid benchmark type")
+
+    try:
+        from vector_encoder import simulate_multi_horizon_portfolio
+        sim = simulate_multi_horizon_portfolio(
+            segments=segments,
+            projection_years=req.projection_years
+        )
+        _BENCHMARK_CACHE[cache_key] = sim
+        return sim
+    except Exception as e:
+        logger.error(f"Benchmark simulation crash: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

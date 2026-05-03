@@ -85,3 +85,9 @@ class SimulationRequest(BaseModel):
 
 class PortfolioDeleteRequest(BaseModel):
     ids: list[int]
+
+
+class SimulationBenchmarkRequest(BaseModel):
+    benchmark_type: str  # "sp500" or "conservative_60_40"
+    initial_investment: float = 100000
+    projection_years: int = 30

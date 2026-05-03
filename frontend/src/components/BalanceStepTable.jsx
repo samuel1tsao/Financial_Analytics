@@ -70,7 +70,8 @@ export default function BalanceStepTable({ steps, segments, portfolioName }) {
             <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
               <th style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>Year</th>
               <th style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>Status</th>
-              <th style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>Next Phase Strategy</th>
+              <th style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>Goal / Withdrawn</th>
+              <th style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>Shortfall</th>
               <th style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase', textAlign: 'right' }}>Post-Cashout Balance</th>
             </tr>
           </thead>
@@ -106,14 +107,15 @@ export default function BalanceStepTable({ steps, segments, portfolioName }) {
                     </span>
                   </td>
                   <td style={{ padding: '1rem', color: '#94a3b8', fontSize: '0.85rem' }}>
-                    {topAssets ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        <span style={{ color: '#3b82f6', fontWeight: 600 }}>↺ REBALANCE:</span>
-                        <span>{topAssets}...</span>
-                      </div>
-                    ) : (
-                      <span style={{ opacity: 0.5 }}>Final Goal Horizon</span>
-                    )}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                      <span style={{ fontSize: '0.7rem' }}>Goal: {fmt(step.goal_amount)}</span>
+                      <span style={{ color: step.shortfall > 0 ? '#fca5a5' : '#4ade80', fontWeight: 600 }}>
+                        {fmt(step.withdrawn)}
+                      </span>
+                    </div>
+                  </td>
+                  <td style={{ padding: '1rem', color: step.shortfall > 0 ? '#ef4444' : '#64748b', fontSize: '0.85rem', fontWeight: step.shortfall > 0 ? 700 : 400 }}>
+                    {step.shortfall > 0 ? fmt(step.shortfall) : '—'}
                   </td>
                   <td style={{ padding: '1rem', color: '#60a5fa', fontWeight: 700, fontSize: '0.95rem', textAlign: 'right', letterSpacing: '-0.01em' }}>
                     {fmt(step.balance)}

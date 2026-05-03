@@ -114,25 +114,33 @@ class RLRecommender:
             logger.error(f"Error loading dataset for RL: {e}")
             self.dynamic_embeddings = {}
 
-        # 2. Load Model
-        # checkpoint_rl_v2_dm64_nh4_lr001_id226.pt (example from plan)
-        # We'll look for the most recent RL checkpoint if this specific one isn't found
+        # 2. Load Models (Ensemble)
+        # checkpoint_rl_v2_dm64_nh4_lr001_id226.pt
         checkpoint_name = "checkpoint_rl_v2_dm64_nh4_lr001_id226.pt"
         checkpoint_path = os.path.join(CACHE_DIR, checkpoint_name)
+        self.models = []
         
         if os.path.exists(checkpoint_path):
             input_dim = 226 # Matches the filename id226
-            self.model = PortfolioTransformerRL(input_dim, self.config).to(self.device)
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            
             if 'agents_state' in checkpoint:
-                self.model.load_state_dict(checkpoint['agents_state'][0])
-            else:
-                self.model.load_state_dict(checkpoint['model_state'])
-            self.model.eval()
-            logger.info(f"RL model loaded from {checkpoint_path}")
+                # Load all agents in the ensemble
+                for state in checkpoint['agents_state']:
+                    m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                    m.load_state_dict(state)
+                    m.eval()
+                    self.models.append(m)
+                logger.info(f"Loaded ensemble of {len(self.models)} RL agents from {checkpoint_path}")
+            elif 'model_state' in checkpoint:
+                # Fallback for single-agent checkpoints
+                m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                m.load_state_dict(checkpoint['model_state'])
+                m.eval()
+                self.models.append(m)
+                logger.info(f"Loaded single RL agent from {checkpoint_path}")
         else:
             logger.warning(f"RL checkpoint not found at {checkpoint_path}. Multi-horizon RL disabled.")
-            self.model = None
 
         self._initialized = True
 
@@ -140,7 +148,7 @@ class RLRecommender:
         """
         Inference: Returns (pre_goal_weights, post_goal_weights) as dictionaries.
         """
-        if self.model is None or not self.dynamic_embeddings:
+        if not self.models or not self.dynamic_embeddings:
             return {}, {}
 
         # 1. Build input tensor
@@ -169,13 +177,26 @@ class RLRecommender:
         
         full_input = np.concatenate([emb_matrix, user_tiled, static_matrix], axis=1)
         x = torch.tensor(full_input[np.newaxis, :, :], dtype=torch.float32).to(self.device)
-        
-        # 2. Forward pass
+
+        # 2. Forward pass (Ensemble Average)
+        if not self.models:
+            return {}, {}
+
         with torch.no_grad():
-            (mu_pre, _), (mu_post, _) = self.model(x)
-            # Softmax + Normalization (Top-K etc)
-            w_pre = _softmax_normalize_top_k(mu_pre, None)[0].cpu().numpy()
-            w_post = _softmax_normalize_top_k(mu_post, None)[0].cpu().numpy()
+            mu_pre_sum = 0
+            mu_post_sum = 0
+            for m in self.models:
+                (mu_p, _), (mu_g, _) = m(x)
+                mu_pre_sum += mu_p
+                mu_post_sum += mu_g
+            
+            # Average the logits across all agents
+            mu_pre = mu_pre_sum / len(self.models)
+            mu_post = mu_post_sum / len(self.models)
+            
+            # Use raw mu directly as done in the training notebook to ensure consistent weights
+            w_pre = F.softmax(mu_pre, dim=-1)[0].cpu().numpy()
+            w_post = F.softmax(mu_post, dim=-1)[0].cpu().numpy()
             
         # 3. Post-process (Top-K pruning and thresholding)
         def _finalize_weights(w_np):
@@ -315,23 +336,17 @@ def encode_multi_horizon(answers: dict) -> dict:
 
 def simulate_multi_horizon_portfolio(
     segments: list,
-    goals: list,
-    initial_investment: float = 100000,
-    monthly_contrib: float = 500,
     projection_years: int = 30,
 ) -> dict:
     """
-    Run a year-by-year simulation switching weights at segment boundaries.
-    Records post-cash-out balances at each goal step.
+    Run a year-by-year simulation of portfolio returns, switching weights at segment boundaries.
     """
     recommender = RLRecommender()
     if not recommender._initialized or recommender.daily_returns is None:
         # Fallback if no data
         return {"error": "Market data unavailable for simulation"}
 
-    # Use projection_years as a floor for simulation length
-    max_goal_yr = max(g.get("years", 0) for g in goals) if goals else 0
-    total_years = max(max_goal_yr, projection_years)
+    total_years = projection_years
 
     # 1. Build Simulation Cache
     base_returns = recommender.drip_daily_returns if recommender.drip_daily_returns is not None else recommender.daily_returns
@@ -346,8 +361,6 @@ def simulate_multi_horizon_portfolio(
     rng = np.random.default_rng(42)
     num_paths = min(len(sim_starts), 20)
     sim_starts = rng.choice(sim_starts, size=num_paths, replace=False)
-
-    goal_map = {g.get("years"): g.get("amount") for g in goals}
     
     # 3. Pre-process segment weights into year-indexed arrays for speed
     num_assets = len(clean_returns.columns)
@@ -371,144 +384,49 @@ def simulate_multi_horizon_portfolio(
         if wa.sum() > 0: wa /= wa.sum()
         year_weight_arrays.append(wa)
 
-    # 4. Run Monte Carlo Paths
-    n_paths = len(sim_starts)
-    # Matrix: (n_paths, total_years+1) to store net balance at each year for each path
-    balance_matrix = np.zeros((n_paths, total_years + 1))
-    step_balances_accumulator = {yr: [] for yr in goal_map.keys()}
-    cash_out_events = []  # Populated from the mean path
+    # 4. Vectorized Path Simulation
+    pos_indices = [start_idx_to_pos[s] for s in sim_starts]
+    selected_returns = sim_cache[pos_indices] # (n_paths, total_years, n_assets)
     
-    for path_i, start_idx in enumerate(sim_starts):
-        capital = initial_investment
-        debt = 0.0
-        balance_matrix[path_i, 0] = capital
-        
-        for yr in range(1, total_years + 1):
-            wa = year_weight_arrays[yr-1]
-            # Annual return dot product
-            pos = start_idx_to_pos[start_idx]
-            yr_returns = sim_cache[pos][yr-1]
-            portfolio_return = np.dot(wa, yr_returns)
-            
-            # Growth phase
-            capital *= (1 + portfolio_return)
-            # Add contributions (simplified annual)
-            capital += monthly_contrib * 12
-            
-            # Debt compounding (fallback for shortfalls)
-            debt *= (1 + LOAN_DAILY_RATE * TRADING_DAYS_PER_YEAR)
-            
-            # Cash out at goal
-            if yr in goal_map:
-                needed = goal_map[yr]
-                if capital >= needed:
-                    capital -= needed
-                else:
-                    debt += (needed - capital)
-                    capital = 0.0
-                
-                # Record "Balance-at-Step" for this path
-                step_balances_accumulator[yr].append(capital - debt)
-            
-            balance_matrix[path_i, yr] = capital - debt
+    year_weight_arrays = np.array(year_weight_arrays)
+    wa_broad = year_weight_arrays.reshape(1, total_years, num_assets)
+    path_returns = np.sum(selected_returns * wa_broad, axis=2)
 
-    # 5. Aggregate Results across all paths
-    years = list(range(total_years + 1))
-    expected_path = [round(float(np.mean(balance_matrix[:, yr])), 2) for yr in years]
-    upper_bound   = [round(float(np.percentile(balance_matrix[:, yr], 90)), 2) for yr in years]
-    lower_bound   = [round(float(max(0, np.percentile(balance_matrix[:, yr], 10))), 2) for yr in years]
-        
-    # Step balances (sorted by year, rounded to 2 decimals)
-    step_balances = []
-    for yr in sorted(step_balances_accumulator.keys()):
-        avg_bal = float(np.mean(step_balances_accumulator[yr]))
-        step_balances.append({
-            "year": yr,
-            "balance": round(avg_bal, 2)
-        })
-
-    # Cash-out events (from expected path)
-    for yr, amount in sorted(goal_map.items()):
-        yr_idx = yr if yr <= total_years else total_years
-        cash_out_events.append({
-            "year": yr,
-            "goal_name": next((g.get("name", "Goal") for g in goals if g.get("years") == yr), "Goal"),
-            "amount": amount,
-            "remaining_expected": expected_path[yr_idx] if yr_idx < len(expected_path) else expected_path[-1],
-        })
-
-    # Goal annotations for the chart
-    goal_annotations = []
-    for g in goals:
-        y = g.get("years", 10)
-        if y <= total_years:
-            goal_annotations.append({
-                "year": y,
-                "label": g.get("name", "Goal"),
-                "amount": g.get("amount", 0),
-                "is_short_term": y <= 5,
-            })
-
-    # 6. Calculate aggregate metrics for the dashboard cards
-    # Use CAGR-equivalent considering all cash-outs
-    total_withdrawn = sum(e["amount"] for e in cash_out_events)
-    total_value_created = expected_path[-1] + total_withdrawn
-    cagr = ((total_value_created / initial_investment) ** (1/total_years) - 1) if total_years > 0 else 0
-    
-    # Estimate volatility from the spread of paths at the final year
-    # (Simplified: Standard deviation of final returns)
-    final_returns = balance_matrix[:, -1] / initial_investment
-    ann_vol = np.std(final_returns) / np.sqrt(total_years) if total_years > 0 else 0
-    
-    sharpe = (cagr - 0.02) / ann_vol if ann_vol > 0 else 0
-
-    # 7. Calculate Effective Annual Returns for frontend recalculation
-    # Formula: r_eff = (bal[t] + cashout - contrib) / bal[t-1] - 1
-    # This allows the frontend to reproduce the path locally while changing goal amounts.
-    
+    # 5. Calculate Raw Portfolio Growth Rates for frontend recalculation
     expected_annual_returns = []
     upper_annual_returns = []
     lower_annual_returns = []
     
-    for yr in range(1, total_years + 1):
-        cashout = goal_map.get(yr, 0)
-        contrib = monthly_contrib * 12
+    for yr in range(total_years):
+        r_mean = float(np.mean(path_returns[:, yr]))
+        r_std = float(np.std(path_returns[:, yr]))
         
-        # Expected
-        prev_exp = expected_path[yr-1] if expected_path[yr-1] > 0 else 1.0
-        r_exp = (expected_path[yr] + cashout - contrib) / prev_exp - 1
-        expected_annual_returns.append(round(float(r_exp), 6))
-        
-        # Upper
-        prev_upp = upper_bound[yr-1] if upper_bound[yr-1] > 0 else 1.0
-        r_upp = (upper_bound[yr] + cashout - contrib) / prev_upp - 1
-        upper_annual_returns.append(round(float(r_upp), 6))
-        
-        # Lower
-        prev_low = lower_bound[yr-1] if lower_bound[yr-1] > 0 else 1.0
-        r_low = (lower_bound[yr] + cashout - contrib) / prev_low - 1
-        lower_annual_returns.append(round(float(r_low), 6))
+        expected_annual_returns.append(round(r_mean, 6))
+        upper_annual_returns.append(round(r_mean + r_std * 0.8, 6)) 
+        lower_annual_returns.append(round(r_mean - r_std * 0.8, 6))
+
+    # 6. Calculate Per-Segment Stats
+    segment_stats = []
+    for seg in segments:
+        start_yr, end_yr = seg["horizon_years"]
+        seg_returns = path_returns[:, start_yr:end_yr]
+        if seg_returns.size > 0:
+            mean_ret = float(np.mean(seg_returns))
+            std_ret = float(np.std(seg_returns))
+            seg_sharpe = (mean_ret - 0.02) / std_ret if std_ret > 0 else 0
+            segment_stats.append({
+                "expected_return": round(mean_ret * 100, 2),
+                "volatility": round(std_ret * 100, 2),
+                "sharpe_ratio": round(float(seg_sharpe), 2)
+            })
+        else:
+            segment_stats.append({"expected_return": 0, "volatility": 0, "sharpe_ratio": 0})
 
     return {
-        "years": years,
-        "expected_path": expected_path,
-        "upper_bound": upper_bound,
-        "lower_bound": lower_bound,
         "expected_annual_returns": expected_annual_returns,
         "upper_annual_returns": upper_annual_returns,
         "lower_annual_returns": lower_annual_returns,
-        "step_balances": step_balances,
-        "cash_out_events": cash_out_events,
-        "goal_annotations": goal_annotations,
-        "portfolio_stats": {
-            "initial_investment": initial_investment,
-            "projected_final_expected": expected_path[-1],
-            "projected_final_upper": upper_bound[-1],
-            "projected_final_lower": lower_bound[-1],
-            "expected_annual_return": round(float(cagr * 100), 2),
-            "annual_volatility": round(float(ann_vol * 100), 2),
-            "sharpe_ratio": round(float(sharpe), 2),
-        },
+        "segment_stats": segment_stats,
     }
 
 # ─── Legacy Wrappers ─────────────────────────────────────────────────────────
@@ -550,9 +468,16 @@ def simulate_portfolio(weights, goals, initial_investment, years):
     # Legacy wrapper for old API
     # We'll adapt it to the multi-horizon format
     segments = [{"horizon_years": (0, years), "weights": weights}]
-    res = simulate_multi_horizon_portfolio(segments, goals, initial_investment)
+    res = simulate_multi_horizon_portfolio(segments, years)
     return {
-        "expected_path": res["expected_path"],
-        "years": res["years"],
-        "step_balances": res.get("step_balances", [])
+        "expected_path": res.get("expected_annual_returns", []),
+        "years": list(range(years)),
+        "step_balances": []
     }
+
+# Eagerly initialize the recommender to reduce first-request latency
+try:
+    logger.info("Eagerly warming up RLRecommender and Market Data...")
+    _RECOMMENDER_INSTANCE = RLRecommender()
+except Exception as e:
+    logger.error(f"Failed to eager-load RLRecommender: {e}")
