@@ -437,11 +437,3 @@ if RL_ASSET_SUBSET_SIZE is not None and RL_ASSET_SUBSET_SIZE < len(all_tickers):
 | Paths per gradient update | 50 | 10 | ~5× |
 | **Ensemble Concurrency** | Sequential (1x) | **Per-Agent Parallel (Nx)** | **~N-core speedup** |
 | **Net training throughput** | ~0.01 it/s | **25+ it/s (Estimated)** | **~2500×+** |
-
----
-
-### 12.9 Dashboard vs. Training Simulation Paths
-A critical distinction was established between the comprehensive simulation pool and the real-time dashboard view:
-- **The Pool:** Every month-end since `SIM_MONTHLY_START_YEAR` (2006) serves as a potential starting point, creating a pool of ~245 historical paths.
-- **The Dashboard:** To ensure UI responsiveness, the `vector_encoder.py` subsamples exactly **20 random paths** from this pool. This provides a representative "risk band" without the latency of calculating the entire historical dataset.
-- **Asymmetry:** The resulting +/- standard deviation bands on the dashboard are naturally asymmetrical because they reflect **compounded wealth** (which is log-normally distributed) and **historical market skewness** (e.g., the 2008 crash or 2020 recovery), providing a more realistic risk profile than symmetrical parametric models.

@@ -534,12 +534,10 @@ def _resolve_simulation_starts(portfolio_returns, start_date=None, start_year_id
         year_val = years[start_year_idx % len(years)]
         return [(portfolio_returns.index.year == year_val).argmax()]
 
-    # Default: one start per month from SIM_MONTHLY_START_YEAR onward
+    # Default: all trading days from SIM_MONTHLY_START_YEAR onward to allow high-fidelity sampling
     recent = portfolio_returns[portfolio_returns.index.year >= SIM_MONTHLY_START_YEAR]
-    month_ends = recent.resample('ME').last().index
-    # Use 'pad' to snap calendar month-ends to the nearest prior trading day
-    indices = portfolio_returns.index.get_indexer(month_ends, method='pad')
-    return [i for i in indices if i >= 0]
+    indices = np.where(portfolio_returns.index >= recent.index[0])[0]
+    return indices.tolist()
 
 
 def _aggregate_path_results(results):

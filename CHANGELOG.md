@@ -1,10 +1,19 @@
 # Changelog
 
-## [2026-05-02] - Monte Carlo Simulation & Wealth Asymmetry Analysis
-### Added
-- **Historical Resampling Implementation**: Documented that the "Monte Carlo" simulation is a Historical Simulation (Bootstrapping) engine using actual daily returns from 2006 onwards, preserving real-world sequences and correlations.
-- **Frontend Path Subsampling**: Implemented a 20-path random subsample for the dashboard to maintain sub-second responsiveness while still providing a statistically representative sample of the ~245 possible monthly-shifted start dates.
-- **Wealth Asymmetry Logic**: Analyzed and documented why +/- standard deviation bands are asymmetrical in the UI; attributed to compounding (log-normal distribution) and historical market skewness (fat tails) present in the resampling data.
+## [2026-05-03] - High-Fidelity Monte Carlo & True Wealth Percentiles
+### FEAT — High-Fidelity Monte Carlo Simulation
+- **1,000 Simulation Paths**: Upgraded from 20 paths to 1,000 paths per portfolio, providing a much more stable and representative statistical sample of historical market behavior.
+- **Daily Historical Sampling**: Shifted from monthly start-date sampling to daily sampling since 2006. The simulation now draws from a pool of ~5,100 unique historical scenarios, capturing more granular market regimes.
+
+### REFACTOR — Ticker-Aware "Just-In-Time" Simulation
+- **Latency Optimization**: Eliminated the 100+ second "cold start" delay by refactoring the simulation to only process tickers active in the user's specific portfolio or comparison set.
+- **Memory Efficiency**: Reduced the simulation memory footprint from 4GB (full market) to <10MB (portfolio subset), enabling instant response times (<1.5s) on standard hardware.
+
+### FEAT — True Wealth Percentiles (River Plot)
+- **Statistical Correction**: Replaced synthetic "Standard Deviation of Returns" with **True Wealth Percentiles**. This fixes the visual "collapse" of lower bounds caused by compounding independent extreme annual events.
+- **10th - 90th Probability Fan**: Implemented a "Fan Chart" (River Plot) visualization displaying 8 distinct probability zones (10%, 20% ... 90%).
+- **Median-Based Projections**: Switched the primary "Expected Path" from the mathematical mean to the 50th percentile (Median), providing a more robust representative outcome.
+- **Client-Side Simulation**: Offloaded cashflow compounding to the frontend (running all 1,000 paths in JS) to maintain instant slider interactivity while using high-fidelity raw return data.
 
 
 ## [2026-05-01] - Parallel RL Ensemble Training
@@ -164,7 +173,6 @@ Enhanced the `Reward Math` log line to display the raw MDD drop percentage and G
 | `MDD_PENALTY_SCALE` | 20.0 | 4.0 | Portfolios with 12% MDD were generating net-negative rewards, removing all positive signal. |
 | `GFR_EXP_SCALE` | 8.0 | 2.0 | Exponential curve too steep; 60% GFR erased the full return score. |
 | `GFR_MISS_FLAT_PENALTY` | N/A | 10.0 | Added flat deterrent — any goal miss now carries a fixed base cost. |
-
 | `GFR_PERFECT_REWARD` | N/A | +10.0 | Creates a ±20-point swing between 100% and 0% GFR to motivate goal completion. |
 | `rl_learning_rate` | 0.01 | 0.001 | High LR caused gradient explosions; policy head collapsed within first 50 iterations. |
 

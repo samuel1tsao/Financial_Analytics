@@ -43,12 +43,10 @@ function SimTooltip({ active, payload, label }) {
       ))}
 
       <div style={{ marginTop: '0.6rem', paddingTop: '0.4rem', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-        <p style={{ color: 'rgba(139,92,246,0.8)', fontSize: '0.75rem' }}>
-          Best Case: {fmt(d.upper)}
-        </p>
-        <p style={{ color: 'rgba(239,68,68,0.7)', fontSize: '0.75rem' }}>
-          Worst Case: {fmt(d.lower)}
-        </p>
+        <p style={{ color: 'rgba(139,92,246,0.95)', fontSize: '0.75rem', marginBottom: '0.1rem' }}>40th-60th Range: {fmt(d.p40)} – {fmt(d.p60)}</p>
+        <p style={{ color: 'rgba(139,92,246,0.85)', fontSize: '0.75rem', marginBottom: '0.1rem' }}>30th-70th Range: {fmt(d.p30)} – {fmt(d.p70)}</p>
+        <p style={{ color: 'rgba(139,92,246,0.75)', fontSize: '0.75rem', marginBottom: '0.1rem' }}>20th-80th Range: {fmt(d.p20)} – {fmt(d.p80)}</p>
+        <p style={{ color: 'rgba(139,92,246,0.65)', fontSize: '0.75rem' }}>10th-90th Range: {fmt(d.p10)} – {fmt(d.p90)}</p>
       </div>
     </div>
   );
@@ -205,8 +203,26 @@ export default function DashboardMain() {
     };
 
     const expectedPath = runPath(baseSim.expected_annual_returns || [], true);
-    const upperBound = runPath(baseSim.upper_annual_returns || [], false);
-    const lowerBound = runPath(baseSim.lower_annual_returns || [], false);
+    
+    // True Percentile Calculation
+    const percentiles = [10, 20, 30, 40, 50, 60, 70, 80, 90];
+    const percentilePaths = {};
+    percentiles.forEach(p => percentilePaths[`p${p}`] = []);
+
+    if (baseSim.raw_paths && baseSim.raw_paths.length > 0) {
+      const allWealthPaths = baseSim.raw_paths.map(pathReturns => runPath(pathReturns, false));
+      
+      for (let yr = 0; yr <= totalYears; yr++) {
+        const balancesForYear = allWealthPaths.map(p => p[yr]).sort((a, b) => a - b);
+        percentiles.forEach(p => {
+          const idx = Math.floor((p / 100) * balancesForYear.length);
+          percentilePaths[`p${p}`].push(balancesForYear[Math.min(idx, balancesForYear.length - 1)]);
+        });
+      }
+    } else {
+      // Fallback
+      percentiles.forEach(p => percentilePaths[`p${p}`] = expectedPath);
+    }
 
     const goalAnnotations = goals.map(g => ({
       year: g.years,
@@ -225,17 +241,16 @@ export default function DashboardMain() {
     return {
       ...baseSim,
       years: Array.from({ length: totalYears + 1 }, (_, i) => i),
-      expected_path: expectedPath,
-      upper_bound: upperBound,
-      lower_bound: lowerBound,
+      expected_path: percentilePaths.p50, // Use Median as Expected
+      ...percentilePaths,
       step_balances: stepBalances,
       cash_out_events: cashOutEvents.sort((a,b) => a.year - b.year),
       goal_annotations: goalAnnotations,
       portfolio_stats: {
         ...(baseSim.portfolio_stats || {}),
-        projected_final_expected: finalExp,
-        projected_final_upper: upperBound.length > 0 ? upperBound[upperBound.length - 1] : 0,
-        projected_final_lower: lowerBound.length > 0 ? lowerBound[lowerBound.length - 1] : 0,
+        projected_final_expected: percentilePaths.p50[percentilePaths.p50.length - 1],
+        projected_final_upper: percentilePaths.p90[percentilePaths.p90.length - 1],
+        projected_final_lower: percentilePaths.p10[percentilePaths.p10.length - 1],
         expected_annual_return: (isNaN(cagr) || !isFinite(cagr)) ? "0.00" : cagr.toFixed(2),
       },
       segment_stats: baseSim.segment_stats,
@@ -410,8 +425,15 @@ export default function DashboardMain() {
       const row = {
         year: yr,
         expected: activeSimulation.expected_path[i],
-        upper: activeSimulation.upper_bound[i],
-        lower: activeSimulation.lower_bound[i],
+        p10: activeSimulation.p10[i],
+        p20: activeSimulation.p20[i],
+        p30: activeSimulation.p30[i],
+        p40: activeSimulation.p40[i],
+        p50: activeSimulation.p50[i],
+        p60: activeSimulation.p60[i],
+        p70: activeSimulation.p70[i],
+        p80: activeSimulation.p80[i],
+        p90: activeSimulation.p90[i],
       };
       
       activeComparisons.forEach(comp => {
@@ -754,9 +776,24 @@ export default function DashboardMain() {
                     <XAxis dataKey="year" stroke="#475569" fontSize={12} tickLine={false} />
                     <YAxis stroke="#475569" fontSize={11} tickLine={false} tickFormatter={fmt} width={65} />
                     <Tooltip content={<SimTooltip />} />
-                    <Area type="monotone" dataKey="upper" name="Best Case" stroke="rgba(34,197,94,0.4)" fill="rgba(34,197,94,0.05)" dot={false} strokeDasharray="4 2" />
-                    <Area type="monotone" dataKey="expected" name="Expected Path" stroke="#3b82f6" strokeWidth={2.5} fill="url(#gradExpected)" dot={false} />
-                    <Area type="monotone" dataKey="lower" name="Worst Case" stroke="rgba(239,68,68,0.4)" fill="rgba(239,68,68,0.05)" dot={false} strokeDasharray="4 2" />
+                    
+                    {/* 10-90% Band */}
+                    <Area type="monotone" dataKey="p90" stroke="none" fill="rgba(139,92,246,0.05)" />
+                    <Area type="monotone" dataKey="p10" stroke="none" fill="rgba(139,92,246,0.05)" />
+                    
+                    {/* 20-80% Band */}
+                    <Area type="monotone" dataKey="p80" stroke="none" fill="rgba(139,92,246,0.1)" />
+                    <Area type="monotone" dataKey="p20" stroke="none" fill="rgba(139,92,246,0.1)" />
+
+                    {/* 30-70% Band */}
+                    <Area type="monotone" dataKey="p70" stroke="none" fill="rgba(139,92,246,0.15)" />
+                    <Area type="monotone" dataKey="p30" stroke="none" fill="rgba(139,92,246,0.15)" />
+
+                    {/* 40-60% Band */}
+                    <Area type="monotone" dataKey="p60" stroke="none" fill="rgba(139,92,246,0.2)" />
+                    <Area type="monotone" dataKey="p40" stroke="none" fill="rgba(139,92,246,0.2)" />
+                    
+                    <Area type="monotone" dataKey="expected" name="Median Path" stroke="#3b82f6" strokeWidth={3} fill="url(#gradExpected)" dot={false} />
                     
                     {activeComparisons.map((comp, idx) => {
                       const colors = ['#f59e0b', '#10b981', '#ec4899', '#8b5cf6', '#06b6d4'];

@@ -348,18 +348,33 @@ def simulate_multi_horizon_portfolio(
 
     total_years = projection_years
 
-    # 1. Build Simulation Cache
-    base_returns = recommender.drip_daily_returns if recommender.drip_daily_returns is not None else recommender.daily_returns
-    sim_cache, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns, max_horizon_years=total_years)
+    # 1. Identify active tickers across all segments
+    active_tickers = set()
+    for seg in segments:
+        if isinstance(seg.get("weights"), dict):
+            for t in seg["weights"].keys():
+                active_tickers.add(t)
     
-    # 2. Determine start dates for Monte Carlo (use monthly-shifted pool)
+    active_tickers = [t for t in active_tickers if t in recommender.daily_returns.columns]
+    if not active_tickers:
+        # Fallback to S&P 500 if no valid tickers found (to avoid crash)
+        active_tickers = ["VOO"] if "VOO" in recommender.daily_returns.columns else [recommender.daily_returns.columns[0]]
+
+    # 2. Extract only required daily returns
+    base_returns = recommender.drip_daily_returns if recommender.drip_daily_returns is not None else recommender.daily_returns
+    filtered_returns = base_returns[active_tickers]
+    
+    # 3. Build a Mini-Cache (Fast!)
+    sim_cache, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(filtered_returns, max_horizon_years=total_years)
+    
+    # 4. Determine start dates for Monte Carlo (use high-fidelity starts)
     sim_starts = _resolve_simulation_starts(clean_returns)
     if len(sim_starts) == 0:
         return {"error": "Insufficient historical data for simulation paths"}
 
-    # Take a sample of paths for performance
+    # Take 1000 paths for high fidelity
     rng = np.random.default_rng(42)
-    num_paths = min(len(sim_starts), 20)
+    num_paths = min(len(sim_starts), 1000)
     sim_starts = rng.choice(sim_starts, size=num_paths, replace=False)
     
     # 3. Pre-process segment weights into year-indexed arrays for speed
@@ -392,18 +407,11 @@ def simulate_multi_horizon_portfolio(
     wa_broad = year_weight_arrays.reshape(1, total_years, num_assets)
     path_returns = np.sum(selected_returns * wa_broad, axis=2)
 
-    # 5. Calculate Raw Portfolio Growth Rates for frontend recalculation
-    expected_annual_returns = []
-    upper_annual_returns = []
-    lower_annual_returns = []
+    # 6. Prepare raw paths for frontend percentile calculation
+    raw_paths = np.round(path_returns, 6).tolist()
     
-    for yr in range(total_years):
-        r_mean = float(np.mean(path_returns[:, yr]))
-        r_std = float(np.std(path_returns[:, yr]))
-        
-        expected_annual_returns.append(round(r_mean, 6))
-        upper_annual_returns.append(round(r_mean + r_std * 0.8, 6)) 
-        lower_annual_returns.append(round(r_mean - r_std * 0.8, 6))
+    # Still send a basic expected return array just in case it's needed for fallback
+    expected_annual_returns = [round(float(np.mean(path_returns[:, yr])), 6) for yr in range(total_years)]
 
     # 6. Calculate Per-Segment Stats
     segment_stats = []
@@ -423,9 +431,8 @@ def simulate_multi_horizon_portfolio(
             segment_stats.append({"expected_return": 0, "volatility": 0, "sharpe_ratio": 0})
 
     return {
+        "raw_paths": raw_paths,
         "expected_annual_returns": expected_annual_returns,
-        "upper_annual_returns": upper_annual_returns,
-        "lower_annual_returns": lower_annual_returns,
         "segment_stats": segment_stats,
     }
 
