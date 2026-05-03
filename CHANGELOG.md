@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026-05-02] - Monte Carlo Simulation & Wealth Asymmetry Analysis
+### Added
+- **Historical Resampling Implementation**: Documented that the "Monte Carlo" simulation is a Historical Simulation (Bootstrapping) engine using actual daily returns from 2006 onwards, preserving real-world sequences and correlations.
+- **Frontend Path Subsampling**: Implemented a 20-path random subsample for the dashboard to maintain sub-second responsiveness while still providing a statistically representative sample of the ~245 possible monthly-shifted start dates.
+- **Wealth Asymmetry Logic**: Analyzed and documented why +/- standard deviation bands are asymmetrical in the UI; attributed to compounding (log-normal distribution) and historical market skewness (fat tails) present in the resampling data.
+
+
 ## [2026-05-01] - Parallel RL Ensemble Training
 ### Added
 - **Process-Based Parallelism**: Migrated the RL ensemble training from threads to `multiprocessing.Process` to achieve true hardware parallelism and bypass GIL limitations.
@@ -157,6 +164,7 @@ Enhanced the `Reward Math` log line to display the raw MDD drop percentage and G
 | `MDD_PENALTY_SCALE` | 20.0 | 4.0 | Portfolios with 12% MDD were generating net-negative rewards, removing all positive signal. |
 | `GFR_EXP_SCALE` | 8.0 | 2.0 | Exponential curve too steep; 60% GFR erased the full return score. |
 | `GFR_MISS_FLAT_PENALTY` | N/A | 10.0 | Added flat deterrent — any goal miss now carries a fixed base cost. |
+
 | `GFR_PERFECT_REWARD` | N/A | +10.0 | Creates a ±20-point swing between 100% and 0% GFR to motivate goal completion. |
 | `rl_learning_rate` | 0.01 | 0.001 | High LR caused gradient explosions; policy head collapsed within first 50 iterations. |
 
