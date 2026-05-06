@@ -158,7 +158,9 @@ Closing the loop end-to-end.
 | **Nonlinear vs. Linear Decay** | Matches professional "Target Date Fund" logic. | Harder to explain math to non-technical users. |
 | **Autoencoder vs. GRU/LSTM** | Feedforward autoencoder with per-year snapshots avoids sequence-length sensitivity and trains faster on ~1,500 assets × ~20 years. Milestone horizons capture temporal structure without recurrence. | Loses intra-year sequential patterns; cannot model regime transitions within a year. See 11.8. |
 | **SAFE_STATIC features only** | Prevents data poisoning: backtesting uses TODAY's snapshot for all historical years. Only time-invariant features (sector, state, industry) avoid leakage. | Loses potentially useful signals (P/E, beta, margins). Accepted trade-off for backtest integrity. See 11.7. |
-| **`fullTimeEmployees` vs. `marketCap`** | Market cap = price × shares (changes daily). Employee count is a stable company-size proxy that doesn't leak future price information. | Employee count changes annually, so it's an approximation. Classified `SLOW_CHANGING` with acknowledged risk. |
+| **Block Bootstrapping vs. Chronological** | Bootstrapping 1-year blocks from the full 20-year cache increases regime diversity and prevents the model from overfitting to a specific historical sequence. | Can lose longer-term cyclical dependencies (>1 year). |
+| **Recency-Weighted Sampling** | Exponential decay probabilities (10y half-life) ensure the model prioritizes modern market dynamics while still learning from 2008-style crashes. | Reduces the statistical weight of early-2000s data. |
+| **Dynamic Top-K Thresholding** | Replaces static limits with a relative threshold (10% of max weight). Allows portfolio size to adapt to market confidence. | Makes UI layout more fluid as asset counts fluctuate. |
 | **Configurable Hidden Layers** | `ml_hidden_layers: [128, 64, 32]` allows architecture tuning via dashboard config. Input dimension (~224) requires gradual compression to 8-dim embedding. | Deeper networks risk overfitting on ~30k training samples. Mitigated by masked loss + z-score normalization. |
 
 ---
@@ -169,23 +171,6 @@ Closing the loop end-to-end.
 *   **9.3 Reinforcement Learning Allocator:** Formulate allocation as an MDP (State, Action, Reward) using PPO/DDPG.
 *   **9.4 Regime-Switching Monte Carlo:** Use Hidden Markov Models (HMM) to simulate prolonged bear/bull regimes.
 *   **9.5 Multi-Phase "Waterfall" Allocation:** (Active) Sequence multiple single-goal inferences to handle complex multi-goal users via the dual-head policy (Pre-Goal $W_1 \to$ Pre-Goal $W_2 \to$ Post-Goal $W_n$).
-
----
-
-## 13. Multi-Phase Waterfall Allocation (Engineering Spec)
-
-To handle users with multiple goals using the dual-head RL model, we implement a **Waterfall Schedule**. This decouples the complex multi-objective optimization into a sequence of atomic, goal-specific strategy shifts.
-
-### 13.1 Inference Flow
-For a user with goals at $T_1, T_2, \dots, T_n$:
-1.  **Iterative Scoring:** Run the RL Transformer $n$ times, once for each goal condition $(T_i, Amount_i)$.
-2.  **Head Selection:** 
-    *   For the $i$-th goal period $[T_{i-1}, T_i]$, select the `pre-goal` weights from Inference $i$.
-    *   For the final terminal period $[T_n, 30]$, select the `post-goal` weights from Inference $n$.
-3.  **Result:** A weight schedule $S = \{ (0, W_{pre,1}), (T_1, W_{pre,2}), \dots, (T_n, W_{post,n}) \}$.
-
-### 13.2 Simulation Support
-The `_sim_worker.py` engine is updated to accept a weight dictionary keyed by year. At the start of each simulated year, if `year` exists in the schedule, the active `weight_array` is updated. This allows the backtester to evaluate the "Waterfall" performance on original multi-goal profiles while the model only ever has to learn "single-goal funding" and "general growth."
 
 ---
 
@@ -202,13 +187,10 @@ The `_sim_worker.py` engine is updated to accept a weight dictionary keyed by ye
 ### 11.3 Time-Decayed Sample Weighting
 *   **Chosen:** Exponential Decay Half-Life (configurable, default 10 years) for training samples.
 *   **Rationale:** Financial markets undergo structural regime changes (pre/post-2008 regulatory shifts, rise of algorithmic trading, COVID-era monetary policy). A model trained uniformly on 2001–2024 data treats a 2002 sample identically to a 2022 sample, despite fundamentally different market microstructures. Time-decay ensures the model prioritizes modern dynamics while still learning from historical crashes.
-*   **Implementation:** Each training sample generated from backtest year $y$ receives a weight:
-    $$w(y) = 2^{\,-(y_{\max} - y) \,/ \,\lambda}$$
-    where $\lambda$ is the half-life (default 10 years) and $y_{\max}$ is the most recent year. This means:
-    *   Samples from the most recent year: weight = **1.0**
-    *   Samples from 10 years ago: weight = **0.5**
-    *   Samples from 20 years ago: weight = **0.25**
-*   **Integration with Masked Weighted MSE:** The per-sample time-decay weight is multiplied into the existing horizon-weighted loss, creating a compound weighting: `total_weight = horizon_weight × time_decay_weight`. This preserves the near-term prediction emphasis from Section 11.2 while adding temporal recency bias.
+*   **Implementation:** Each training sample generated from backtest year $y$ receives a weight or sampling probability:
+    $$p(y) \propto 2^{\,-(y_{\max} - y) \,/ \,\lambda}$$
+    where $\lambda$ is the half-life. **Aggressive Recency Bias:** The half-life is set to **3 years** to ensure that decade-old anomalies (e.g., 2015 spikes) do not dominate current projections.
+*   **Block Bootstrapping:** To maximize statistical variance during training, the simulator constructs each 30-year path by drawing 30 independent 1-year blocks from the cache, weighted by the decay probabilities. This prevents the agent from simply memorizing the exact sequence of 2008 -> 2009.
 *   **Configurable via Dashboard:** `ml_time_decay_half_life` parameter (set to `null` to disable and revert to uniform weighting for ablation studies).
 
 ### 11.4 Missing Token Imputation & Feature Safety Classification
@@ -246,10 +228,10 @@ The original plan specified a feedforward autoencoder. During implementation, we
 *   **Why we pivoted:** The autoencoder struggled to capture intricate temporal dynamics, sequence of returns, and the "progression of time" inherent in financial data. A Transformer, utilizing a 5-year sliding context window (1260 daily tokens) and positional embeddings, natively understands sequence and volatility clustering.
 *   **Performance Trade-off:** While computationally heavier to train initially, the Transformer embeddings proved vastly superior at representing an asset's market behavior. By pairing this with persistent caching, we eliminated the inference bottleneck, passing rich, context-aware dense vectors to the downstream RL agent.
 
-### 11.10 Reward Function: Annual Simple Return vs. CAGR
-*   **Rejected (CAGR):** Compounding Annual Growth Rate proved mathematically unstable for RL gradients. When portfolios had heavy withdrawals or went bankrupt, CAGR suffered from division-by-zero errors or produced massive, exponential reward spikes that destroyed the training gradient.
-*   **Chosen (Annualized Simple Return):** We shifted the objective function to `Total Profit = ETV + Actual Withdrawals - Start Capital`, yielding an `Annual Return = (Total Profit / Start Capital) / Horizon`. 
-*   **Why it works:** This creates a smooth, linear gradient. Critically, by tracking *actual* cash withdrawals instead of *target* goals, it correctly punishes the agent for going bankrupt early. Combined with exponential Goal Fulfillment Rate (GFR) and Max Drawdown (MDD) penalties, the agent is forced to balance high-growth capital generation with strict risk management.
+### 11.10 Reward Function: Geometric CAGR vs. Simple Return
+*   **Rejected (Simple Average):** Arithmetic mean of multipliers (Terminal Wealth / Start Capital / Horizon) was mathematically unstable. It allowed "lottery ticket" paths (e.g., a 1,000,000x multiplier from sampled spikes) to generate astronomical rewards that dwarfed all risk penalties.
+*   **Chosen (Geometric CAGR):** We shifted to the **Compound Annual Growth Rate**: `CAGR = (Mean_Market_Mult ^ (1/Horizon)) - 1`.
+*   **Why it works:** This creates a smooth, linear gradient in annualized space. By squashing exponential wealth growth into a stable annual percentage, it ensures that **Volatility Penalties** (scaled to annual standard deviation) can properly balance and reject hyper-volatile anomalies. Critically, it decouples investment performance measurement from cash flow mechanics.
 
 ### 11.9 Multi-Horizon Input Feature Expansion & Lifespan Truncation
 Instead of providing the autoencoder with just a 1-year trailing snapshot of `hist_momentum` and `hist_volatility`, the model inputs are expanded into **multi-dimensional vectors** that perfectly mirror the `ml_target_horizons` (e.g., [1, 3, 5, 10, 15] years). The model is given the 1-year, 3-year, 5-year, 10-year, and 15-year trailing backward averages for both return and volatility at every historical snapshot.
@@ -268,19 +250,15 @@ Instead of providing the autoencoder with just a 1-year trailing snapshot of `hi
 
 ## 12. RL Training Findings & Engineering Considerations
 
-This section documents empirical discoveries made during live RL training that informed architectural and reward-function changes. These are not theoretical trade-offs — they are observed failure modes and their proven fixes.
-
----
-
 ### 12.1 Reward Function Tuning History
 
 | Constant | Original Value | Final Value | Rationale |
 | :--- | :--- | :--- | :--- |
-| `MDD_PENALTY_SCALE` | 20.0 | 4.0 | At 20.0, even low-MDD (~12%) portfolios generated net-negative rewards, eliminating any positive signal for the agent. |
-| `GFR_EXP_SCALE` | 8.0 | 2.0 | The exponential curve was too steep — a 60% GFR would wipe out the entire return component. |
-| `GFR_MISS_FLAT_PENALTY` | 0.0 | 10.0 | Added a flat base deterrent so any goal miss carries a fixed cost regardless of how close the agent got. |
-| `GFR_PERFECT_REWARD` | 0.0 | +10.0 | Creates a ±20 point swing between perfect and zero GFR, giving the agent a clear signal to chase 100% goal fulfillment. |
-| `rl_learning_rate` | 0.01 | 0.001 | High LR caused gradient explosions after early bad samples, collapsing the policy head within the first 50 iterations. |
+| `CAGR_REWARD_SCALE` | 100.0 | 200.0 | Returns were too small compared to penalties; agent became overly risk-averse. |
+| `MDD_PENALTY_SCALE` | 4.0 | 2.0 | High-volatility growth assets were being unfairly penalized during exploration. |
+| `VOL_PENALTY_SCALE` | 0.0 | 50.0 | Introduced to penalize "spiky" non-continuous returns, encouraging consistent growth. |
+| `GFR_BRACKETS (0.0)` | -30.0 | -100.0 | Increased failure penalty to prevent the agent from "safely failing" to avoid volatility. |
+| `rl_learning_rate` | 0.01 | 0.001 | High LR caused gradient explosions; policy head collapsed within first 50 iterations. |
 
 ---
 
@@ -298,142 +276,77 @@ capital *= (1 + yr_return)             # Real cash balance (used for withdrawals
 capital, bankrupt, goal_log = _process_goal_withdrawal(capital, year, goals)
 ```
 
----
-
 ### 12.3 Bankruptcy Type Taxonomy
-
-**Problem discovered:** The simulation treated two fundamentally different failure modes as identical — both reported `max_drawdown = 1.0` and `ETV = 0`:
-
-- **Market Collapse:** The portfolio lost its value through market returns alone (e.g., position in a stock that went to zero).
-- **Goal Bankrupt:** The market performed fine, but the withdrawal target exceeded the current capital (e.g., a $25k portfolio trying to pay a $30k Year-3 goal).
-
-Setting `max_drawdown = 1.0` for Goal Bankrupt paths was incorrect — the market hadn't collapsed, so the MDD penalty was falsely punishing the agent for what was purely a GFR problem (already captured by the GFR penalty).
-
-**Solution:** Each bankrupt path is now tagged with a `bankrupt_reason` ("goal" or "market"). Only `market` bankruptcies are assigned `max_drawdown = 1.0`. `goal` bankruptcies return the actual market-measured drawdown from `market_multiplier`.
-
-**Logs now display:** `Failures: 5/5 Goal Bankrupt` or `Failures: 3/5 Market Collapse, 2/5 Goal Bankrupt` for full observability.
-
----
+**Problem discovered:** The simulation treated two fundamentally different failure modes as identical. Only `market` bankruptcies are assigned `max_drawdown = 1.0`. `goal` bankruptcies return the actual market-measured drawdown from `market_multiplier`.
 
 ### 12.4 Empty Portfolio Collapse (Policy Pruning Bug)
+**Solution:** The training loop now detects all-zero weight arrays before calling `_run_single_sim_path` and immediately appends a max-penalty result without running the simulation.
 
-**Problem discovered:** When the policy's softmax distributes weight across the full ~6,500 asset universe, each individual weight is ~0.015%, well below `MIN_ACTIVE_WEIGHT = 1%`. The `active_mask` was all-False, `full_weights` stayed all-zeros, and the simulator was called with a zero-weight array. Because `np.dot(zeros, returns) = 0`, capital never changed, and the portfolio inevitably went bankrupt at the first withdrawal goal. This manifested as "ALL ASSETS PRUNED (Empty Portfolio)" in the logs but generated a *misleading* negative reward rather than a proper max-penalty signal.
+### 12.5 Non-IPO Asset Exclusion
+**Solution:** Implemented `src_key_padding_mask` for the Transformer encoder and `masked_fill(-1e9)` on `raw_action` to ensure non-IPO assets do not influence the policy.
 
-**Solution:** The training loop now detects all-zero weight arrays before calling `_run_single_sim_path` and immediately appends a max-penalty result (`bankrupt=True, MDD=1.0, ETV=0, GFR=0`) without running the simulation. This gives REINFORCE an honest, strong negative gradient specifically tied to the uniform-distribution policy, teaching the agent to concentrate weight.
-
-**Lesson:** Always guard for the degenerate empty-portfolio case *in the training loop*, not just in the evaluator. The training path calling `_run_single_sim_path` directly bypassed the `evaluate_portfolio_member_c` guard that handled this case.
-
----
-
-### 12.5 Non-IPO Asset Exclusion in the Transformer
-
-**Problem raised:** Should assets that had not yet IPO'd be masked from the Transformer's attention, or is setting their weight to 0 sufficient?
-
-**Finding:** Setting non-IPO weights to 0 alone is insufficient — the Transformer's Self-Attention mechanism still attends to those token positions, allowing them to influence the representation of valid assets. Proper exclusion requires both:
-1. A `src_key_padding_mask` passed to the Transformer encoder (marks invalid positions so they are excluded from key/value computation in attention).
-2. A `masked_fill(-1e9)` on `raw_action` before softmax (ensures the Gaussian sample for that asset is zeroed out in the final weight vector).
-
-Both are currently implemented in `_rl_worker.py` and confirmed active.
-
----
-
-### 12.6 Sigma Floor for Exploration Stability
-
-**Problem observed:** With a sufficiently negative reward signal and a high learning rate, the `sigma_head` can be driven to output near-zero variance. Once `sigma → 0`, the Gaussian policy becomes effectively deterministic (always outputs `mu`). If `mu` at that point concentrates on a single asset, the agent locks in a degenerate single-asset portfolio with no way to recover exploration.
-
-**Solution:** The `sigma` output is clamped with a hard floor:
-```python
-sigma = F.softplus(self.sigma_head(out).squeeze(-1)) + 0.5
-```
-The `+ 0.5` ensures a minimum exploration noise of 0.5 regardless of what the network learns, preserving the agent's ability to sample diverse portfolios throughout training.
-
----
+### 12.6 Sigma Floor
+**Solution:** Clamped `sigma` output: `sigma = F.softplus(self.sigma_head(out).squeeze(-1)) + 0.5` to preserve exploration.
 
 ### 12.7 Reward Math Log Transparency
-
-All training logs now display the full reward decomposition including raw percentages, making it straightforward to correlate each penalty component with its cause:
-
-```
--> Reward Math: Return (23.54) - MDD (8.2% drop → 3.12) - GFR (0.0% miss → 0.000) + Bonus (10.000) = 30.42
-```
-
-The `+ Bonus (10.000)` term only appears when `GFR = 100%`, making perfect-goal-fulfillment runs immediately identifiable in training logs.
-
----
+Logs now include `+ Bonus` indicators for perfect GFR, making performance tracking visual in the training logs.
 
 ### 12.8 Training Throughput Optimizations
+The simulation pipeline was optimized using `np.dot` caches and `joblib` parallelization, moving from ~0.01 it/s to 25+ it/s.
 
-Three architectural changes, implemented incrementally, combined to increase RL training throughput from ~0.01 it/s (original per-episode loop with full Pandas simulation) to sustained **1+ it/s** — a ~100× improvement. Each optimization is independent and can be toggled via `_constants.py`.
+### 12.9 Dynamic Top-K vs. Empty Portfolio (The DECISIVE Policy)
+**Problem discovered:** A static `TOP_K_ASSETS` limit forced the agent to always pick 10 assets, even if it only had confidence in 3.
 
----
+**Solution:** **Relative Dynamic Thresholding**.
+1. Calculate `max_weight` across all assets.
+2. Keep any asset where `weight >= 0.1 * max_weight`.
+3. Apply `DIVERSITY_PENALTY_SCALE` to the reward.
 
-#### 12.8.1 Annual Simulation Cache (`build_simulation_cache`)
+This creates "Decisiveness Pressure": the agent pays a tax for every asset it adds, driving the agent toward a concentrated, "High-Conviction" variety of assets.
 
-**File:** `_sim_worker.py`
+### 12.10 The Desperation Factor (Hail Mary Mechanics)
+**Problem:** The agent was mathematically incentivized to choose "Safe Failure" (failing the goal with low volatility) because the Volatility Penalty was larger than the Goal Failure Penalty.
+**Solution:** Introduced a **Desperation Multiplier**. If the user's goal requires aggressive growth (Required CAGR > 10%), the agent dynamically suppresses Volatility and MDD penalties. This allows "Hail Mary" strategies where the agent aggressively pursues bursts of growth when it is the *only* path to goal fulfillment.
 
-**Before:** Each simulation path called `_extract_yearly_chunk()` which used Pandas `.iloc` slicing and `.prod()` to compute annual returns on-the-fly for every year × every asset. With 50 paths × 30 years × 6,600 assets, this dominated training time.
-
-**After:** `build_simulation_cache()` runs once at startup and pre-computes a numpy array of annual compound returns for every `(start_index, year, asset)` triple:
-
-```python
-one_plus_ret = 1.0 + clean_returns.values   # Convert to numpy once
-cache[start_idx] = year_returns              # shape: (30, num_assets)
-```
-
-The entire simulation inner loop collapses to:
-```python
-yr_return = np.dot(weight_array, precomputed_returns[year - 1])
-```
-
-**Cache dimensions:** `136 start indices × 30 years × 6,601 assets`
-
-**Impact:** Eliminated all per-step Pandas overhead. Simulation cost per path reduced from ~100ms to <1ms.
+### 12.11 Upside Winsorization (Outlier Management)
+**Problem:** A single historical anomaly (e.g., +10,000% spike from a reverse split) could be sampled multiple times in the bootstrapping engine, creating an "Infinite Money" illusion.
+**Solution:** Implemented hard **Upside Winsorization** at **+500%** (6.0x) in the simulation cache. This clips extreme anomalies while preserving legitimate high-growth clusters (e.g., NVDA best years). Consistent "bursters" are now favored over one-off anomalies.
 
 ---
 
-#### 12.8.2 Random Asset Subset Sampling (`RL_ASSET_SUBSET_SIZE`)
+## 13. Multi-Phase Waterfall Allocation (Engineering Spec)
 
-**File:** `_rl_worker.py`, `_constants.py`
+To handle users with multiple goals using the dual-head RL model, we implement a **Waterfall Schedule**. This decouples the complex multi-objective optimization into a sequence of atomic, goal-specific strategy shifts.
 
-**Before:** All ~6,500 assets were fed through the Transformer at every training iteration. Transformer Self-Attention is O(N²), making each forward pass expensive.
+### 13.1 Inference Flow
+For a user with goals at $T_1, T_2, \dots, T_n$:
+1.  **Iterative Scoring:** Run the RL Transformer $n$ times, once for each goal condition $(T_i, Amount_i)$.
+2.  **Head Selection:** 
+    *   For the $i$-th goal period $[T_{i-1}, T_i]$, select the `pre-goal` weights from Inference $i$.
+    *   For the final terminal period $[T_n, 30]$, select the `post-goal` weights from Inference $n$.
+3.  **Result:** A weight schedule $S = \{ (0, W_{pre,1}), (T_1, W_{pre,2}), \dots, (T_n, W_{post,n}) \}$.
 
-**After:** Each iteration randomly samples `RL_ASSET_SUBSET_SIZE = 500` assets. The Transformer processes only this subset. Subset indices are re-drawn every iteration (with `np.sort` to maintain stable ordering), ensuring full universe coverage over time.
-
-```python
-if RL_ASSET_SUBSET_SIZE is not None and RL_ASSET_SUBSET_SIZE < len(all_tickers):
-    subset_idx = np.random.choice(len(all_tickers), size=RL_ASSET_SUBSET_SIZE, replace=False)
-    subset_idx = np.sort(subset_idx)   # keep asset order stable
-```
-
-**Impact:**
-- Attention compute reduced by ~169× per step (`(6500/500)² ≈ 169`)
-- Per-asset gradient signal strengthened ~13× (gradient distributed over 500 vs 6,500 assets)
-- Forces generalization: the policy must learn from feature patterns (sector, volatility profile, embedding similarity) rather than memorizing specific ticker positions since the asset set changes every step
-
-**Configuration:** Set `RL_ASSET_SUBSET_SIZE = None` in `_constants.py` to disable and use the full universe.
+### 13.2 Simulation Support
+The `_sim_worker.py` engine is updated to accept a weight dictionary keyed by year. At the start of each simulated year, if `year` exists in the schedule, the active `weight_array` is updated.
 
 ---
 
-#### 12.8.4 Per-Agent Parallelization Optimization (`joblib`)
+## 14. Explainable AI & Rationale Generation
 
-**File:** `_rl_worker.py`
+To improve user trust and transparency, the inference pipeline includes a **Rationale Engine** that explains the "why" behind every recommendation.
 
-**Before:** Simulations were parallelized at the path level ($N$ agents $\times$ $P$ paths = tasks). Because individual simulations are now hyper-fast (<1ms), the IPC (Inter-Process Communication) overhead of serializing the 6,601-element weight vector 30+ times per step was becoming the primary bottleneck.
+### 14.1 Categorization Logic
+Assets are categorized based on their assigned weight:
+*   **>20%**: "High-conviction primary holding"
+*   **10-20%**: "Core portfolio allocation"
+*   **5-10%**: "Strategic diversifier"
+*   **<5%**: "Tactical exposure"
 
-**After:** Parallel execution is now batched **per agent**. Each of the $N$ agents is a single joblib task. The worker process receives the weight vector once, loops through the $P$ paths internally, and aggregates the results before returning only the final metrics/reward to the main process.
+### 14.2 Behavioral Reasoning
+The engine uses historical volatility (`hist_volatility`) to explain the asset's role in the specific goal horizon:
+*   **High Volatility (>40%)**: Selected for "high-variance growth potential to overcome funding shortfalls."
+*   **Low Volatility (<15%)**: Providing "crucial downside protection and stability."
+*   **Moderate Volatility**: Offering "balanced risk-adjusted compounding."
 
-**Impact:** 
-- **Drastic Overhead Reduction:** Reduces IPC serialization frequency by $P$ times (e.g., from 30 tasks to 3 tasks).
-- **Streamlined Workflow:** Training throughput increased further, enabling larger ensembles without IPC congestion.
-
----
-
-#### Combined Effect Summary
-
-| Component | Before | After | Speedup |
-| :--- | :--- | :--- | :--- |
-| Simulation per path | Pandas `.iloc` + `.prod()` (~100ms) | `np.dot` on cached numpy (<1ms) | ~100× |
-| Transformer input size | ~6,500 assets (full universe) | 500 assets (random subset) | ~169× (attention) |
-| Paths per gradient update | 50 | 10 | ~5× |
-| **Ensemble Concurrency** | Sequential (1x) | **Per-Agent Parallel (Nx)** | **~N-core speedup** |
-| **Net training throughput** | ~0.01 it/s | **25+ it/s (Estimated)** | **~2500×+** |
+### 14.3 Multi-Goal Sensitivity
+The rationales change based on the waterfall segment. A stock might be a "Strategic diversifier" in a 5-year house goal but shift to a "High-conviction primary holding" in the 30-year Growth Phase, reflecting the RL agent's temporal adaptability.

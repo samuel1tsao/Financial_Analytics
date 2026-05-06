@@ -259,6 +259,7 @@ export default function DashboardMain() {
 
   let weights = {};
   let segments = [];
+  let rationales = {};
   let hardConstraints = new Set();
   let startCap = 100000;
   let monthlyContrib = 500;
@@ -288,12 +289,15 @@ export default function DashboardMain() {
       segments = data;
       const currentSeg = segments[activeSegmentIdx] || segments[0];
       weights = currentSeg?.weights || {};
+      rationales = currentSeg?.rationales || {};
     } else if (data && data.segments) {
       segments = data.segments;
       const currentSeg = segments[activeSegmentIdx] || segments[0];
       weights = currentSeg?.weights || {};
+      rationales = currentSeg?.rationales || {};
     } else {
       weights = data || {};
+      rationales = {};
     }
   }
 
@@ -434,6 +438,14 @@ export default function DashboardMain() {
         p70: activeSimulation.p70[i],
         p80: activeSimulation.p80[i],
         p90: activeSimulation.p90[i],
+        band_80_90: [activeSimulation.p80[i], activeSimulation.p90[i]],
+        band_70_80: [activeSimulation.p70[i], activeSimulation.p80[i]],
+        band_60_70: [activeSimulation.p60[i], activeSimulation.p70[i]],
+        band_50_60: [activeSimulation.p50[i], activeSimulation.p60[i]],
+        band_40_50: [activeSimulation.p40[i], activeSimulation.p50[i]],
+        band_30_40: [activeSimulation.p30[i], activeSimulation.p40[i]],
+        band_20_30: [activeSimulation.p20[i], activeSimulation.p30[i]],
+        band_10_20: [activeSimulation.p10[i], activeSimulation.p20[i]],
       };
       
       activeComparisons.forEach(comp => {
@@ -777,21 +789,17 @@ export default function DashboardMain() {
                     <YAxis stroke="#475569" fontSize={11} tickLine={false} tickFormatter={fmt} width={65} />
                     <Tooltip content={<SimTooltip />} />
                     
-                    {/* 10-90% Band */}
-                    <Area type="monotone" dataKey="p90" stroke="none" fill="rgba(139,92,246,0.05)" />
-                    <Area type="monotone" dataKey="p10" stroke="none" fill="rgba(139,92,246,0.05)" />
-                    
-                    {/* 20-80% Band */}
-                    <Area type="monotone" dataKey="p80" stroke="none" fill="rgba(139,92,246,0.1)" />
-                    <Area type="monotone" dataKey="p20" stroke="none" fill="rgba(139,92,246,0.1)" />
+                    {/* Upper Bands */}
+                    <Area type="monotone" dataKey="band_80_90" stroke="none" fill="rgba(139,92,246,0.05)" />
+                    <Area type="monotone" dataKey="band_70_80" stroke="none" fill="rgba(139,92,246,0.15)" />
+                    <Area type="monotone" dataKey="band_60_70" stroke="none" fill="rgba(139,92,246,0.30)" />
+                    <Area type="monotone" dataKey="band_50_60" stroke="none" fill="rgba(139,92,246,0.50)" />
 
-                    {/* 30-70% Band */}
-                    <Area type="monotone" dataKey="p70" stroke="none" fill="rgba(139,92,246,0.15)" />
-                    <Area type="monotone" dataKey="p30" stroke="none" fill="rgba(139,92,246,0.15)" />
-
-                    {/* 40-60% Band */}
-                    <Area type="monotone" dataKey="p60" stroke="none" fill="rgba(139,92,246,0.2)" />
-                    <Area type="monotone" dataKey="p40" stroke="none" fill="rgba(139,92,246,0.2)" />
+                    {/* Lower Bands */}
+                    <Area type="monotone" dataKey="band_40_50" stroke="none" fill="rgba(139,92,246,0.50)" />
+                    <Area type="monotone" dataKey="band_30_40" stroke="none" fill="rgba(139,92,246,0.30)" />
+                    <Area type="monotone" dataKey="band_20_30" stroke="none" fill="rgba(139,92,246,0.15)" />
+                    <Area type="monotone" dataKey="band_10_20" stroke="none" fill="rgba(139,92,246,0.05)" />
                     
                     <Area type="monotone" dataKey="expected" name="Median Path" stroke="#3b82f6" strokeWidth={3} fill="url(#gradExpected)" dot={false} />
                     
@@ -1104,6 +1112,11 @@ export default function DashboardMain() {
                         transition: 'width 0.5s ease',
                       }} />
                     </div>
+                    {rationales[ticker] && (
+                      <div style={{ marginTop: '0.75rem', fontSize: '0.7rem', color: '#94a3b8', lineHeight: 1.4, fontStyle: 'italic' }}>
+                        "{rationales[ticker]}"
+                      </div>
+                    )}
                   </div>
                 ))}
             </div>

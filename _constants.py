@@ -90,34 +90,35 @@ GFR_OBJECTIVE_THRESHOLD = 0.90
 # RL REWARD FUNCTION CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════
 
-# Growth: CAGR is multiplied by this to convert to reward points (10% CAGR → 10 pts)
-CAGR_REWARD_SCALE         = 100.0
+# Growth: CAGR is multiplied by this to convert to reward points (10% CAGR → 20 pts)
+CAGR_REWARD_SCALE         = 200.0
 
 # Drawdown: MDD is multiplied by this before being scaled by the risk factor
-MDD_PENALTY_SCALE         = 4.0
+MDD_PENALTY_SCALE         = 2.0
+
+# Volatility / Consistency: Penalizes spiky, non-continuous returns (e.g. one-time massive spikes)
+VOL_PENALTY_SCALE         = 50.0
 
 # Risk factor: penalty_multiplier = (MAX_RISK_OFFSET - user_risk_tolerance)
-# Risk 1 → multiplier 10 | Risk 10 → multiplier 1
+# Risk 1 -> multiplier 10 | Risk 10 -> multiplier 1
 MAX_RISK_OFFSET           = 11.0
 
 # GFR bracketed penalty/reward structure (Success Rate over N paths)
-# 1.0 -> +10 | 0.8 -> 0 | 0.6 -> -5 | 0.4 -> -10 | 0.2 -> -20 | 0.0 -> -30
-GFR_BRACKETS = [
-    (1.0,  10.0),
-    (0.8,   0.0),
-    (0.6,  -5.0),
-    (0.4, -10.0),
-    (0.2, -20.0),
-    (0.0, -30.0)
+GFR_BRACKETS              = [
+    (0.00, -100.0),   # 0% success (certain failure) -> Flat penalty
+    (0.50, -20.0),    # 50% success -> Mild penalty
+    (0.85,   0.0),    # 85% success -> Neutral
+    (1.00,  10.0)     # 100% success -> Bonus
 ]
 GFR_MISS_FLAT_PENALTY     = 0.0     # (Deprecated in favor of GFR_BRACKETS)
 GFR_PERFECT_REWARD        = 10.0    # (Explicit bonus for 1.0)
 
 # Number of top assets to select by weight — used consistently in BOTH training and evaluation.
-# Replaces the old MIN_ACTIVE_WEIGHT threshold, which caused a train/eval mismatch:
-# training used top-K fallback while evaluation used a hard weight cutoff.
-TOP_K_ASSETS              = 10
+# Replaces the old static TOP_K_ASSETS limit with a dynamic relative threshold.
+RELATIVE_WEIGHT_THRESHOLD = 0.1   # Keep assets >= 10% of the max weight
+MAX_DYNAMIC_ASSETS        = 20    # Ceiling for safety
 MIN_ACTIVE_WEIGHT         = 0.001   # kept only for display/log filtering
+DIVERSITY_PENALTY_SCALE   = 0.5   # Penalty per active asset in reward
 
 # Random asset subset size per training iteration.
 # Instead of presenting all ~6500 assets to the Transformer every step, we sample a random
@@ -203,7 +204,7 @@ DEFAULT_PIPELINE_CONFIG = {
     "rl_dropout": 0.1,
     "rl_learning_rate": 0.001,
     "rl_episodes": 10000000,
-    "rl_force_rebuild": False,
+    "rl_force_rebuild": True,
     "rl_initial_mu_bias": 0.0,
     "rl_checkpoint_frequency": 10,
     "sim_paths_per_episode": 50,          # (Legacy) Number of start-dates for full evaluation
@@ -239,7 +240,7 @@ DEFAULT_PIPELINE_CONFIG = {
     # Simulation & Thresholds
     # -----------------------
     "sim_glide_path_tau": 8.0,
-    "sim_cvar_percentile": None,            # None = mean of ALL paths (recommended). Set to e.g. 20 to use CVaR worst-20% instead.
+    "sim_cvar_percentile": 20,              # 20 = use CVaR worst-20% for MDD penalty. None = mean.
 
     # -----------------------
     # Validation & Splitting

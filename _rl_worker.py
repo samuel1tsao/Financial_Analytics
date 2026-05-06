@@ -4,9 +4,8 @@ _rl_worker.py
 Member D: RL-Driven Transformer Portfolio Optimizer.
 
 Architecture:
-    PortfolioTransformerRL — Transformer with dual Gaussian policy heads:
-        - Pre-goal head:  allocation before the goal withdrawal year
-        - Post-goal head: growth-phase allocation after the goal is met/missed
+    PortfolioTransformerRL — Transformer with single Gaussian policy head:
+        - Shared head for all horizons, conditioned by user profile
     train_rl_agent — Stochastic REINFORCE with per-step gradient updates
 
 Optimizations:
@@ -35,7 +34,8 @@ from _constants import (
     SIM_TERMINAL_HORIZON,
     WF_SNAPSHOTS_PER_EPISODE,
     MIN_ACTIVE_WEIGHT,
-    TOP_K_ASSETS,
+    RELATIVE_WEIGHT_THRESHOLD,
+    MAX_DYNAMIC_ASSETS,
     RL_ASSET_SUBSET_SIZE,
     decompose_profiles,
 )
@@ -46,6 +46,7 @@ from _sim_worker import (
     _run_single_sim_path,
     _aggregate_path_results,
     _compute_reward,
+    calculate_decay_probabilities,
 )
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -63,12 +64,10 @@ _CATEGORICAL_PREFIXES = ["sector", "industry", "state", "quoteType", "exchange"]
 
 class PortfolioTransformerRL(nn.Module):
     """
-    Transformer with dual Gaussian policy heads for two-phase allocation.
+    Transformer with single Gaussian policy head.
 
-    Both heads share the same transformer backbone (cross-asset attention),
-    but produce independent (mu, sigma) outputs:
-        - Pre-goal head:  conservative allocation to fund near-term goals
-        - Post-goal head: aggressive growth allocation after goal withdrawal
+    Uses cross-asset attention to produce (mu, sigma) outputs:
+        - Optimized for current goal/horizon specified in the user condition.
     """
     def __init__(self, input_dim, config):
         super().__init__()
@@ -93,34 +92,24 @@ class PortfolioTransformerRL(nn.Module):
         initial_bias  = config.get("rl_initial_mu_bias", -0.1)
         initial_sigma = config.get("rl_initial_sigma_bias", 1.0)
 
-        # Pre-goal policy head (may learn conservative allocations for short horizons)
-        self.mu_head_pre    = nn.Linear(self.d_model, 1)
-        self.sigma_head_pre = nn.Linear(self.d_model, 1)
-        nn.init.constant_(self.mu_head_pre.bias, initial_bias)
-        nn.init.constant_(self.sigma_head_pre.bias, initial_sigma)
-
-        # Post-goal policy head (growth-phase allocation after goal is met/missed)
-        self.mu_head_post    = nn.Linear(self.d_model, 1)
-        self.sigma_head_post = nn.Linear(self.d_model, 1)
-        nn.init.constant_(self.mu_head_post.bias, initial_bias)
-        nn.init.constant_(self.sigma_head_post.bias, initial_sigma)
+        # Single policy head
+        self.mu_head    = nn.Linear(self.d_model, 1)
+        self.sigma_head = nn.Linear(self.d_model, 1)
+        nn.init.constant_(self.mu_head.bias, initial_bias)
+        nn.init.constant_(self.sigma_head.bias, initial_sigma)
 
     def forward(self, x, src_key_padding_mask=None):
         """
         x: (batch, num_assets, input_dim)
-        Returns: (mu_pre, sigma_pre), (mu_post, sigma_post)
-            each mu/sigma is (batch, num_assets)
+        Returns: (mu, sigma) each (batch, num_assets)
         """
         h   = F.relu(self.input_proj(x))
         out = self.transformer(h, src_key_padding_mask=src_key_padding_mask)
 
-        mu_pre    = self.mu_head_pre(out).squeeze(-1)
-        sigma_pre = F.softplus(self.sigma_head_pre(out).squeeze(-1)) + 0.5
+        mu    = self.mu_head(out).squeeze(-1)
+        sigma = F.softplus(self.sigma_head(out).squeeze(-1)) + 0.5
 
-        mu_post    = self.mu_head_post(out).squeeze(-1)
-        sigma_post = F.softplus(self.sigma_head_post(out).squeeze(-1)) + 0.5
-
-        return (mu_pre, sigma_pre), (mu_post, sigma_post)
+        return mu, sigma
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,29 +153,71 @@ def _softmax_normalize_top_k(samp, mask):
     return F.softmax(samp, dim=-1)
 
 
-def _run_agent_simulations_batch(w_pre, w_post, path_indices, sim_cache, clean_returns, profile):
+def _run_agent_simulations_batch(w_pre, bootstrap_indices, sim_cache, clean_returns_values, profile, cvar_percentile=None):
     """
-    Joblib worker function to run all requested simulation paths for a single agent,
-    aggregate the results, and return just the final metrics and reward.
-    This dramatically reduces IPC serialization overhead by passing the weight 
-    vectors only once per agent, rather than once per path.
+    ULTRA-FAST vectorized simulation batch runner.
+    Bypasses the sequential Python loops of _run_single_sim_path.
+    Calculates ETV, MDD, and GFR for all paths in a single NumPy pass.
+    
+    bootstrap_indices: (n_paths, goal_year) - pre-sampled indices from cache
     """
-    agent_res = []
-    goal_year = profile.get('goal_year')
-    for idx in path_indices:
-        # Note: clean_returns here is a NumPy array (clean_returns.values)
-        res = _run_single_sim_path(
-            idx, w_pre, sim_cache, clean_returns, profile['start_cap'], 
-            profile['goals'], "loop", SIM_TERMINAL_HORIZON, False, "",
-            post_goal_weights=w_post, goal_year=goal_year
-        )
-        agent_res.append(res)
+    cache_array, _ = sim_cache
+    
+    goal_year = profile.get('goal_year', SIM_TERMINAL_HORIZON)
+    # 1. Gather annual returns for these paths using bootstrapping
+    # bootstrap_indices shape: (n_paths, goal_year)
+    # cache_array shape: (num_starts, num_assets)
+    # batch_rets shape: (n_paths, goal_year, num_assets)
+    batch_rets = cache_array[bootstrap_indices[:, :goal_year], :]
+    
+    # 2. Compute annual portfolio returns via vectorized dot product
+    # Shape: (n_paths, goal_year)
+    ann_rets = np.dot(batch_rets, w_pre)
+    
+    # 3. Calculate capital trajectory and market multiplier
+    # Shape: (n_paths, goal_year)
+    market_mults = np.cumprod(1.0 + ann_rets, axis=1)
+    
+    # 4. Handle goal withdrawal
+    start_cap = profile['start_cap']
+    goal_amt  = profile['goals'].get(goal_year, 0.0)
+    
+    # Terminal capital BEFORE withdrawal
+    term_cap_pre = start_cap * market_mults[:, -1]
+    final_cap    = term_cap_pre - goal_amt
+    
+    bankrupt = final_cap < 0
+    actual_wds = np.where(bankrupt, np.maximum(term_cap_pre, 0.0), goal_amt)
+    
+    # 5. MDD calculation (pure NumPy)
+    running_peak = np.maximum.accumulate(market_mults, axis=1)
+    running_peak = np.maximum(running_peak, 1.0) # start peak is 1.0
+    drawdowns = (running_peak - market_mults) / running_peak
+    max_drawdowns = np.max(drawdowns, axis=1)
+    
+    # 6. Aggregate results
+    gfr = np.mean(~bankrupt)
+    etv = np.mean(final_cap)
+    aw  = np.mean(actual_wds)
+    mean_market_mult = float(np.mean(market_mults[:, -1]))
+
+    if cvar_percentile is not None:
+        sorted_mdds = np.sort(max_drawdowns)
+        n_cvar = max(1, int(len(sorted_mdds) * (cvar_percentile / 100.0)))
+        mdd = float(np.mean(sorted_mdds[-n_cvar:]))
+    else:
+        mdd = float(np.mean(max_drawdowns))
         
-    gfr, etv, mdd, aw, goal_f, market_f = _aggregate_path_results(agent_res)
+    path_vols = np.std(ann_rets, axis=1)
+    mean_annual_vol = float(np.mean(path_vols))
+    
     metrics = {
-        "GFR": gfr, "ETV": etv, "MDD": mdd, "AW": aw,
-        "GoalFails": goal_f, "MarketFails": market_f,
-        "Total_Simulations": len(path_indices)
+        "GFR": float(gfr), "ETV": float(etv), "MDD": mdd, "AW": float(aw),
+        "Annual_Vol": mean_annual_vol,
+        "Mean_Market_Mult": mean_market_mult,
+        "GoalFails": int(np.sum(bankrupt)), "MarketFails": 0,
+        "Total_Simulations": bootstrap_indices.shape[0],
+        "Active_Assets": int(np.sum(w_pre > 0))
     }
     reward = _compute_reward(metrics, profile)
     return reward, metrics
@@ -312,7 +343,6 @@ def build_rl_dataset(dataset, user_profile, config, specific_embeddings=None):
 def _run_episode_walkforward(agent, dataset, profile, config, wf_snapshots, debug_path=False, sim_cache_bundle=None):
     """
     One Walk-Forward episode: sample historical snapshots, compute reward per regime.
-    Updated for dual-head architecture (pre-goal + post-goal weights).
     Returns (mean_reward, total_log_prob) for REINFORCE update.
     """
     all_dates     = list(wf_snapshots.keys())
@@ -333,26 +363,25 @@ def _run_episode_walkforward(agent, dataset, profile, config, wf_snapshots, debu
         if pit_x.numel() == 0:
             continue
 
-        (mu_pre, sigma_pre), (mu_post, sigma_post) = agent(pit_x)
-        weights_pre, lp_pre   = sample_portfolio_weights(mu_pre, sigma_pre)
-        weights_post, lp_post = sample_portfolio_weights(mu_post, sigma_post)
+        mu, sigma = agent(pit_x)
+        weights, lp = sample_portfolio_weights(mu, sigma)
 
         reward, metrics = simulate_rl_environment_step(
-            weights_pre.detach().cpu().numpy(), pit_tickers,
+            weights.detach().cpu().numpy(), pit_tickers,
             dataset, profile, config, start_date=date_str, debug_path=debug_path,
             sim_cache_bundle=sim_cache_bundle
         )
         rewards.append(reward)
-        log_probs.append(lp_pre.sum() + lp_post.sum())
+        log_probs.append(lp.sum())
         last_metrics = metrics
-        last_weights = weights_pre.detach().cpu().numpy()
+        last_weights = weights.detach().cpu().numpy()
         last_tickers = pit_tickers
 
     return rewards, log_probs, last_metrics, last_weights, last_tickers
 
 
 def _greedy_evaluate_fast(agents, emb_matrix, static_matrix, tickers, user_profile):
-    """Run a deterministic (greedy) evaluation using ensemble average. Returns both phase dicts."""
+    """Run a deterministic (greedy) evaluation using ensemble average. Returns weight dict."""
     if not isinstance(agents, list):
         agents = [agents]
         
@@ -361,21 +390,17 @@ def _greedy_evaluate_fast(agents, emb_matrix, static_matrix, tickers, user_profi
         
     with torch.no_grad():
         tensor_x = _build_rl_input_fast(emb_matrix, static_matrix, user_profile)
-        mu_pre_sum, mu_post_sum = 0, 0
+        mu_sum = 0
         for a in agents:
-            (mu_pre, _), (mu_post, _) = a(tensor_x)
-            mu_pre_sum += mu_pre
-            mu_post_sum += mu_post
+            mu, _ = a(tensor_x)
+            mu_sum += mu
             
-        mu_pre_avg = mu_pre_sum / len(agents)
-        mu_post_avg = mu_post_sum / len(agents)
+        mu_avg = mu_sum / len(agents)
+        greedy = F.softmax(mu_avg, dim=-1)
         
-        greedy_pre  = F.softmax(mu_pre_avg, dim=-1)
-        greedy_post = F.softmax(mu_post_avg, dim=-1)
-        
-    pre_dict  = {tickers[i]: float(greedy_pre[0, i]) for i in range(len(tickers))}
-    post_dict = {tickers[i]: float(greedy_post[0, i]) for i in range(len(tickers))}
-    return pre_dict, post_dict
+    weights_dict = {tickers[i]: float(greedy[0, i]) for i in range(len(tickers))}
+    # Return twice for compatibility with multi-horizon callers
+    return weights_dict, weights_dict
 
 
 def get_rl_transformer_filename_base(config, input_dim):
@@ -416,10 +441,15 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
         print(f"  Data loaded. {len(all_tickers)} assets.")
 
         # ── Build Simulation Cache (each process builds its own) ──────────
-        print(f"  Building simulation cache...")
+        print(f"  Building simulation cache (1-Year Blocks)...")
         cache_array, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns, max_horizon_years=30)
         sim_cache = (cache_array, start_idx_to_pos)
         sim_start_pool = np.array(_resolve_simulation_starts(clean_returns))
+        
+        # Precompute decay probabilities for the entire pool
+        start_dates = clean_returns.index[sim_start_pool]
+        decay_probs = calculate_decay_probabilities(start_dates, half_life_years=3.0)
+        
         num_columns = len(clean_returns.columns)
         valid_col_indices = np.array([column_to_idx.get(t, -1) for t in all_tickers])
         valid_ticker_mask = valid_col_indices >= 0
@@ -500,43 +530,64 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             base_x   = _build_rl_input_fast(sub_emb, sub_static, profile)
             tensor_x = base_x.expand(1, -1, -1)
 
-            path_indices = rng.choice(all_starts, size=n_paths, replace=False)
+            # Sample bootstrapping indices for all paths in this step
+            # bootstrap_indices shape: (n_paths, SIM_TERMINAL_HORIZON)
+            bootstrap_indices = rng.choice(len(sim_start_pool), size=(n_paths, SIM_TERMINAL_HORIZON), replace=True, p=decay_probs)
+
+            # For masking, we use the first year of each path (approximate)
+            path_starts = sim_start_pool[bootstrap_indices[:, 0]]
             safe_col_indices = np.where(sub_ticker_mask, sub_col_indices, 0)
             src_key_padding_mask = ~torch.from_numpy(
-                is_active_matrix[path_indices[0:1]][:, safe_col_indices]
+                is_active_matrix[path_starts[0:1]][:, safe_col_indices]
             ).to(device)
 
-            (mu_pre, sigma_pre), (mu_post, sigma_post) = agent(tensor_x, src_key_padding_mask=src_key_padding_mask)
-            dist_pre  = torch.distributions.Normal(mu_pre,  F.softplus(sigma_pre))
-            dist_post = torch.distributions.Normal(mu_post, F.softplus(sigma_post))
-            samp_pre  = dist_pre.rsample()
-            samp_post = dist_post.rsample()
+            mu, sigma = agent(tensor_x, src_key_padding_mask=src_key_padding_mask)
+            dist  = torch.distributions.Normal(mu, F.softplus(sigma))
+            samp  = dist.rsample()
 
-            weights_pre  = _softmax_normalize_top_k(samp_pre,  sub_ticker_mask)
-            weights_post = _softmax_normalize_top_k(samp_post, sub_ticker_mask)
-            w_pre_np  = weights_pre[0].detach().cpu().numpy()
-            w_post_np = weights_post[0].detach().cpu().numpy()
+            weights  = _softmax_normalize_top_k(samp, sub_ticker_mask)
+            w_np  = weights[0].detach().cpu().numpy()
 
             def _build_full_weights(w_np):
                 vi = np.where(sub_ticker_mask)[0]
                 if len(vi) == 0: return np.zeros(num_columns)
-                k = min(TOP_K_ASSETS, len(vi))
-                top_k_local = vi[np.argsort(w_np[vi])[-k:]]
-                top_w = w_np[top_k_local].copy()
+                
+                # Dynamic top K selection
+                valid_w = w_np[vi]
+                max_w = np.max(valid_w)
+                threshold = max_w * RELATIVE_WEIGHT_THRESHOLD
+                
+                # Identify candidates above threshold
+                rel_vi = vi[valid_w >= threshold]
+                
+                # Sort candidates by weight descending
+                sorted_idx = np.argsort(w_np[rel_vi])[::-1]
+                top_vi = rel_vi[sorted_idx[:MAX_DYNAMIC_ASSETS]]
+                
+                # Normalize the selection
+                top_w = w_np[top_vi].copy()
                 if top_w.sum() > 0: top_w /= top_w.sum()
+                
+                # Apply MIN_ACTIVE_WEIGHT
                 keep = top_w > MIN_ACTIVE_WEIGHT
                 if not keep.any(): keep[:] = True
-                sel = top_k_local[keep]; sel_w = top_w[keep]
+                
+                sel = top_vi[keep]
+                sel_w = top_w[keep]
+                
                 cp = sub_col_indices[sel]
-                fw = np.zeros(num_columns); fw[cp] = sel_w
+                fw = np.zeros(num_columns)
+                fw[cp] = sel_w
+                
                 if fw.sum() > 0: fw /= fw.sum()
                 return fw
 
-            full_pre  = _build_full_weights(w_pre_np)
-            full_post = _build_full_weights(w_post_np)
+            full_pre  = _build_full_weights(w_np)
 
+            cvar_pct = config.get("sim_cvar_percentile")
             reward, metrics = _run_agent_simulations_batch(
-                full_pre, full_post, path_indices, sim_cache, clean_returns_values, profile
+                full_pre, bootstrap_indices, sim_cache, clean_returns_values, profile,
+                cvar_percentile=cvar_pct
             )
 
             if it == start_iter:
@@ -544,7 +595,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             else:
                 baseline = 0.99 * baseline + 0.01 * float(reward)
 
-            lp_sum = dist_pre.log_prob(samp_pre).mean() + dist_post.log_prob(samp_post).mean()
+            lp_sum = dist.log_prob(samp).mean()
             loss = -lp_sum * (reward - baseline)
             optimizer.zero_grad()
             loss.backward()
@@ -593,29 +644,31 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             if it % verbose_every == 0 or it == start_iter + iterations - 1:
                 elapsed = time.time() - t0
                 ips = (it - start_iter + 1) / elapsed if elapsed > 0 else 0
-                gs = f"Y{profile.get('goal_year','?')}: ${profile.get('goal_amount',0):,.0f}"
+                gs = f"Start: ${profile.get('start_cap',0):,.0f} -> Y{profile.get('goal_year','?')}: ${profile.get('goal_amount',0):,.0f}"
                 print(f"  [Iter {it+1:7d}] Reward: {ep_reward:7.3f} | Baseline: {baseline:7.3f} | {ips:.1f} it/s | {profile['profile_name']} [{gs}]")
                 
                 # Detailed Metrics Breakdown
                 m = metrics
                 rc = m.get("reward_components", {})
+                
+                annual_return = rc.get("annual_return", 0)
                 math_str = (
-                    f"Return: {rc.get('return_score',0):+.2f} | "
+                    f"Return: {annual_return*100:+.1f}% (Score: {rc.get('return_score',0):+.2f}) | "
                     f"MDD_Pen: {rc.get('mdd_penalty',0):.2f} | "
+                    f"Div_Pen: {rc.get('diversity_penalty',0):.2f} | "
                     f"GFR_Contrib: {rc.get('gfr_bonus',0)-rc.get('gfr_penalty',0):+.2f}"
                 )
-                print(f"    -> Math: {math_str} | GFR={m.get('GFR',0):.4f}, MDD={m.get('MDD',0):.4f}")
+                print(f"    -> Math: {math_str} | ETV=${m.get('ETV',0):,.0f}, GFR={m.get('GFR',0):.4f}, MDD={m.get('MDD',0):.4f}")
                 
                 # Top Assets
                 def _get_top_str(fw):
                     idx = np.where(fw > 0)[0]
                     if len(idx) == 0: return "None"
-                    top_idx = idx[np.argsort(fw[idx])[-5:]][::-1] # Top 5
+                    top_idx = idx[np.argsort(fw[idx])][::-1] # All non-zero, sorted
                     tickers_list = clean_returns.columns
-                    return ", ".join([f"{tickers_list[i]}: {fw[i]*100:.1f}%" for i in top_idx])
+                    return " | ".join([f"{tickers_list[i]} ({fw[i]*100:.1f}%)" for i in top_idx])
                 
-                print(f"    -> Assets (Pre):  {_get_top_str(full_pre)}")
-                print(f"    -> Assets (Post): {_get_top_str(full_post)}")
+                print(f"    -> Allocation: {_get_top_str(full_pre)}")
 
         elapsed = time.time() - t0
         print(f"\n  {'='*60}")
