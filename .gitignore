@@ -32,3 +32,4 @@ backend/*.db
 # Cache and temporary
 cache/
 scratch/
+package-lock.json
