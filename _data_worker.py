@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from tqdm.auto import tqdm
+from pandas_datareader import data as web
 
 from _constants import (
     MASTER_FILE, PRICE_FILE, VOLUME_FILE, DIV_CACHE,
@@ -821,3 +822,42 @@ def run_data_diagnostics(master_df, config):
         print(f"  \u2705 All configured features exist in master_df.")
 
     print("=" * 100 + "\n")
+
+def load_cpi(start="2000-01-01"):
+    cpi = web.DataReader("CPIAUCSL", "fred", start)
+    cpi = cpi.dropna()
+    cpi = cpi.sort_index()
+    return cpi
+
+def cpi_to_inflation_rate(cpi_df):
+    inflation = cpi_df.pct_change().dropna()
+    inflation = inflation.rename(columns=lambda x: "inflation_rate")
+    return inflation
+
+def to_annual_inflation(monthly_inflation):
+    annual = (1 + monthly_inflation).resample("YE").apply(
+        lambda x: (1 + x).prod() - 1
+    )
+    annual.index = annual.index.year
+    return annual
+
+def align_inflation_series(annual_inflation, start_year, horizon):
+    years = list(range(start_year, start_year + horizon))
+
+    aligned = []
+    last_val = annual_inflation.iloc[-1].values[0]
+
+    for y in years:
+        if y in annual_inflation.index:
+            aligned.append(annual_inflation.loc[y].values[0])
+        else:
+            aligned.append(last_val)  # fallback
+
+    return np.array(aligned)
+
+def get_annual_inflation_series(start="2000-01-01"):
+    cpi = load_cpi(start)
+    monthly_infl = cpi_to_inflation_rate(cpi)
+    annual_infl = to_annual_inflation(monthly_infl)
+
+    return annual_infl
