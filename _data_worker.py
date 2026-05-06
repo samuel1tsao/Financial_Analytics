@@ -824,17 +824,20 @@ def run_data_diagnostics(master_df, config):
     print("=" * 100 + "\n")
 
 def load_cpi(start="2000-01-01"):
+    """Pull CPIAUCSL dataset from FRED and preprocess"""
     cpi = web.DataReader("CPIAUCSL", "fred", start)
     cpi = cpi.dropna()
     cpi = cpi.sort_index()
     return cpi
 
 def cpi_to_inflation_rate(cpi_df):
+    """Calculates inflation rate from CPI data"""
     inflation = cpi_df.pct_change().dropna()
     inflation = inflation.rename(columns=lambda x: "inflation_rate")
     return inflation
 
 def to_annual_inflation(monthly_inflation):
+    """Converts to an annual inflation rate"""
     annual = (1 + monthly_inflation).resample("YE").apply(
         lambda x: (1 + x).prod() - 1
     )
@@ -842,6 +845,7 @@ def to_annual_inflation(monthly_inflation):
     return annual
 
 def align_inflation_series(annual_inflation, start_year, horizon):
+    """Processes the inflation rates to align with the simulation"""
     years = list(range(start_year, start_year + horizon))
 
     aligned = []
@@ -856,6 +860,7 @@ def align_inflation_series(annual_inflation, start_year, horizon):
     return np.array(aligned)
 
 def get_annual_inflation_series(start="2000-01-01"):
+    """Pipeline function"""
     cpi = load_cpi(start)
     monthly_infl = cpi_to_inflation_rate(cpi)
     annual_infl = to_annual_inflation(monthly_infl)
