@@ -1,44 +1,5 @@
 # Changelog
 
-## [2026-05-05] - Geometric CAGR, Desperation Factor & Outlier Clipping
-
-### FIX — Geometric CAGR Reward Math
-- **Exponential Reward Suppression**: Transitioned from Simple Average Return to **Geometric CAGR** (`Multiplier ^ (1/Horizon) - 1`) for the return-score calculation. This prevents "lottery ticket" paths (e.g., 1,000,000x multiplier) from generating astronomical, un-penalizable reward scores.
-- **Scale Normalization**: Return scores are now properly normalized to a human-readable annualized scale, ensuring that Volatility and MDD penalties remain mathematically significant even for high-growth paths.
-
-### FEAT — The Desperation Factor ("Hail Mary" Logic)
-- **Goal-Aware Risk Suppression**: Implemented dynamic suppression of risk penalties (Volatility and MDD) when a user's goal requires aggressive growth.
-- **Shortfall Scaling**: If the **Required CAGR** to hit a goal exceeds 10%, the `desperation_factor` progressively weakens risk penalties, allowing the RL agent to prioritize goal fulfillment over smoothness in "impossible" funding scenarios.
-- **Harsher Failure Penalties**: Increased the base penalty for 0% Goal Fulfillment Rate (GFR) from `-30` to `-100`, forcing the agent to take the necessary risk to hit the target.
-
-### FEAT — Upside Winsorization (Outlier Clipping)
-- **Outlier Management**: Implemented a hard **+500% (6.0x)** ceiling on 1-year annual returns in the simulation cache (`build_simulation_cache`).
-- **Anomalous Spike Defense**: This prevents the "Bootstrapping Illusion" where a single historical data error or penny-stock pump-and-dump is sampled multiple times, creating unrealistic expectations. Consistent "bursters" (e.g., +100% multiple times) are favored over one-off +10,000% anomalies.
-
-### TUNE — Strict Recency Bias (3-Year Half-Life)
-- **Aggressive Time Decay**: Shortened the exponential sampling half-life from **10.0 years** to **3.0 years**. 
-- **Regime Integrity**: Ensures the simulator's expectations are strictly grounded in modern market behavior. Spikes from 10 years ago are now effectively invisible to the training environment, preventing reliance on obsolete market dynamics.
-
-## [2026-05-04] - Block Bootstrapping, Volatility Penalties & Allocation Rationales
-
-### FEAT — Block Bootstrapping with Recency Bias
-- **Exponential Decay Probabilities**: Implemented a decay-weighted sampling mechanism (`calculate_decay_probabilities`) for Monte Carlo paths. The simulation now prioritizes recent market regimes (10-year half-life) while still sampling historical stress periods.
-- **Bootstrapping Engine**: Replaced chronological-only paths with **Block Bootstrapping**. The simulator now constructs 30-year synthetic trajectories by randomly sampling 1-year historical blocks from the entire 20-year cache, providing much higher regime diversity.
-- **2D Simulation Cache**: Optimized `build_simulation_cache` to store returns in 1-year atomic blocks (`num_starts × num_assets`), enabling flexible bootstrapping and reducing memory overhead.
-
-### FEAT — Consistency-Aware Reward (Volatility Penalty)
-- **Volatility Penalty (`VOL_PENALTY_SCALE = 50.0`)**: Introduced a new component to the RL reward function that penalizes high annual volatility. 
-- **Decisiveness vs. Spikiness**: Complements the Diversification Penalty by ensuring the agent doesn't just pick "spiky" one-hit-wonder assets to maximize CAGR, but instead favors consistent, high-Sharpe growth.
-
-### FEAT — Allocation Rationale Engine
-- **Explainable AI (XAI)**: Implemented an automated rationale generator in the inference pipeline. Every recommended asset now includes a human-readable explanation (e.g., "High-conviction primary holding selected for aggressive capital appreciation").
-- **Volatility-Aware Reasoning**: Rationales are dynamically generated based on the asset's historical volatility and its assigned weight, providing transparency into the RL agent's "thinking."
-
-### REFACTOR — Dynamic Top-K & Reward Re-Balancing
-- **Dynamic Thresholding**: Transitioned from a fixed `TOP_K_ASSETS=10` to a relative threshold (`RELATIVE_WEIGHT_THRESHOLD=0.1`). The portfolio size now dynamically adjusts (up to 20 assets) based on the model's confidence.
-- **Reward Scale Reset**: Re-balanced the reward function to prioritize returns (`CAGR_REWARD_SCALE=200.0`) and goal success (+20 bonus) over pure risk avoidance, preventing the "Safe Asset Trap."
-
-
 ## [2026-05-03] - High-Fidelity Monte Carlo & True Wealth Percentiles
 ### FEAT — High-Fidelity Monte Carlo Simulation
 - **1,000 Simulation Paths**: Upgraded from 20 paths to 1,000 paths per portfolio, providing a much more stable and representative statistical sample of historical market behavior.

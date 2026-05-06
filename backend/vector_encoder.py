@@ -16,8 +16,7 @@ from typing import Any, Dict, List
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from _constants import (
-    DEFAULT_PIPELINE_CONFIG, RELATIVE_WEIGHT_THRESHOLD, MIN_ACTIVE_WEIGHT, MAX_DYNAMIC_ASSETS,
-    SIM_TERMINAL_HORIZON,
+    DEFAULT_PIPELINE_CONFIG, TOP_K_ASSETS, MIN_ACTIVE_WEIGHT, SIM_TERMINAL_HORIZON,
     RISK_NORMALIZER, CAPITAL_NORMALIZER, GOAL_YEAR_NORMALIZER,
     TRADING_DAYS_PER_YEAR, CASH_BUCKET_ANNUAL_RATE, DAILY_RETURN_CLAMP, LOAN_DAILY_RATE,
     CACHE_DIR
@@ -81,27 +80,6 @@ class RLRecommender:
             cls._instance._initialized = False
         return cls._instance
 
-    def _load_state_dict_with_compat(self, model, state_dict):
-        """Maps old dual-head keys (pre/post) to the new single-head architecture."""
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            # 1. Ignore post-goal heads (they are redundant in the single-head architecture)
-            if k.startswith("mu_head_post") or k.startswith("sigma_head_post"):
-                continue
-            # 2. Map pre-goal heads to the new single heads
-            elif k.startswith("mu_head_pre"):
-                new_state_dict[k.replace("mu_head_pre", "mu_head")] = v
-            elif k.startswith("sigma_head_pre"):
-                new_state_dict[k.replace("sigma_head_pre", "sigma_head")] = v
-            # 3. Keep standard names if they already exist (single-head v3+)
-            elif k.startswith("mu_head") or k.startswith("sigma_head"):
-                new_state_dict[k] = v
-            # 4. Keep all other layers (transformer, input_proj)
-            else:
-                new_state_dict[k] = v
-        
-        model.load_state_dict(new_state_dict, strict=True)
-
     def __init__(self):
         if self._initialized:
             return
@@ -137,30 +115,30 @@ class RLRecommender:
             self.dynamic_embeddings = {}
 
         # 2. Load Models (Ensemble)
+        # checkpoint_rl_v2_dm64_nh4_lr001_id226.pt
         checkpoint_name = "checkpoint_rl_v2_dm64_nh4_lr001_id226.pt"
         checkpoint_path = os.path.join(CACHE_DIR, checkpoint_name)
         self.models = []
         
         if os.path.exists(checkpoint_path):
-            input_dim = 226 
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-                
-                if 'agents_state' in checkpoint:
-                    for state in checkpoint['agents_state']:
-                        m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
-                        self._load_state_dict_with_compat(m, state)
-                        m.eval()
-                        self.models.append(m)
-                    logger.info(f"Loaded ensemble of {len(self.models)} RL agents from {checkpoint_path}")
-                elif 'model_state' in checkpoint:
+            input_dim = 226 # Matches the filename id226
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            
+            if 'agents_state' in checkpoint:
+                # Load all agents in the ensemble
+                for state in checkpoint['agents_state']:
                     m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
-                    self._load_state_dict_with_compat(m, checkpoint['model_state'])
+                    m.load_state_dict(state)
                     m.eval()
                     self.models.append(m)
-                    logger.info(f"Loaded single RL agent from {checkpoint_path}")
-            except Exception as e:
-                logger.error(f"Failed to load RL checkpoint: {e}")
+                logger.info(f"Loaded ensemble of {len(self.models)} RL agents from {checkpoint_path}")
+            elif 'model_state' in checkpoint:
+                # Fallback for single-agent checkpoints
+                m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                m.load_state_dict(checkpoint['model_state'])
+                m.eval()
+                self.models.append(m)
+                logger.info(f"Loaded single RL agent from {checkpoint_path}")
         else:
             logger.warning(f"RL checkpoint not found at {checkpoint_path}. Multi-horizon RL disabled.")
 
@@ -205,55 +183,36 @@ class RLRecommender:
             return {}, {}
 
         with torch.no_grad():
-            mu_sum = 0
+            mu_pre_sum = 0
+            mu_post_sum = 0
             for m in self.models:
-                mu, _ = m(x)
-                mu_sum += mu
+                (mu_p, _), (mu_g, _) = m(x)
+                mu_pre_sum += mu_p
+                mu_post_sum += mu_g
             
             # Average the logits across all agents
-            mu_avg = mu_sum / len(self.models)
+            mu_pre = mu_pre_sum / len(self.models)
+            mu_post = mu_post_sum / len(self.models)
             
-            # Duplicate for compatibility (single head now handles both pre/post logic via condition)
-            mu_pre = mu_avg
-            mu_post = mu_avg
+            # Use raw mu directly as done in the training notebook to ensure consistent weights
+            w_pre = F.softmax(mu_pre, dim=-1)[0].cpu().numpy()
+            w_post = F.softmax(mu_post, dim=-1)[0].cpu().numpy()
             
-            # Sharpen logits to match the variance seen during training's exploration sampling (sigma ~ 1.0)
-            # This prevents the softmax from creating an evenly distributed, uniform allocation
-            def sharpen_logits(m, target_std=1.0):
-                std = m.std(dim=-1, keepdim=True)
-                std = torch.clamp(std, min=1e-6)
-                return (m - m.mean(dim=-1, keepdim=True)) / std * target_std
-
-            mu_pre_sharp = sharpen_logits(mu_pre)
-            mu_post_sharp = sharpen_logits(mu_post)
-            
-            w_pre = F.softmax(mu_pre_sharp, dim=-1)[0].cpu().numpy()
-            w_post = F.softmax(mu_post_sharp, dim=-1)[0].cpu().numpy()
-            
-        # 3. Post-process (Dynamic Top-K and thresholding)
+        # 3. Post-process (Top-K pruning and thresholding)
         def _finalize_weights(w_np):
-            if w_np.sum() == 0: return {}
-            
-            # 1. Dynamic Top-K: Keep assets >= RELATIVE_WEIGHT_THRESHOLD of max
-            max_w = np.max(w_np)
-            threshold = max_w * RELATIVE_WEIGHT_THRESHOLD
-            
-            # 2. Sort and filter
+            # Sort and take top K
             idx_sorted = np.argsort(w_np)[::-1]
-            dynamic_idx = [i for i in idx_sorted if w_np[i] >= threshold]
-            
-            # 3. Hard ceiling for safety
-            top_idx = dynamic_idx[:MAX_DYNAMIC_ASSETS]
+            top_idx = idx_sorted[:TOP_K_ASSETS]
             
             final_w = np.zeros_like(w_np)
             final_w[top_idx] = w_np[top_idx]
             
-            # 4. Normalize
+            # Normalize
             if final_w.sum() > 0:
                 final_w /= final_w.sum()
             
-            # 5. Apply min threshold
-            keep = final_w >= MIN_ACTIVE_WEIGHT
+            # Apply min threshold
+            keep = final_w > MIN_ACTIVE_WEIGHT
             if not keep.any(): keep[:] = True
             final_w[~keep] = 0
             if final_w.sum() > 0:
@@ -340,47 +299,10 @@ def encode_multi_horizon(answers: dict) -> dict:
         for t, wt in w_pre.items():
             combined_weights[t] = combined_weights.get(t, 0) + wt * scale
             
-        # Generate rationales
-        rationales = {}
-        for t, wt in combined_weights.items():
-            if t in reserved_weights:
-                rationales[t] = "User-defined custom preference."
-                continue
-                
-            vol = None
-            if recommender and hasattr(recommender, 'master_df') and t in recommender.master_df.index:
-                row = recommender.master_df.loc[t]
-                if 'hist_volatility' in row:
-                    vol = row['hist_volatility']
-            
-            if wt >= 0.20:
-                prefix = "High-conviction primary holding"
-            elif wt >= 0.10:
-                prefix = "Core portfolio allocation"
-            elif wt >= 0.05:
-                prefix = "Strategic diversifier"
-            else:
-                prefix = "Tactical exposure"
-                
-            if vol is not None:
-                if vol > 0.4:
-                    reason = "selected for high-variance growth potential to overcome funding shortfalls."
-                elif vol > 0.25:
-                    reason = "selected for aggressive capital appreciation."
-                elif vol < 0.15:
-                    reason = "providing crucial downside protection and stability."
-                else:
-                    reason = "offering balanced risk-adjusted compounding."
-            else:
-                reason = "optimized by the RL policy for this time horizon."
-                
-            rationales[t] = f"{prefix} {reason}"
-            
         segments.append({
             "horizon_years": (prev_yr, curr_yr),
             "goal_name": g.get("name", f"Goal {i+1}"),
-            "weights": combined_weights,
-            "rationales": rationales
+            "weights": combined_weights
         })
         prev_yr = curr_yr
 
@@ -394,24 +316,10 @@ def encode_multi_horizon(answers: dict) -> dict:
         for t, wt in w_post.items():
             combined_post_weights[t] = combined_post_weights.get(t, 0) + wt * scale
             
-        post_rationales = {}
-        for t, wt in combined_post_weights.items():
-            if t in reserved_weights:
-                post_rationales[t] = "User-defined custom preference."
-                continue
-            
-            if wt >= 0.20:
-                post_rationales[t] = "High-conviction primary holding optimized for long-term terminal growth."
-            elif wt >= 0.10:
-                post_rationales[t] = "Core allocation selected for sustained long-term compounding."
-            else:
-                post_rationales[t] = "Diversifying asset to balance terminal horizon risk."
-            
         segments.append({
             "horizon_years": (prev_yr, SIM_TERMINAL_HORIZON),
             "goal_name": "Growth Phase",
-            "weights": combined_post_weights,
-            "rationales": post_rationales
+            "weights": combined_post_weights
         })
         
     return {
