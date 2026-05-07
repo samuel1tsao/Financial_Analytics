@@ -97,16 +97,20 @@ CAGR_REWARD_SCALE         = 200.0
 MDD_PENALTY_SCALE         = 2.0
 
 # Volatility / Consistency: Penalizes spiky, non-continuous returns (e.g. one-time massive spikes)
-VOL_PENALTY_SCALE         = 50.0
+VOL_PENALTY_SCALE         = 10.0
 
 # Risk factor: penalty_multiplier = (MAX_RISK_OFFSET - user_risk_tolerance)
 # Risk 1 -> multiplier 10 | Risk 10 -> multiplier 1
 MAX_RISK_OFFSET           = 11.0
 
+# Global factor to optionally dampen risk‑related penalties (MDD & Volatility)
+RISK_PENALTY_FACTOR      = 1.0  # Set <1.0 to lessen penalties for high‑risk profiles
+
+
 # GFR bracketed penalty/reward structure (Success Rate over N paths)
 GFR_BRACKETS              = [
-    (0.00, -100.0),   # 0% success (certain failure) -> Flat penalty
-    (0.50, -20.0),    # 50% success -> Mild penalty
+    (0.00, -30.0),    # 0% success (certain failure) -> Flat penalty
+    (0.50, -10.0),    # 50% success -> Mild penalty
     (0.85,   0.0),    # 85% success -> Neutral
     (1.00,  10.0)     # 100% success -> Bonus
 ]
@@ -119,6 +123,7 @@ RELATIVE_WEIGHT_THRESHOLD = 0.1   # Keep assets >= 10% of the max weight
 MAX_DYNAMIC_ASSETS        = 20    # Ceiling for safety
 MIN_ACTIVE_WEIGHT         = 0.001   # kept only for display/log filtering
 DIVERSITY_PENALTY_SCALE   = 0.5   # Penalty per active asset in reward
+DIVERSITY_PENALTY_THRESHOLD = 10  # No penalty until active assets > this value
 
 # Random asset subset size per training iteration.
 # Instead of presenting all ~6500 assets to the Transformer every step, we sample a random
@@ -141,7 +146,8 @@ SIM_MONTHLY_START_YEAR    = 2006
 
 # All single-goal episodes simulate to this terminal horizon
 # (post-goal capital keeps compounding under the growth-phase weights)
-SIM_TERMINAL_HORIZON      = 30
+SIM_TERMINAL_HORIZON_CAP      = 30
+SIM_HORIZON_BUFFER_YEARS      = 1
 
 # Debug: max years to log per path
 DEBUG_LOG_MAX_YEARS       = 5
@@ -241,6 +247,7 @@ DEFAULT_PIPELINE_CONFIG = {
     # -----------------------
     "sim_glide_path_tau": 8.0,
     "sim_cvar_percentile": 20,              # 20 = use CVaR worst-20% for MDD penalty. None = mean.
+    "sim_terminal_horizon_cap": 30,
 
     # -----------------------
     # Validation & Splitting
@@ -307,7 +314,7 @@ TEST_PROFILES = [
 ]
 
 
-def decompose_profiles(profiles=None):
+def decompose_profiles(profiles=None, max_horizon=None):
     """
     Decompose multi-goal profiles into single-goal episodes.
 
@@ -318,6 +325,9 @@ def decompose_profiles(profiles=None):
 
     This lets the RL agent learn the optimal pre-goal/post-goal allocation
     for each specific horizon, rather than trying to satisfy all goals at once.
+
+    If max_horizon is provided, all goal_years are clamped to this value to ensure
+    training stays within the available historical data span.
     """
     if profiles is None:
         profiles = TEST_PROFILES
@@ -325,14 +335,18 @@ def decompose_profiles(profiles=None):
     single_goal_profiles = []
     for p in profiles:
         for year, amount in p["goals"].items():
+            goal_yr = int(year)
+            if max_horizon is not None:
+                goal_yr = min(goal_yr, max_horizon)
+
             single_goal_profiles.append({
-                "profile_name": f"{p['profile_name']} (Y{year})",
+                "profile_name": f"{p['profile_name']} (Y{goal_yr})",
                 "risk_tolerance": p["risk_tolerance"],
                 "start_cap": p["start_cap"],
                 "monthly_contrib": p.get("monthly_contrib", 0),
-                "goal_year": int(year),
+                "goal_year": goal_yr,
                 "goal_amount": float(amount),
-                "goals": {int(year): float(amount)},
+                "goals": {goal_yr: float(amount)},
             })
     return single_goal_profiles
 

@@ -256,9 +256,14 @@ Instead of providing the autoencoder with just a 1-year trailing snapshot of `hi
 | :--- | :--- | :--- | :--- |
 | `CAGR_REWARD_SCALE` | 100.0 | 200.0 | Returns were too small compared to penalties; agent became overly risk-averse. |
 | `MDD_PENALTY_SCALE` | 4.0 | 2.0 | High-volatility growth assets were being unfairly penalized during exploration. |
-| `VOL_PENALTY_SCALE` | 0.0 | 50.0 | Introduced to penalize "spiky" non-continuous returns, encouraging consistent growth. |
+| `VOL_PENALTY_SCALE` | 50.0 | 10.0 | Reduced to prevent over-penalizing reasonable market noise in conservative profiles. |
 | `GFR_BRACKETS (0.0)` | -30.0 | -100.0 | Increased failure penalty to prevent the agent from "safely failing" to avoid volatility. |
 | `rl_learning_rate` | 0.01 | 0.001 | High LR caused gradient explosions; policy head collapsed within first 50 iterations. |
+| `DIVERSITY_THRESHOLD` | 0 | 10 | Introduced to allow broad portfolios (up to 10 assets) before overhead penalties apply. |
+
+### 12.12 Math Observability & Debugging
+**Problem:** The RL agent's loss was often opaque. High negative rewards were difficult to debug without seeing the exact interaction between return scores and risk penalties.
+**Solution:** Implemented **Step-by-Step Math Logging**. Every training step now prints the exact equation used to compute the reward, including the risk-tolerance multipliers and desperation factor adjustments. This allows for real-time verification of the reward landscape.
 
 ---
 

@@ -410,8 +410,9 @@ from _constants import (
     RELATIVE_WEIGHT_THRESHOLD,
     MAX_DYNAMIC_ASSETS,
     DIVERSITY_PENALTY_SCALE,
+    DIVERSITY_PENALTY_THRESHOLD,
     SIM_MONTHLY_START_YEAR,
-    SIM_TERMINAL_HORIZON,
+    SIM_TERMINAL_HORIZON_CAP,
     DEBUG_LOG_MAX_YEARS,
     CAGR_REWARD_SCALE,
     MDD_PENALTY_SCALE,
@@ -432,16 +433,10 @@ def _extract_yearly_chunk(daily_returns, start_idx, year_number):
     chunk_end   = (start_idx + year_number * TRADING_DAYS_PER_YEAR) % n_days
 
     if hasattr(daily_returns, "iloc"):
-        if chunk_end > chunk_start:
-            return daily_returns.iloc[chunk_start:chunk_end]
-        # Wrap around
-        return pd.concat([daily_returns.iloc[chunk_start:], daily_returns.iloc[:chunk_end]])
+        return daily_returns.iloc[chunk_start:chunk_end]
     else:
         # NumPy path
-        if chunk_end > chunk_start:
-            return daily_returns[chunk_start:chunk_end]
-        # Wrap around
-        return np.vstack((daily_returns[chunk_start:], daily_returns[:chunk_end]))
+        return daily_returns[chunk_start:chunk_end]
 
 
 def _update_drawdown(capital, peak, max_drawdown):
@@ -486,7 +481,7 @@ def _blend_portfolio_returns_safe(base_returns, ticker_weights):
 def build_simulation_cache(base_returns, max_horizon_years=30):
     """
     Precompute annual returns for every asset, for every standard simulation start index.
-    Returns: (numpy 2D array cache_array, dict start_idx_to_pos, dataframe clean_returns, dict column_to_idx)
+    Returns: (numpy 2D array cache_array, dict start_idx_to_pos, dataframe clean_returns, dict column_to_idx, int max_sim_years)
     """
     import time
     print(f"[{time.strftime('%H:%M:%S')}] [Member C] Building Annual Simulation Cache (1-Year Blocks)...")
@@ -523,9 +518,14 @@ def build_simulation_cache(base_returns, max_horizon_years=30):
     # Cap maximum 1-year return at +500% (5.0x growth)
     MAX_ANNUAL_RETURN = 5.0
     cache_array = np.clip(cache_array, a_min=-1.0, a_max=MAX_ANNUAL_RETURN)
-            
-    print(f"[{time.strftime('%H:%M:%S')}] [Member C] Cache built: {cache_array.shape} (starts x assets)")
-    return cache_array, start_idx_to_pos, clean_returns, column_to_idx
+
+    # Compute data-derived max horizon
+    from _constants import SIM_HORIZON_BUFFER_YEARS
+    total_span_years = len(clean_returns) // TRADING_DAYS_PER_YEAR
+    max_sim_years = max(1, total_span_years - SIM_HORIZON_BUFFER_YEARS)
+
+    print(f"[{time.strftime('%H:%M:%S')}] [Member C] Cache built: {cache_array.shape} (starts x assets) | Data Horizon: {max_sim_years}y")
+    return cache_array, start_idx_to_pos, clean_returns, column_to_idx, max_sim_years
 
 
 def calculate_decay_probabilities(dates, half_life_years=3.0):
@@ -604,10 +604,10 @@ def _aggregate_path_results(results, cvar_percentile=None):
 def _compute_reward(metrics, user_profile):
     """
     3-part reward: Annual return score – risk-scaled MDD penalty – softened GFR penalty.
-    Horizon is always SIM_TERMINAL_HORIZON (30y) since post-goal capital keeps compounding.
+    Horizon is always clamped to available data span.
     All scaling constants live in _constants.py for easy tuning.
     """
-    horizon    = float(user_profile.get("goal_year", SIM_TERMINAL_HORIZON))
+    horizon    = float(user_profile.get("goal_year", SIM_TERMINAL_HORIZON_CAP))
     risk_tol   = float(user_profile["risk_tolerance"])
     
     # Calculate Required CAGR
@@ -655,7 +655,7 @@ def _compute_reward(metrics, user_profile):
     # 4. Diversity Penalty (Decisiveness Penalty)
     # Count assets that have substantial weight
     active_assets = int(metrics.get("Active_Assets", 0))
-    diversity_penalty = active_assets * DIVERSITY_PENALTY_SCALE
+    diversity_penalty = max(0, active_assets - DIVERSITY_PENALTY_THRESHOLD) * DIVERSITY_PENALTY_SCALE
 
     total_reward = return_score + gfr_contrib - mdd_penalty - vol_penalty - diversity_penalty
     
@@ -666,7 +666,9 @@ def _compute_reward(metrics, user_profile):
         "gfr_penalty": gfr_penalty,
         "gfr_bonus": gfr_bonus,
         "annual_return": annual_return,
-        "diversity_penalty": diversity_penalty
+        "diversity_penalty": diversity_penalty,
+        "required_cagr": required_cagr,
+        "desperation_factor": desperation_factor
     }
 
     return total_reward
@@ -861,7 +863,8 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
 
     # Step 3: Determine simulation start indices
     sim_starts  = _resolve_simulation_starts(clean_returns, start_date, start_year_idx)
-    max_horizon = SIM_TERMINAL_HORIZON if goal_year else (max(user_profile['goals'].keys()) if user_profile['goals'] else 1)
+    max_horizon_requested = goal_year if goal_year else (max(user_profile['goals'].keys()) if user_profile['goals'] else 1)
+    max_horizon = min(max_horizon_requested, max_sim_years)
     start_cap   = user_profile['start_cap']
     
     # Calculate decay probabilities for the entire cache pool (for bootstrapping)

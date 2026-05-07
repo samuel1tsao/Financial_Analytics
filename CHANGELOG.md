@@ -1,5 +1,20 @@
 # Changelog
 
+## [2026-05-06] - Reward Stabilization & Math Observability
+
+### FEAT — Rich Reward "Math" Observability
+- **Equation-Style Logging**: Overhauled RL training logs to display a complete mathematical breakdown: `Reward = Ret + GFR - MDD - Vol - Div`.
+- **Step-by-Step Details**: Added a "Details" line showing exactly how each component was derived (e.g., `Vol = Vol_Metric * Scale * Risk_Multiplier / Desperation`).
+- **ASCII Compatibility**: Resolved `UnicodeEncodeError` on Windows terminals by replacing special characters (→) with ASCII equivalents (->).
+
+### TUNE — Volatility Penalty Normalization
+- **Penalty Scaling**: Lowered `VOL_PENALTY_SCALE` from **50.0** to **10.0** in `_constants.py`. This prevents moderate volatility from completely erasing high returns in low-risk profiles while maintaining the directional signal.
+- **Diversity Thresholding**: Migrated the diversity penalty threshold to a configurable constant `DIVERSITY_PENALTY_THRESHOLD = 10`.
+
+### FIX — Training Loop Crashes
+- **Import Integrity**: Fixed a `NameError` in `_rl_worker.py` by ensuring all reward scaling constants are imported from `_constants.py`.
+- **Encoding Defense**: Fixed a crash in the logging pipeline caused by unsupported unicode characters in standard Windows CMD/PowerShell environments.
+
 ## [2026-05-05] - Geometric CAGR, Desperation Factor & Outlier Clipping
 
 ### FIX — Geometric CAGR Reward Math

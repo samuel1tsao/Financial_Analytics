@@ -31,12 +31,16 @@ from _constants import (
     CAPITAL_NORMALIZER,
     RISK_NORMALIZER,
     GOAL_YEAR_NORMALIZER,
-    SIM_TERMINAL_HORIZON,
+    SIM_TERMINAL_HORIZON_CAP,
     WF_SNAPSHOTS_PER_EPISODE,
     MIN_ACTIVE_WEIGHT,
     RELATIVE_WEIGHT_THRESHOLD,
     MAX_DYNAMIC_ASSETS,
     RL_ASSET_SUBSET_SIZE,
+    CAGR_REWARD_SCALE,
+    MDD_PENALTY_SCALE,
+    VOL_PENALTY_SCALE,
+    MAX_RISK_OFFSET,
     decompose_profiles,
 )
 from _sim_worker import (
@@ -163,7 +167,7 @@ def _run_agent_simulations_batch(w_pre, bootstrap_indices, sim_cache, clean_retu
     """
     cache_array, _ = sim_cache
     
-    goal_year = profile.get('goal_year', SIM_TERMINAL_HORIZON)
+    goal_year = profile.get('goal_year', SIM_TERMINAL_HORIZON_CAP)
     # 1. Gather annual returns for these paths using bootstrapping
     # bootstrap_indices shape: (n_paths, goal_year)
     # cache_array shape: (num_starts, num_assets)
@@ -442,7 +446,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
 
         # ── Build Simulation Cache (each process builds its own) ──────────
         print(f"  Building simulation cache (1-Year Blocks)...")
-        cache_array, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns, max_horizon_years=30)
+        cache_array, start_idx_to_pos, clean_returns, column_to_idx, max_sim_years = build_simulation_cache(base_returns, max_horizon_years=30)
         sim_cache = (cache_array, start_idx_to_pos)
         sim_start_pool = np.array(_resolve_simulation_starts(clean_returns))
         
@@ -503,7 +507,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
         conv_min_delta = config.get("rl_convergence_min_delta", 0.5)
         early_stopping = config.get("rl_early_stopping", False)
 
-        single_goal_profiles = decompose_profiles(TEST_PROFILES)
+        single_goal_profiles = decompose_profiles(TEST_PROFILES, max_horizon=max_sim_years)
 
         subset_str = f"{RL_ASSET_SUBSET_SIZE} assets/iter" if RL_ASSET_SUBSET_SIZE else f"{len(all_tickers)} assets"
         print(f"  STOCHASTIC REINFORCE | {len(single_goal_profiles)} profiles | {subset_str} | {n_paths} paths/step | {iterations} iters")
@@ -531,8 +535,8 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             tensor_x = base_x.expand(1, -1, -1)
 
             # Sample bootstrapping indices for all paths in this step
-            # bootstrap_indices shape: (n_paths, SIM_TERMINAL_HORIZON)
-            bootstrap_indices = rng.choice(len(sim_start_pool), size=(n_paths, SIM_TERMINAL_HORIZON), replace=True, p=decay_probs)
+            # bootstrap_indices shape: (n_paths, max_sim_years)
+            bootstrap_indices = rng.choice(len(sim_start_pool), size=(n_paths, max_sim_years), replace=True, p=decay_probs)
 
             # For masking, we use the first year of each path (approximate)
             path_starts = sim_start_pool[bootstrap_indices[:, 0]]
@@ -652,13 +656,29 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
                 rc = m.get("reward_components", {})
                 
                 annual_return = rc.get("annual_return", 0)
-                math_str = (
-                    f"Return: {annual_return*100:+.1f}% (Score: {rc.get('return_score',0):+.2f}) | "
-                    f"MDD_Pen: {rc.get('mdd_penalty',0):.2f} | "
-                    f"Div_Pen: {rc.get('diversity_penalty',0):.2f} | "
-                    f"GFR_Contrib: {rc.get('gfr_bonus',0)-rc.get('gfr_penalty',0):+.2f}"
-                )
-                print(f"    -> Math: {math_str} | ETV=${m.get('ETV',0):,.0f}, GFR={m.get('GFR',0):.4f}, MDD={m.get('MDD',0):.4f}")
+                # ---- Return component ----
+                # annual_return = (safe_mult ** (1/horizon)) - 1
+                # return_score = annual_return * CAGR_REWARD_SCALE
+                ret_detail = f"Ret = ({annual_return:.4%}) * {CAGR_REWARD_SCALE:.1f} = {rc.get('return_score',0):+.2f}"
+                # ---- GFR component ----
+                gfr_val = m.get('GFR',0)
+                gfr_contrib = rc.get('gfr_bonus',0) - rc.get('gfr_penalty',0)
+                gfr_detail = f"GFR = {gfr_val:.4f} -> contrib {gfr_contrib:+.2f}"
+                # ---- MDD component ----
+                # raw_mdd = metrics['MDD'] * MDD_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
+                # mdd_penalty = raw_mdd / desperation_factor
+                mdd_detail = f"MDD = {m.get('MDD',0):.4f} * {MDD_PENALTY_SCALE:.1f} * {(MAX_RISK_OFFSET - profile['risk_tolerance']):.1f} / {rc.get('desperation_factor',1.0):.1f} = {rc.get('mdd_penalty',0):.2f}"
+                # ---- Volatility component ----
+                # raw_vol = Annual_Vol * VOL_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
+                # vol_penalty = raw_vol / desperation_factor
+                vol_detail = f"Vol = {m.get('Annual_Vol',0):.4f} * {VOL_PENALTY_SCALE:.1f} * {(MAX_RISK_OFFSET - profile['risk_tolerance']):.1f} / {rc.get('desperation_factor',1.0):.1f} = {rc.get('vol_penalty',0):.2f}"
+                # ---- Diversity component ----
+                div_detail = f"Div = {rc.get('diversity_penalty',0):.2f}"
+                # ---- Assemble reward equation ----
+                reward_eq = f"Reward = {rc.get('return_score',0):+.2f} (Ret) + {gfr_contrib:+.2f} (GFR) - {rc.get('mdd_penalty',0):.2f} (MDD) - {rc.get('vol_penalty',0):.2f} (Vol) - {rc.get('diversity_penalty',0):.2f} (Div)"
+                print(f"    -> Math: {reward_eq} (Desp: {rc.get('desperation_factor',1.0):.1f})")
+                print(f"       Details: {ret_detail} | {gfr_detail} | {mdd_detail} | {vol_detail} | {div_detail}")
+                print(f"    -> Metric: ETV=${m.get('ETV',0):,.0f} | GFR={m.get('GFR',0):.4f} | MDD={m.get('MDD',0):.4f} | Vol={m.get('Annual_Vol',0):.4f}")
                 
                 # Top Assets
                 def _get_top_str(fw):

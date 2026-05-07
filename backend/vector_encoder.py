@@ -17,7 +17,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from _constants import (
     DEFAULT_PIPELINE_CONFIG, RELATIVE_WEIGHT_THRESHOLD, MIN_ACTIVE_WEIGHT, MAX_DYNAMIC_ASSETS,
-    SIM_TERMINAL_HORIZON,
+    SIM_TERMINAL_HORIZON_CAP,
     RISK_NORMALIZER, CAPITAL_NORMALIZER, GOAL_YEAR_NORMALIZER,
     TRADING_DAYS_PER_YEAR, CASH_BUCKET_ANNUAL_RATE, DAILY_RETURN_CLAMP, LOAN_DAILY_RATE,
     CACHE_DIR
@@ -304,11 +304,15 @@ def encode_multi_horizon(answers: dict) -> dict:
         scale = 1.0 - total_reserved_ratio
     
     if not goals:
-        # Default 30 year horizon if no goals
+        # Default 30 year horizon if no goals, but we'll clamp it
         goals = [{"name": "Retirement", "amount": 1000000, "years": 30}]
+
+    # Determine max horizon from data
+    data_years = len(recommender.price_matrix) // TRADING_DAYS_PER_YEAR
+    max_horizon = min(data_years - 1, SIM_TERMINAL_HORIZON_CAP)
         
     sorted_goals = sorted(goals, key=lambda g: g.get("years", 30))
-    horizons = [g.get("years", 30) for g in sorted_goals]
+    horizons = [min(g.get("years", 30), max_horizon) for g in sorted_goals]
     
     segments = []
     # Segment 1: Start to Goal 1
@@ -318,7 +322,8 @@ def encode_multi_horizon(answers: dict) -> dict:
     
     prev_yr = 0
     for i, g in enumerate(sorted_goals):
-        curr_yr = g.get("years", 30)
+        curr_yr_requested = g.get("years", 30)
+        curr_yr = min(curr_yr_requested, max_horizon)
         goal_amount = g.get("amount", 0)
         
         # Condition RL agent for this specific goal horizon
@@ -386,7 +391,7 @@ def encode_multi_horizon(answers: dict) -> dict:
 
     # NEW: Add Terminal Growth Phase (Phase N+1)
     # Uses the 'post-goal' weights from the RL model for the last goal's profile
-    if prev_yr < SIM_TERMINAL_HORIZON:
+    if prev_yr < max_horizon:
         # Re-fetch weights to get mu_post from the last goal context
         _, w_post = recommender.get_weights(profile, list(recommender.dynamic_embeddings.keys()))
         
@@ -408,7 +413,7 @@ def encode_multi_horizon(answers: dict) -> dict:
                 post_rationales[t] = "Diversifying asset to balance terminal horizon risk."
             
         segments.append({
-            "horizon_years": (prev_yr, SIM_TERMINAL_HORIZON),
+            "horizon_years": (prev_yr, max_horizon),
             "goal_name": "Growth Phase",
             "weights": combined_post_weights,
             "rationales": post_rationales
@@ -457,17 +462,23 @@ def simulate_multi_horizon_portfolio(
     filtered_returns = base_returns[active_tickers]
     
     # 3. Build a Mini-Cache (Fast!)
-    sim_cache, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(filtered_returns, max_horizon_years=total_years)
+    cache_array, start_idx_to_pos, clean_returns, column_to_idx, max_sim_years = build_simulation_cache(filtered_returns, max_horizon_years=total_years)
     
+    # Clamp total years to data-derived max for simulation
+    total_years = min(total_years, max_sim_years)
+
     # 4. Determine start dates for Monte Carlo (use high-fidelity starts)
     sim_starts = _resolve_simulation_starts(clean_returns)
     if len(sim_starts) == 0:
         return {"error": "Insufficient historical data for simulation paths"}
 
+    from _sim_worker import calculate_decay_probabilities
+    all_start_dates = clean_returns.index[sim_starts]
+    decay_probs = calculate_decay_probabilities(all_start_dates, half_life_years=3.0)
+
     # Take 1000 paths for high fidelity
     rng = np.random.default_rng(42)
-    num_paths = min(len(sim_starts), 1000)
-    sim_starts = rng.choice(sim_starts, size=num_paths, replace=False)
+    num_paths = 1000
     
     # 3. Pre-process segment weights into year-indexed arrays for speed
     num_assets = len(clean_returns.columns)
@@ -490,14 +501,19 @@ def simulate_multi_horizon_portfolio(
                 wa[column_to_idx[t]] = wt
         if wa.sum() > 0: wa /= wa.sum()
         year_weight_arrays.append(wa)
-
-    # 4. Vectorized Path Simulation
-    pos_indices = [start_idx_to_pos[s] for s in sim_starts]
-    selected_returns = sim_cache[pos_indices] # (n_paths, total_years, n_assets)
     
     year_weight_arrays = np.array(year_weight_arrays)
-    wa_broad = year_weight_arrays.reshape(1, total_years, num_assets)
-    path_returns = np.sum(selected_returns * wa_broad, axis=2)
+
+    # 4. Vectorized Block Bootstrapping
+    num_starts = cache_array.shape[0]
+    path_returns = np.zeros((num_paths, total_years))
+    
+    for p in range(num_paths):
+        # Sample random 1-year blocks for each projection year
+        bootstrap_indices = rng.choice(num_starts, size=total_years, replace=True, p=decay_probs)
+        for yr in range(total_years):
+            cache_row = cache_array[bootstrap_indices[yr]]
+            path_returns[p, yr] = np.dot(year_weight_arrays[yr], cache_row)
 
     # 6. Prepare raw paths for frontend percentile calculation
     raw_paths = np.round(path_returns, 6).tolist()
