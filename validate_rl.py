@@ -14,7 +14,7 @@ def main():
     print("Loading Dataset...")
     tickers = []
     # Try to load local dataset
-    master_df, price_matrix, volume_matrix, daily_returns, drip_returns = generate_dataset_member_a(tickers, config)
+    master_df, price_matrix, volume_matrix, daily_returns, drip_returns, annual_inflation, inflation_daily_returns, inflation_index = generate_dataset_member_a(tickers, config)
     
     print("Training Autoencoder (Fast)...")
     config["ml_epochs"] = 1 # Force fast training

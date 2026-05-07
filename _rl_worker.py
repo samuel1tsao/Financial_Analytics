@@ -182,9 +182,9 @@ def _run_agent_simulations_batch(w_pre, w_post, path_indices, sim_cache, clean_r
         )
         agent_res.append(res)
         
-    gfr, etv, mdd, aw, goal_f, market_f = _aggregate_path_results(agent_res)
+    gfr, etv, mdd, aw, goal_f, market_f, avg_inflation = _aggregate_path_results(agent_res)
     metrics = {
-        "GFR": gfr, "ETV": etv, "MDD": mdd, "AW": aw,
+        "GFR": gfr, "ETV": etv, "MDD": mdd, "AW": aw, "inflation_adjustment": avg_inflation,
         "GoalFails": goal_f, "MarketFails": market_f,
         "Total_Simulations": len(path_indices)
     }
@@ -206,6 +206,7 @@ def _encode_user_condition(user_profile):
     """
     risk_val  = float(user_profile.get("risk_tolerance", 5.0)) / RISK_NORMALIZER
     start_cap = float(user_profile.get("start_cap", 100000.0))
+    inflation_exp = user_profile.get("expected_inflation", 0.02)
 
     # Single-goal profile (preferred path)
     if "goal_year" in user_profile:
@@ -217,7 +218,7 @@ def _encode_user_condition(user_profile):
         goal_year   = float(max(goals.keys())) / GOAL_YEAR_NORMALIZER if goals else 0.0
         goal_ratio  = float(sum(goals.values())) / start_cap if goals else 0.0
 
-    return [risk_val, start_cap / CAPITAL_NORMALIZER, goal_year, goal_ratio]
+    return [risk_val, start_cap / CAPITAL_NORMALIZER, goal_year, goal_ratio, inflation_exp]
 
 
 def _get_static_feature_columns(master_df):
@@ -507,8 +508,8 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             ).to(device)
 
             (mu_pre, sigma_pre), (mu_post, sigma_post) = agent(tensor_x, src_key_padding_mask=src_key_padding_mask)
-            dist_pre  = torch.distributions.Normal(mu_pre,  F.softplus(sigma_pre))
-            dist_post = torch.distributions.Normal(mu_post, F.softplus(sigma_post))
+            dist_pre  = torch.distributions.Normal(mu_pre,  sigma_pre)
+            dist_post = torch.distributions.Normal(mu_post, sigma_post)
             samp_pre  = dist_pre.rsample()
             samp_post = dist_post.rsample()
 
@@ -600,7 +601,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
                 m = metrics
                 rc = m.get("reward_components", {})
                 math_str = (
-                    f"Return: {rc.get('return_score',0):+.2f} | "
+                    f"Return: {rc.get('real_return_score',0):+.2f} | "
                     f"MDD_Pen: {rc.get('mdd_penalty',0):.2f} | "
                     f"GFR_Contrib: {rc.get('gfr_bonus',0)-rc.get('gfr_penalty',0):+.2f}"
                 )

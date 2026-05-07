@@ -122,8 +122,33 @@ def generate_dataset_member_a(tickers, config):
         _persist_caches(master_df, price_matrix, volume_matrix)
 
     # ── 5. Compute Returns ──────────────────────────────────────────
-    daily_returns = price_matrix.pct_change().dropna(how='all') if not price_matrix.empty else pd.DataFrame()
-    drip_daily_returns = _compute_drip_returns(drip_enabled, price_matrix, daily_returns)
+    #daily_returns = price_matrix.pct_change().dropna(how='all') if not price_matrix.empty else pd.DataFrame()
+    #drip_daily_returns = _compute_drip_returns(drip_enabled, price_matrix, daily_returns)
+    daily_returns = (
+        price_matrix.pct_change().dropna(how='all')
+        if not price_matrix.empty else pd.DataFrame()
+    )
+    drip_daily_returns = _compute_drip_returns(
+        drip_enabled, price_matrix, daily_returns
+    )
+    # Infaltion Data
+    annual_inflation = get_annual_inflation_series(
+        start=config.get("fred_start_date", "2000-01-01")
+    )
+    inflation_daily_returns, inflation_index = get_daily_inflation_series(
+        start=config.get("fred_start_date", "2000-01-01")
+    )
+    inflation_daily_returns = (
+        inflation_daily_returns
+        .reindex(daily_returns.index)
+        .ffill()
+        .fillna(0.0)
+    )
+    inflation_index = (
+        inflation_index
+        .reindex(daily_returns.index)
+        .ffill()
+    )
 
     # ── 6. ML Feature Preprocessing ─────────────────────────────────
     master_df = _preprocess_ml_features(master_df, config)
@@ -133,11 +158,18 @@ def generate_dataset_member_a(tickers, config):
 
     # ── 7. Diagnostics ──────────────────────────────────────────────
     _print_pipeline_diagnostics(master_df, volume_matrix, drip_daily_returns, config)
-
+    print(master_df.columns[master_df.columns.duplicated()])
+    dupes = master_df.columns[master_df.columns.duplicated()]
+    print("Duplicate columns:", dupes.tolist())
+    print(master_df.shape)
+    print(len(master_df.columns))
+    print(len(set(master_df.columns)))
     numeric_cols = master_df.select_dtypes(include=[np.number]).columns
-    master_df[numeric_cols] = master_df[numeric_cols].fillna(0.0)
-
-    return master_df, price_matrix, volume_matrix, daily_returns, drip_daily_returns
+    #master_df[numeric_cols] = master_df[numeric_cols].fillna(0.0)
+    for col in numeric_cols:
+        master_df[col] = master_df[col].fillna(0.0)
+    master_df = master_df.loc[:, ~master_df.columns.duplicated()]
+    return master_df, price_matrix, volume_matrix, daily_returns, drip_daily_returns, annual_inflation, inflation_daily_returns, inflation_index
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -346,14 +378,17 @@ def _preprocess_ml_features(master_df, config):
                     or pd.api.types.is_string_dtype(master_df[f])):
                 print(f"   -> Extracting Categorical Matrix: '{f}'")
                 dummies = pd.get_dummies(master_df[f], prefix=f, dtype=float)
-                master_df = pd.concat([master_df, dummies], axis=1)
+                # remove any duplicate columns
+                dummies = dummies.loc[:, ~dummies.columns.isin(master_df.columns)]
+                if len(dummies.columns) > 0:
+                    master_df = pd.concat([master_df, dummies], axis=1)
                 master_df.drop(columns=[f], inplace=True)
             else:
                 print(f"   -> Processing Numeric Vector: '{f}'")
                 master_df[f] = pd.to_numeric(master_df[f], errors='coerce').fillna(0.0)
         else:
             print(f"   -> WARNING: Requested config feature '{f}' not found in master_df.")
-
+    master_df = master_df.loc[:, ~master_df.columns.duplicated()]
     return master_df
 
 
@@ -866,3 +901,20 @@ def get_annual_inflation_series(start="2000-01-01"):
     annual_infl = to_annual_inflation(monthly_infl)
 
     return annual_infl
+
+def get_daily_inflation_series(start = "2000-01-01"):
+    cpi = load_cpi(start)
+    cpi_daily = (
+        cpi 
+        .resample("D")
+        .ffill()
+    )
+    daily_inflation_returns = (
+        cpi_daily
+        .pct_change()
+        .fillna(0.0)
+    )
+    return (
+        daily_inflation_returns.iloc[:,0],
+        cpi_daily.iloc[:,0]
+    )

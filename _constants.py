@@ -130,7 +130,7 @@ RL_ASSET_SUBSET_SIZE      = 500
 WF_SNAPSHOTS_PER_EPISODE  = 8
 
 # User condition vector dimensions (single-goal: risk, capital, goal_year, goal_ratio)
-USER_CONDITION_DIM        = 4
+USER_CONDITION_DIM        = 5
 CAPITAL_NORMALIZER        = 1_000_000.0
 RISK_NORMALIZER           = 10.0
 GOAL_YEAR_NORMALIZER      = 30.0    # Normalize goal year to [0, 1]

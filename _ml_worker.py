@@ -153,7 +153,8 @@ def masked_weighted_mse_loss(pred, target, weights):
     w = weights[mask]
     return (w * (diff ** 2)).mean()
 
-def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, verbose=True):
+def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, inflation_daily_returns=None, inflation_index=None, 
+                                  annual_inflation=None, verbose=True):
     print(f"[{time.strftime('%H:%M:%S')}] [Member A] Initializing Dual-Head Sequence Transformer...")
     
     # Base Setup
@@ -490,7 +491,10 @@ def train_pytorch_embedding_model(master_df, price_matrix, volume_matrix, daily_
         "Y_std": Y_std,
         "input_dim": input_dim,
         "output_macro_dim": output_macro_dim,
-        "output_ar_dim": output_ar_dim
+        "output_ar_dim": output_ar_dim,
+        "inflation_daily_returns": inflation_daily_returns,
+        "inflation_index": inflation_index,
+        "annual_inflation": annual_inflation,
     }
 
 def run_ml_grid_search(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None):
@@ -585,7 +589,8 @@ def save_embedding_cache(cache_data, folder="cache"):
     
     print(f"[{time.strftime('%H:%M:%S')}] [Member A] Persistence: Results and model saved to '{folder}/{fname_base}'")
 
-def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, folder="cache"):
+def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, config, drip_daily_returns=None, inflation_daily_returns=None,
+                         inflation_index=None, annual_inflation=None, folder="cache"):
     """
     Loads saved model and embeddings from disk if they exist for the SPECIFIC config.
     """
@@ -616,7 +621,10 @@ def load_embedding_cache(master_df, price_matrix, volume_matrix, daily_returns, 
             "model_checkpoint": checkpoint, # Store full state for later inference
             "ml_embedding_dim": data.get("config_snapshot", {}).get("ed", 8),
             "ml_d_model": data.get("config_snapshot", {}).get("dm", 64),
-            "ml_learning_rate": data.get("config_snapshot", {}).get("lr", 0.001)
+            "ml_learning_rate": data.get("config_snapshot", {}).get("lr", 0.001),
+            "inflation_daily_returns": inflation_daily_returns,
+            "inflation_index": inflation_index,
+            "annual_inflation": annual_inflation,
         }
         return cache
     except Exception as e:
@@ -715,7 +723,7 @@ def generate_walkforward_embeddings_monthly(model, ticker_data, config, X_mean, 
                 idx_end = mask.sum()
                 idx_start = max(0, idx_end - max_seq_len)
                 
-                window_data = info['features'][idx_start:idx_end]
+                window_data = info['feats'][idx_start:idx_end]
                 
                 # Normalize using global stats
                 x = (window_data - X_mean) / X_std

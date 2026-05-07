@@ -43,6 +43,15 @@ class SimResult:
     # Raw delta (useful for inspection)
     relative_delta:             float = 0.0   # (pers - base) / |base|
 
+    # Inflation Metrics
+    infl_terminal:              float = 0.0
+    infl_failures:              int   = 0
+    real_pers_terminal:         float = 0.0
+    real_base_terminal:         float = 0.0
+    inflation_delta:            float = 0.0
+    signed_squared_inflation_delta: float = 0.0
+    combined_label:             float = 0.0
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def signed_log(x: float) -> float:
@@ -281,6 +290,7 @@ def backtest_portfolio(
     portfolio_composition: Dict[str, float],
     asset_daily_returns: Dict[str, np.ndarray],
     baseline_daily_returns: np.ndarray,
+    inflation_daily_returns: np.ndarray,
     start_i: int = 0,
     boundary: tuple = (5, 15),           # (short_max_yr, medium_max_yr)
 ) -> SimResult:
@@ -319,7 +329,7 @@ def backtest_portfolio(
     # Baseline: 100% in growth (tracks baseline returns)
     cash_b, growth_b = 0.0, start_cap
 
-    # ── Run both sims ───────────────────────────────────────────────────────────
+    # ── Run all sims ───────────────────────────────────────────────────────────
     pers_term, pers_fails = _run_sim_core(
         start_i, n_days, portfolio_returns,  user_config, cash_p, growth_p
     )
@@ -327,18 +337,40 @@ def backtest_portfolio(
         start_i, n_days, baseline_daily_returns, user_config, cash_b, growth_b
     )
 
+    # ── Compute inflation metrics ─────────────────────────────────────────────────
+    infl_slice = inflation_daily_returns[start_i:start_i+n_days]
+    infl_multiplier = float(np.prod(1.0 + infl_slice))
+    infl_multiplier = max(infl_multiplier, 1e-6)
+    real_pers = pers_term / infl_multiplier
+    real_base = base_term / infl_multiplier
+    infl_delta = (real_pers - start_cap) / start_cap
+    infl_label = np.sign(infl_delta) * infl_delta**2
+
     # ── Compute training label ─────────────────────────────────────────────────
     rel_delta, label = signed_squared_delta(pers_term, base_term)
+    if real_pers < start_cap:
+        combined_label = infl_label*2.0  #hard penality if less than inflation
+    else:
+        combined_label = (
+            0.7*infl_label + 0.3*label   #combine inflation label and market label
+        )
 
     return SimResult(
         base_terminal               = base_term,
         pers_terminal               = pers_term,
+        infl_terminal               = infl_term,
         base_failures               = base_fails,
         pers_failures               = pers_fails,
+        infl_failures               = infl_fails,       
         base_utility                = signed_log(base_term),
         pers_utility                = signed_log(pers_term),
         signed_squared_relative_delta = label,
         relative_delta              = rel_delta,
+        real_pers_terminal          = real_pers,
+        real_base_terminal          = real_base,
+        inflation_delta             = infl_delta,
+        signed_squared_inflation_delta = infl_label,
+        combined_label              = combined_label
     )
 
 
@@ -347,6 +379,7 @@ def simulate_batch(
     start_i: int,
     sp_ret: np.ndarray,
     bond_ret: np.ndarray,
+    inflation_ret: np.ndarray,
     all_configs: list,
     boundary_configs: dict,
 ) -> list:
@@ -371,6 +404,7 @@ def simulate_batch(
                 portfolio_composition  = composition,
                 asset_daily_returns    = asset_rets,
                 baseline_daily_returns = sp_ret,
+                inflation_daily_returns= inflation_ret,
                 start_i                = start_i,
                 boundary               = boundary,
             )
@@ -388,6 +422,10 @@ def simulate_batch(
                 "pers_utility":   result.pers_utility,
                 "relative_delta": result.relative_delta,
                 "label":          result.signed_squared_relative_delta,
+                "real_pers_terminal": result.real_pers_terminal,
+                "inflation_delta":    result.inflation_delta,
+                "infl_label":      result.signed_squared_inflation_delta,
+                "combined_label":  result.combined_label,
             }
             if "meta_cap_ratio" in cfg:
                 res_dict["meta_cap_ratio" ] = cfg["meta_cap_ratio"]
@@ -554,7 +592,9 @@ def _aggregate_path_results(results):
     etv = np.mean(all_tvs) if all_tvs else 0.0
     mdd = np.mean(all_mdds) if all_mdds else 1.0
     wds = np.mean(all_wds) if all_wds else 0.0
-    return gfr, etv, mdd, wds, goal_fails, market_fails
+    all_infl = [r.get("inflation_multiplier", 1.0) for r in results]
+    avg_inflation = np.mean(all_infl) if all_infl else 1.0
+    return gfr, etv, mdd, wds, goal_fails, market_fails, avg_inflation
 
 
 def _compute_reward(metrics, user_profile):
@@ -569,9 +609,18 @@ def _compute_reward(metrics, user_profile):
     actual_wds = metrics.get("AW", sum(user_profile["goals"].values())) # Fallback for old logs
 
     # 1. Annual Simple Return Score — smooth gradient, avoids division by zero
-    total_profit = metrics["ETV"] + actual_wds - start_cap
-    annual_return = (total_profit / start_cap) / horizon
-    return_score = annual_return * CAGR_REWARD_SCALE
+    #total_profit = metrics["ETV"] + actual_wds - start_cap
+    #annual_return = (total_profit / start_cap) / horizon
+    #return_score = annual_return * CAGR_REWARD_SCALE
+
+    # 1. Inflation Adjusted Return
+    nominal_etv = metrics["ETV"]
+    inflation_adjustment = metrics.get("inflation_adjustment", 1.0)
+    real_etv = nominal_etv / inflation_adjustment
+    total_real_profit = real_etv + actual_wds - start_cap
+    #real_annual_return = (total_real_profit / start_cap) / horizon 
+    real_cagr = ((real_etv + actual_wds) / start_cap) ** (1 / horizon) - 1
+    return_score = real_cagr * CAGR_REWARD_SCALE
 
     # 2. Risk-Scaled MDD Penalty
     mdd_penalty = metrics["MDD"] * MDD_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
@@ -597,7 +646,8 @@ def _compute_reward(metrics, user_profile):
         "mdd_penalty": mdd_penalty,
         "gfr_penalty": gfr_penalty,
         "gfr_bonus": gfr_bonus,
-        "annual_return": annual_return
+        "real_annual_return": real_annual_return,
+        "inflation_adjustment": inflation_adjustment,
     }
 
     return total_reward
@@ -605,7 +655,7 @@ def _compute_reward(metrics, user_profile):
 
 # ── Core Path Runner ──────────────────────────────────────────────────────────
 
-def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, start_capital, goals, mode,
+def _run_single_sim_path(start_idx, weight_array, sim_cache, inflation_cache, clean_returns, start_capital, goals, mode,
                          max_horizon_years, debug_path, start_date_str,
                          post_goal_weights=None, goal_year=None):
     """
@@ -622,6 +672,7 @@ def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, star
     max_drawdown      = 0.0
     trail             = []
     phase_switched    = False
+    inflation_multiplier = 1.0
     
     # On-the-fly computation if missing from cache (e.g. custom Walk-Forward dates)
     if isinstance(sim_cache, tuple):
@@ -660,6 +711,8 @@ def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, star
 
         # FAST VECTOR DOT PRODUCT
         yr_return = np.dot(w, precomputed_returns[year - 1])
+        annual_inflation_rate = inflation_cache[year -1]
+        inflation_multiplier *= (1 + annual_inflation_rate)
         capital           *= (1 + yr_return)
         market_multiplier *= (1 + yr_return)
 
@@ -696,7 +749,7 @@ def _run_single_sim_path(start_idx, weight_array, sim_cache, clean_returns, star
         log_msg = f"    Start: {start_date_str} | Path: {' -> '.join(trail)} ✅"
 
     return {"bankrupt": False, "terminal_value": capital, "actual_withdrawals": actual_withdrawals,
-            "max_drawdown": max_drawdown, "log": log_msg}
+            "max_drawdown": max_drawdown, "inflation_multiplier": inflation_multiplier, "log": log_msg}
 
 
 # ── Portfolio Evaluator ───────────────────────────────────────────────────────
@@ -718,12 +771,15 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
     
     # Retrieve or build cache
     if sim_cache_bundle is not None:
-        cache_data, clean_returns, column_to_idx = sim_cache_bundle
+        cache_data, inflation_cache_bundle, clean_returns, column_to_idx = sim_cache_bundle
         # If cache_data is a tuple (array, pos_dict), it's the new format
         sim_cache = cache_data
     else:
         cache_array, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns)
         sim_cache = (cache_array, start_idx_to_pos)
+        inflation_returns = dataset["inflation_daily_returns"]
+        infl_cache_array, infl_start_idx_to_pos = build_inflation_cache(inflation_returns)
+        inflation_cache_bundle = (infl_cache_array,infl_start_idx_to_pos)
 
     # Convert weights dict -> sorted candidates -> two-stage top-K + normalized threshold
     # Mirrors the exact selection logic used in the RL training loop for train/eval consistency.
@@ -777,6 +833,8 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
     results = []
     for idx in sim_starts:
         date_str = str(clean_returns.index[idx].date())
+        infl_cache_array, infl_start_idx_to_pos = inflation_cache_bundle
+        inflation_path = infl_cache_array[infl_start_idx_to_pos[idx]]
         results.append(
             _run_single_sim_path(
                 idx, weight_array, sim_cache, clean_returns, start_cap,
@@ -787,10 +845,10 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
 
 
     # Step 5: Aggregate metrics
-    gfr, etv, mdd, aw, goal_fails, market_fails = _aggregate_path_results(results)
+    gfr, etv, mdd, aw, goal_fails, market_fails, avg_inflation = _aggregate_path_results(results)
     score = etv if gfr >= GFR_OBJECTIVE_THRESHOLD else etv * (gfr / GFR_OBJECTIVE_THRESHOLD)
 
-    metrics = {"GFR": gfr, "ETV": etv, "MDD": mdd, "AW": aw,
+    metrics = {"GFR": gfr, "ETV": etv, "MDD": mdd, "AW": aw, "inflation_adjustment": avg_inflation,
                "Objective_Function_Score": score, "Total_Simulations": len(results),
                "GoalFails": goal_fails, "MarketFails": market_fails}
                
@@ -823,3 +881,38 @@ def simulate_rl_environment_step(weights, tickers, dataset, user_profile, config
     # Compute scalar reward
     reward = _compute_reward(metrics, user_profile)
     return float(reward), metrics
+
+def build_inflation_cache(inflation_returns, max_horizon_years=30):
+    """Precompute annual inflation multipliers for every simulation start."""
+    clean_infl = inflation_returns.fillna(0.0)
+
+    start_indices = _resolve_simulation_starts(clean_infl)
+    start_idx_to_pos = {idx: i for i, idx in enumerate(start_indices)}
+
+    cache_array = np.zeros((len(start_indices), max_horizon_years), dtype=np.float32)
+
+    n_days = len(clean_infl)
+    one_plus = (1.0 + clean_infl.values).astype(np.float32)
+
+    for i, start_idx in enumerate(start_indices):
+        for year in range(1, max_horizon_years + 1):
+
+            chunk_start = (
+                start_idx + (year - 1) * TRADING_DAYS_PER_YEAR
+            ) % n_days
+
+            chunk_end = (
+                start_idx + year * TRADING_DAYS_PER_YEAR
+            ) % n_days
+
+            if chunk_end > chunk_start:
+                chunk = one_plus[chunk_start:chunk_end]
+            else:
+                chunk = np.concatenate(
+                    [one_plus[chunk_start:], one_plus[:chunk_end]]
+                )
+
+            annual_infl = chunk.prod() - 1.0
+            cache_array[i, year - 1] = annual_infl
+
+    return cache_array, start_idx_to_pos
