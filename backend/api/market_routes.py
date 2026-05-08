@@ -101,10 +101,18 @@ async def _yfinance_ticker_is_real(ticker: str) -> bool:
 
 async def _sync_single_ticker_background(ticker: str):
     """Thin wrapper to sync a single newly discovered ticker."""
-    from market_data import sync_market_data, sync_company_info, sync_historical_deep
-    await asyncio.to_thread(sync_market_data, [ticker])
-    await asyncio.to_thread(sync_company_info, [ticker])
-    await asyncio.to_thread(sync_historical_deep, [ticker])
+    from market_data import sync_market_data, sync_company_info, sync_historical_financials
+    import logging
+    logger = logging.getLogger("market_sync")
+    
+    try:
+        logger.info(f"Background Sync: Starting for {ticker}")
+        await asyncio.to_thread(sync_market_data, [ticker])
+        await asyncio.to_thread(sync_company_info, [ticker])
+        await asyncio.to_thread(sync_historical_financials, [ticker])
+        logger.info(f"Background Sync: Completed for {ticker}")
+    except Exception as e:
+        logger.error(f"Background Sync: Failed for {ticker}: {e}", exc_info=True)
 
 
 @router.get("/market/lookup/{ticker}")

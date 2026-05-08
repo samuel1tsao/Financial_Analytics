@@ -162,6 +162,8 @@ Closing the loop end-to-end.
 | **Recency-Weighted Sampling** | Exponential decay probabilities (10y half-life) ensure the model prioritizes modern market dynamics while still learning from 2008-style crashes. | Reduces the statistical weight of early-2000s data. |
 | **Dynamic Top-K Thresholding** | Replaces static limits with a relative threshold (10% of max weight). Allows portfolio size to adapt to market confidence. | Makes UI layout more fluid as asset counts fluctuate. |
 | **Configurable Hidden Layers** | `ml_hidden_layers: [128, 64, 32]` allows architecture tuning via dashboard config. Input dimension (~224) requires gradual compression to 8-dim embedding. | Deeper networks risk overfitting on ~30k training samples. Mitigated by masked loss + z-score normalization. |
+| **Learnable Embedding Adapter** | A trainable 2-layer MLP inside the RL Transformer expands frozen 8-dim embeddings to 32-dim, allowing RL gradients to learn which embedding aspects are useful for allocation. | Adds ~1,300 parameters. Requires fresh training run (architecture break). Does not update the upstream embeddings themselves. |
+| **Static Interpretation Cards** | Replaced real-time jumping text above sliders with fixed-height cards below. Improves readability and eliminates layout jarring. | Requires manual mapping of all 1-10 values to descriptive rationales. |
 
 ---
 
@@ -260,10 +262,20 @@ Instead of providing the autoencoder with just a 1-year trailing snapshot of `hi
 | `GFR_BRACKETS (0.0)` | -30.0 | -100.0 | Increased failure penalty to prevent the agent from "safely failing" to avoid volatility. |
 | `rl_learning_rate` | 0.01 | 0.001 | High LR caused gradient explosions; policy head collapsed within first 50 iterations. |
 | `DIVERSITY_THRESHOLD` | 0 | 10 | Introduced to allow broad portfolios (up to 10 assets) before overhead penalties apply. |
+| `RISK_NORMALIZER` | N/A | 10.0 | Added for normalized aggregation of drawdown and volatility sensitivities across the risk profile. |
 
 ### 12.12 Math Observability & Debugging
 **Problem:** The RL agent's loss was often opaque. High negative rewards were difficult to debug without seeing the exact interaction between return scores and risk penalties.
 **Solution:** Implemented **Step-by-Step Math Logging**. Every training step now prints the exact equation used to compute the reward, including the risk-tolerance multipliers and desperation factor adjustments. This allows for real-time verification of the reward landscape.
+
+### 12.13 Learnable Embedding Adapter (Gradient Flow into Embeddings)
+**Problem:** The frozen 8-dim embeddings from Member A constituted only ~3.5% of the RL Transformer's input vector (~229 dims total). The remaining ~96.5% was static one-hot categoricals (sector, industry, exchange). This imbalance meant the RL model could learn effective policies based purely on sector patterns while ignoring the behavioral embeddings entirely.
+
+**Alternatives Considered:**
+- **Option B (Live Embedding Model):** Run Member A's full Transformer (3,780 tokens per asset) inside the RL forward pass. Principled but would drop throughput from 25 it/s to <0.1 it/s.
+- **Option C (Periodic Fine-Tuning):** Periodically unfreeze Member A and update embeddings using accumulated RL reward signal. Complex implementation with stale gradient issues.
+
+**Solution (Option A):** Added a **Learnable Embedding Adapter** inside `PortfolioTransformerRL` - a 2-layer MLP (`Linear(8->32) -> ReLU -> Linear(32->32)`) that projects the frozen embeddings into a richer representation before concatenation with other features. RL gradients flow through this adapter, learning to amplify or suppress specific embedding dimensions based on what improves portfolio rewards. The embedding's input share increases from ~3.5% to ~13% at a cost of only ~1,300 additional parameters with zero throughput impact.
 
 ---
 
@@ -316,6 +328,10 @@ This creates "Decisiveness Pressure": the agent pays a tax for every asset it ad
 ### 12.11 Upside Winsorization (Outlier Management)
 **Problem:** A single historical anomaly (e.g., +10,000% spike from a reverse split) could be sampled multiple times in the bootstrapping engine, creating an "Infinite Money" illusion.
 **Solution:** Implemented hard **Upside Winsorization** at **+500%** (6.0x) in the simulation cache. This clips extreme anomalies while preserving legitimate high-growth clusters (e.g., NVDA best years). Consistent "bursters" are now favored over one-off anomalies.
+
+### 12.14 UI Interpretability & Sensitivity Mapping
+**Problem:** Users found the questionnaire sliders "jarring" because the interpretation text above the slider jumped and shifted the layout during interaction. Additionally, numeric values were opaque without clear labels.
+**Solution:** Migrated detailed interpretations to **Fixed-Height Cards** below the sliders. These cards provide static visual anchors and more detailed financial rationales for each of the 10 sensitivity levels. Added numeric tick marks (1-10) to the slider track to align the visual "feel" with the underlying RL condition vector.
 
 ---
 

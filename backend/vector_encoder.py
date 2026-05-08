@@ -18,7 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from _constants import (
     DEFAULT_PIPELINE_CONFIG, RELATIVE_WEIGHT_THRESHOLD, MIN_ACTIVE_WEIGHT, MAX_DYNAMIC_ASSETS,
     SIM_TERMINAL_HORIZON_CAP,
-    RISK_NORMALIZER, CAPITAL_NORMALIZER, GOAL_YEAR_NORMALIZER,
+    CAPITAL_NORMALIZER, GOAL_YEAR_NORMALIZER,
     TRADING_DAYS_PER_YEAR, CASH_BUCKET_ANNUAL_RATE, DAILY_RETURN_CLAMP, LOAN_DAILY_RATE,
     CACHE_DIR
 )
@@ -136,33 +136,70 @@ class RLRecommender:
             logger.error(f"Error loading dataset for RL: {e}")
             self.dynamic_embeddings = {}
 
-        # 2. Load Models (Ensemble)
-        checkpoint_name = "checkpoint_rl_v2_dm64_nh4_lr001_id226.pt"
-        checkpoint_path = os.path.join(CACHE_DIR, checkpoint_name)
+        # 2. Dynamic Model Discovery (Ensemble)
+        # Calculate expected input_dim dynamically to match current features
+        try:
+            from _rl_worker import _get_static_feature_columns, _encode_user_condition, TEST_PROFILES
+            static_cols = _get_static_feature_columns(self.master_df)
+            static_dim = len(static_cols)
+            
+            # emb_dim is usually 8, user_cond_dim is 8
+            emb_dim = len(next(iter(self.dynamic_embeddings.values()))) if self.dynamic_embeddings else 8
+            user_cond_dim = len(_encode_user_condition(TEST_PROFILES[0]))
+            
+            input_dim = emb_dim + user_cond_dim + static_dim
+            logger.info(f"RL Recommender: Calculated input_dim={input_dim} (Emb:{emb_dim}, User:{user_cond_dim}, Static:{static_dim})")
+        except Exception as e:
+            logger.warning(f"Could not calculate input_dim dynamically, using fallback: {e}")
+            input_dim = 230 # Current production default
+
         self.models = []
         
-        if os.path.exists(checkpoint_path):
-            input_dim = 226 
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-                
-                if 'agents_state' in checkpoint:
-                    for state in checkpoint['agents_state']:
-                        m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
-                        self._load_state_dict_with_compat(m, state)
+        # Pattern to find all agents for this architecture ID
+        # Format: checkpoint_rl_v2_*_id{input_dim}_agent_{idx}.pt
+        import glob
+        pattern = os.path.join(CACHE_DIR, f"checkpoint_rl_v2_*_id{input_dim}_agent_*.pt")
+        agent_files = glob.glob(pattern)
+        
+        if not agent_files:
+            # Also check for combined master files (legacy)
+            pattern_master = os.path.join(CACHE_DIR, f"checkpoint_rl_v2_*_id{input_dim}.pt")
+            agent_files = glob.glob(pattern_master)
+
+        if agent_files:
+            for epath in sorted(agent_files):
+                try:
+                    # Skip corrupted/empty files
+                    if os.path.getsize(epath) == 0:
+                        logger.warning(f"Skipping corrupted 0-byte agent: {os.path.basename(epath)}")
+                        continue
+                        
+                    ecp = torch.load(epath, map_location=self.device, weights_only=False)
+                    m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                    
+                    # Handle different checkpoint formats (single agent vs ensemble master)
+                    if 'model_state' in ecp:
+                        self._load_state_dict_with_compat(m, ecp['model_state'])
                         m.eval()
                         self.models.append(m)
-                    logger.info(f"Loaded ensemble of {len(self.models)} RL agents from {checkpoint_path}")
-                elif 'model_state' in checkpoint:
-                    m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
-                    self._load_state_dict_with_compat(m, checkpoint['model_state'])
-                    m.eval()
-                    self.models.append(m)
-                    logger.info(f"Loaded single RL agent from {checkpoint_path}")
-            except Exception as e:
-                logger.error(f"Failed to load RL checkpoint: {e}")
+                    elif 'agents_state' in ecp and isinstance(ecp['agents_state'], list):
+                        # If it's a master file with multiple states, load all of them
+                        for state in ecp['agents_state']:
+                            m_sub = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                            self._load_state_dict_with_compat(m_sub, state)
+                            m_sub.eval()
+                            self.models.append(m_sub)
+                    
+                    logger.info(f"Successfully loaded agent(s) from {os.path.basename(epath)}")
+                except Exception as e:
+                    logger.error(f"Failed to load agent file {os.path.basename(epath)}: {e}")
+            
+            if self.models:
+                logger.info(f"Ensemble ready with {len(self.models)} total agents.")
+            else:
+                logger.warning(f"No valid RL agents found for input_dim {input_dim}.")
         else:
-            logger.warning(f"RL checkpoint not found at {checkpoint_path}. Multi-horizon RL disabled.")
+            logger.warning(f"No RL checkpoints found matching input_dim {input_dim} in {CACHE_DIR}.")
 
         self._initialized = True
 
@@ -180,8 +217,30 @@ class RLRecommender:
         emb_rows = []
         static_rows = []
         valid_tickers = []
+        
+        # Fundamental Volatility Filter: Automatically weed out broken/hyper-volatile assets
+        # dynamically based on the user's declared volatility sensitivity.
+        vol_sens = float(user_profile.get("volatility_sensitivity", 5))
+        # Sensitivity 1 (Risk Seeking) -> Max Vol 2.0 (200%)
+        # Sensitivity 10 (Risk Averse) -> Max Vol 0.4 (40%)
+        max_allowed_vol = 2.00 - ((vol_sens - 1) / 9.0) * 1.60
+        
         for t in tickers:
             if t in self.dynamic_embeddings and t in self.master_df.index:
+                # Fundamental Consistency & Recent Volatility Filter
+                if self.daily_returns is not None and t in self.daily_returns.columns:
+                    recent_vol = self.daily_returns[t].tail(30).std() * np.sqrt(252)
+                    hist_vol = self.daily_returns[t].tail(252).std() * np.sqrt(252)
+                    
+                    # 1. Check if RECENT volatility exceeds the user's tolerance
+                    if pd.notna(recent_vol) and recent_vol > max_allowed_vol:
+                        continue
+                        
+                    # 2. Check for Consistency: Reject assets whose volatility has recently spiked >50%
+                    if pd.notna(recent_vol) and pd.notna(hist_vol) and hist_vol > 0:
+                        if (recent_vol / hist_vol) > 1.5:
+                            continue
+                
                 emb_rows.append(self.dynamic_embeddings[t])
                 static_rows.append(self.master_df.loc[t, static_cols].values)
                 valid_tickers.append(t)
@@ -217,9 +276,9 @@ class RLRecommender:
             mu_pre = mu_avg
             mu_post = mu_avg
             
-            # Sharpen logits to match the variance seen during training's exploration sampling (sigma ~ 1.0)
-            # This prevents the softmax from creating an evenly distributed, uniform allocation
-            def sharpen_logits(m, target_std=1.0):
+            # Sharpen logits to match the variance seen during training's exploration sampling
+            # Reduced target_std from 1.0 to 0.5 to prevent overly concentrated allocations
+            def sharpen_logits(m, target_std=0.5):
                 std = m.std(dim=-1, keepdim=True)
                 std = torch.clamp(std, min=1e-6)
                 return (m - m.mean(dim=-1, keepdim=True)) / std * target_std
@@ -263,6 +322,34 @@ class RLRecommender:
 
         return _finalize_weights(w_pre), _finalize_weights(w_post)
 
+    def _finalize_weights_ui(self, weights: Dict[str, float], rationales: Dict[str, str]):
+        """Normalize weights and ensure rationales exist for all."""
+        total = sum(weights.values())
+        if total <= 1e-9: return {}, {}
+        
+        # 1. Prune tiny weights (< 0.5% relative to total) to keep UI clean
+        # But don't prune if it leaves us with nothing
+        pruned = {t: w for t, w in weights.items() if (w/total) >= 0.005}
+        if not pruned: pruned = weights
+        
+        # 2. Re-normalize to exactly 1.0
+        final_total = sum(pruned.values())
+        norm_w = {t: round(w/final_total, 4) for t, w in pruned.items()}
+        
+        # 3. Ensure rationales exist
+        final_r = {}
+        for t in norm_w:
+            rat = rationales.get(t)
+            if not rat or rat == "RL-optimized allocation based on user profile.":
+                # Add dynamic rationale based on asset type if missing
+                if t in BOND_UNIVERSE:
+                    rat = "Selected for capital preservation and yield stability."
+                else:
+                    rat = "Selected for growth potential aligned with horizon risk tolerance."
+            final_r[t] = rat
+            
+        return norm_w, final_r
+
 # ─── Multi-Horizon Encoding ──────────────────────────────────────────────────
 
 def encode_multi_horizon(answers: dict) -> dict:
@@ -277,7 +364,6 @@ def encode_multi_horizon(answers: dict) -> dict:
     
     recommender = _RECOMMENDER_INSTANCE
     
-    risk = float(answers.get("risk_tolerance", 50))
     start_cap = float(answers.get("start_cap") or 100000)
     monthly_contrib = float(answers.get("monthly_contrib") or 500)
     goals = answers.get("goals", [])
@@ -328,7 +414,10 @@ def encode_multi_horizon(answers: dict) -> dict:
         
         # Condition RL agent for this specific goal horizon
         profile = {
-            "risk_tolerance": risk / 10.0, # RL expects 0-10
+            "drawdown_sensitivity": answers.get("drawdown_sensitivity", 5),
+            "volatility_sensitivity": answers.get("volatility_sensitivity", 5),
+            "goal_flexibility": answers.get("goal_flexibility", 5),
+            "concentration_pref": answers.get("concentration_pref", 5),
             "start_cap": start_cap,
             "monthly_contrib": monthly_contrib,
             "goal_year": curr_yr,
@@ -381,11 +470,12 @@ def encode_multi_horizon(answers: dict) -> dict:
                 
             rationales[t] = f"{prefix} {reason}"
             
+        final_w, final_r = recommender._finalize_weights_ui(combined_weights, rationales)
         segments.append({
             "horizon_years": (prev_yr, curr_yr),
             "goal_name": g.get("name", f"Goal {i+1}"),
-            "weights": combined_weights,
-            "rationales": rationales
+            "weights": final_w,
+            "rationales": final_r
         })
         prev_yr = curr_yr
 
@@ -412,13 +502,19 @@ def encode_multi_horizon(answers: dict) -> dict:
             else:
                 post_rationales[t] = "Diversifying asset to balance terminal horizon risk."
             
+        final_w, final_r = recommender._finalize_weights_ui(combined_post_weights, post_rationales)
         segments.append({
             "horizon_years": (prev_yr, max_horizon),
             "goal_name": "Growth Phase",
-            "weights": combined_post_weights,
-            "rationales": post_rationales
+            "weights": final_w,
+            "rationales": final_r
         })
         
+    # Calculate an aggregate risk score for the profile
+    ds = float(answers.get("drawdown_sensitivity", 5))
+    vs = float(answers.get("volatility_sensitivity", 5))
+    risk = (ds + vs) / 2.0
+
     return {
         "risk_score": risk,
         "start_cap": start_cap,

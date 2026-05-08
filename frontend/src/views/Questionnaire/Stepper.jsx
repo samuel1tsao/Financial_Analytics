@@ -4,55 +4,71 @@ import useStore from '../../store';
 import api from '../../api/client';
 import TickerInput from '../../components/TickerInput';
 
-const FOMO_QUESTIONS = [
+const DRAWDOWN_QUESTIONS = [
   {
-    question: "A stock you've been watching drops 20% in a single day. What do you do?",
+    question: "Your portfolio drops 30% during a market crash. How do you react?",
     options: [
-      { label: 'Buy aggressively — it\'s on sale!', score: 3 },
-      { label: 'Buy a small amount and watch', score: 2 },
-      { label: 'Wait for it to stabilize', score: 1 },
+      { label: "Buy more — this is a sale!", score: 2 },
+      { label: "Hold steady, it'll recover", score: 5 },
+      { label: "Sell some to limit losses", score: 7 },
+      { label: "Sell everything immediately", score: 9 },
     ],
   },
   {
-    question: "Your coworker made 40% on a meme stock. Your reaction?",
+    question: "Markets drop 15% over 3 months. Your friend suggests going all-cash. You:",
     options: [
-      { label: 'Research it and jump in immediately', score: 3 },
-      { label: 'Take note but stick to my plan', score: 2 },
-      { label: 'Ignore it — too risky', score: 1 },
+      { label: "Disagree — I'd increase my positions", score: 2 },
+      { label: "Disagree — I'd stay the course", score: 4 },
+      { label: "Consider it — I'd sell my riskiest holdings", score: 7 },
+      { label: "Agree — preserving capital is priority #1", score: 9 },
     ],
   },
   {
-    question: "A heavily hyped IPO launches tomorrow. You would:",
+    question: "In 2008, the S&P 500 fell ~50%. If that happened today, you would:",
     options: [
-      { label: 'Buy on day one', score: 3 },
-      { label: 'Watch for a week then decide', score: 2 },
-      { label: 'Never buy IPOs', score: 1 },
+      { label: "See it as a once-in-a-decade opportunity to buy", score: 2 },
+      { label: "Be uncomfortable but not change anything", score: 5 },
+      { label: "Reduce equity exposure significantly", score: 8 },
+      { label: "Exit the market entirely until recovery", score: 10 },
+    ],
+  },
+];
+
+const VOLATILITY_QUESTIONS = [
+  {
+    question: "Which portfolio do you prefer over 5 years?",
+    options: [
+      { label: "Portfolio A: +7% every year (consistent, lower total)", score: 8 },
+      { label: "Portfolio B: -10%, +35%, +5%, +25%, -5% (~10% avg, volatile)", score: 3 },
+      { label: "No preference", score: 5 },
     ],
   },
   {
-    question: "The market is at an all-time high. Your move?",
+    question: "Two funds have the same 10-year average return of 10%. Fund X had steady growth. Fund Y had wild swings. You pick:",
     options: [
-      { label: 'Keep buying — momentum is everything', score: 3 },
-      { label: 'Hold current positions', score: 2 },
-      { label: 'Take some profits off the table', score: 1 },
+      { label: "Fund X — I want the smooth ride", score: 8 },
+      { label: "Either is fine if the average is the same", score: 5 },
+      { label: "Fund Y — those swings mean bigger upside potential", score: 2 },
     ],
   },
   {
-    question: "A trending TikTok says to buy a particular crypto. You:",
+    question: "Your portfolio is up 25% this year but was down 20% last year. How do you feel?",
     options: [
-      { label: 'Throw in some money for fun', score: 3 },
-      { label: 'Research it first, maybe small position', score: 2 },
-      { label: 'Social media is not investment advice', score: 1 },
+      { label: "Great — I'm ahead overall", score: 2 },
+      { label: "Uneasy — I wish it were more predictable", score: 6 },
+      { label: "Anxious — I need more consistency", score: 9 },
     ],
   },
 ];
 
 const INITIAL_STATE = {
   goals: [{ name: '', amount: '', years: '' }],
-  risk_tolerance: 50,
+  drawdown_answers: Array(DRAWDOWN_QUESTIONS.length).fill(null),
+  volatility_answers: Array(VOLATILITY_QUESTIONS.length).fill(null),
+  goal_flexibility: 5,
+  concentration_pref: 5,
   start_cap: 100000,
   monthly_contrib: 500,
-  fomo_answers: Array(FOMO_QUESTIONS.length).fill(null),
   hard_constraints: [{ ticker: '', pct: '' }],
   current_portfolio: [{ ticker: '', pct: '' }],
 };
@@ -79,7 +95,10 @@ export default function QuestionnaireStepper() {
           setForm((prev) => ({
             ...prev,
             goals: a.goals?.length ? a.goals : prev.goals,
-            risk_tolerance: a.risk_tolerance ?? prev.risk_tolerance,
+            drawdown_answers: a.drawdown_answers?.length ? a.drawdown_answers : prev.drawdown_answers,
+            volatility_answers: a.volatility_answers?.length ? a.volatility_answers : prev.volatility_answers,
+            goal_flexibility: a.goal_flexibility ?? prev.goal_flexibility,
+            concentration_pref: a.concentration_pref ?? prev.concentration_pref,
             start_cap: a.start_cap ?? prev.start_cap,
             monthly_contrib: a.monthly_contrib ?? prev.monthly_contrib,
             hard_constraints: a.hard_constraints?.length
@@ -94,7 +113,7 @@ export default function QuestionnaireStepper() {
     })();
   }, []);
 
-  const totalSteps = 5;
+  const totalSteps = 7;
 
   // ─── Helpers ────────────────────────────────────────────────────────────
   const updateGoal = (idx, field, value) => {
@@ -126,6 +145,24 @@ export default function QuestionnaireStepper() {
     setValidity(v => ({ ...v, current_portfolio: { ...v.current_portfolio, [form.current_portfolio.length]: null } }));
   };
 
+  const removeConstraint = (idx) => {
+    const next = form.hard_constraints.filter((_, i) => i !== idx);
+    setForm({ ...form, hard_constraints: next.length ? next : [{ ticker: '', pct: '' }] });
+    // Also clean up validity
+    const nextV = {};
+    next.forEach((_, i) => { nextV[i] = validity.hard_constraints[i]; });
+    setValidity(v => ({ ...v, hard_constraints: nextV }));
+  };
+
+  const removePortfolioRow = (idx) => {
+    const next = form.current_portfolio.filter((_, i) => i !== idx);
+    setForm({ ...form, current_portfolio: next.length ? next : [{ ticker: '', pct: '' }] });
+    // Also clean up validity
+    const nextV = {};
+    next.forEach((_, i) => { nextV[i] = validity.current_portfolio[i]; });
+    setValidity(v => ({ ...v, current_portfolio: nextV }));
+  };
+
   // Validity helpers
   const setConstraintValid = (idx, ticker, isValid) => {
     setValidity(v => ({ ...v, hard_constraints: { ...v.hard_constraints, [idx]: isValid } }));
@@ -134,28 +171,46 @@ export default function QuestionnaireStepper() {
     setValidity(v => ({ ...v, current_portfolio: { ...v.current_portfolio, [idx]: isValid } }));
   };
 
-  // Returns true if no ticker rows have is_valid === false (null / undefined = not yet checked = ok to pass)
+  // Helper for specific error messaging in JSX
   const constraintsOk = form.hard_constraints.every((c, i) =>
-    !c.ticker || validity.hard_constraints[i] !== false
+    (!c.ticker && !c.pct) || (c.ticker && parseFloat(c.pct) > 0 && validity.hard_constraints[i] !== false)
   );
   const portfolioOk = form.current_portfolio.every((c, i) =>
-    !c.ticker || validity.current_portfolio[i] !== false
+    (!c.ticker && !c.pct) || (c.ticker && parseFloat(c.pct) > 0 && validity.current_portfolio[i] !== false)
   );
-  const stepOk = step === 3 ? constraintsOk : step === 4 ? portfolioOk : true;
 
-  const setFomoAnswer = (qIdx, score) => {
-    const next = [...form.fomo_answers];
-    next[qIdx] = score;
-    setForm({ ...form, fomo_answers: next });
+  // Returns true if the current step is valid for moving forward
+  const stepOk = (() => {
+    switch (step) {
+      case 0: // Goals
+        return parseFloat(form.start_cap) > 0 && 
+               form.goals.some(g => g.name.trim() !== '' && parseFloat(g.amount) > 0 && parseInt(g.years) > 0);
+      case 1: // Drawdown
+        return form.drawdown_answers.every(a => a !== null);
+      case 2: // Volatility
+        return form.volatility_answers.every(a => a !== null);
+      case 5: // Constraints
+        return constraintsOk;
+      case 6: // Portfolio
+        return portfolioOk;
+      default:
+        return true;
+    }
+  })();
+
+  const setDrawdownAnswer = (idx, score) => {
+    const next = [...form.drawdown_answers];
+    next[idx] = score;
+    setForm({ ...form, drawdown_answers: next });
+  };
+  const setVolatilityAnswer = (idx, score) => {
+    const next = [...form.volatility_answers];
+    next[idx] = score;
+    setForm({ ...form, volatility_answers: next });
   };
 
-  const fomoScore = Math.min(
-    10,
-    Math.max(1, Math.round(
-      (form.fomo_answers.filter(Boolean).reduce((a, b) => a + b, 0) /
-        Math.max(1, form.fomo_answers.filter(Boolean).length)) * 10 / 3
-    ))
-  );
+  const ddScore = Math.round(form.drawdown_answers.filter(x => x !== null).reduce((a, b) => a + b, 0) / Math.max(1, form.drawdown_answers.filter(x => x !== null).length));
+  const volScore = Math.round(form.volatility_answers.filter(x => x !== null).reduce((a, b) => a + b, 0) / Math.max(1, form.volatility_answers.filter(x => x !== null).length));
 
   // ─── Submit ─────────────────────────────────────────────────────────────
   const handleSave = async () => {
@@ -169,10 +224,14 @@ export default function QuestionnaireStepper() {
             amount: parseFloat(g.amount),
             years: parseInt(g.years) || 5,
           })),
-          risk_tolerance: form.risk_tolerance,
+          drawdown_answers: form.drawdown_answers,
+          volatility_answers: form.volatility_answers,
+          drawdown_sensitivity: ddScore,
+          volatility_sensitivity: volScore,
+          goal_flexibility: form.goal_flexibility,
+          concentration_pref: form.concentration_pref,
           start_cap: parseFloat(form.start_cap) || 100000,
           monthly_contrib: parseFloat(form.monthly_contrib) || 0,
-          fomo_tendency: fomoScore,
           hard_constraints: form.hard_constraints
             .filter((c) => c.ticker && c.pct)
             .map((c) => ({ ticker: c.ticker.toUpperCase(), pct: parseFloat(c.pct) })),
@@ -327,54 +386,26 @@ export default function QuestionnaireStepper() {
             <button onClick={addGoal} style={{
               ...btnSecondary, marginTop: '0.5rem', fontSize: '0.8rem',
             }}>+ Add Another Goal</button>
+            {!stepOk && (
+              <p style={{ color: '#f87171', fontSize: '0.75rem', marginTop: '1rem' }}>
+                ✗ Please enter your starting capital and at least one financial goal with a valid amount and year.
+              </p>
+            )}
             </div>
           </div>
         );
 
-      case 1: // Risk Tolerance
+      case 1: // Drawdown Tolerance
         return (
           <div>
             <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
-              Risk Tolerance
-            </h2>
-            <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '2rem' }}>
-              How much market volatility can you handle? 1 = extremely conservative, 100 = very aggressive.
-            </p>
-            <div style={{ textAlign: 'center' }}>
-              <span style={{
-                fontSize: '3rem', fontWeight: 700,
-                background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)',
-                WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-              }}>
-                {form.risk_tolerance}
-              </span>
-              <input
-                type="range"
-                min="1" max="100"
-                value={form.risk_tolerance}
-                onChange={(e) => setForm({ ...form, risk_tolerance: parseInt(e.target.value) })}
-                style={{ width: '100%', marginTop: '1rem', accentColor: '#3b82f6' }}
-              />
-              <div style={{ display: 'flex', justifyContent: 'space-between', color: '#64748b', fontSize: '0.75rem' }}>
-                <span>Conservative</span>
-                <span>Moderate</span>
-                <span>Aggressive</span>
-              </div>
-            </div>
-          </div>
-        );
-
-      case 2: // FOMO Questions
-        return (
-          <div>
-            <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
-              Investment Behavior
+              Drawdown Tolerance
             </h2>
             <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-              Answer these situational questions so we can gauge your FOMO tendency.
-              <span style={{ color: '#60a5fa', fontWeight: 600 }}> Current FOMO Score: {fomoScore}/10</span>
+              How do you handle market crashes? This scales your drawdown protection.
+              <span style={{ color: '#60a5fa', fontWeight: 600 }}> Score: {ddScore}/10</span>
             </p>
-            {FOMO_QUESTIONS.map((q, qi) => (
+            {DRAWDOWN_QUESTIONS.map((q, qi) => (
               <div key={qi} style={{
                 marginBottom: '1.25rem',
                 padding: '1rem',
@@ -390,17 +421,17 @@ export default function QuestionnaireStepper() {
                     display: 'flex', alignItems: 'center', gap: '0.5rem',
                     padding: '0.4rem 0.6rem', borderRadius: '0.4rem',
                     cursor: 'pointer', marginBottom: '0.3rem',
-                    background: form.fomo_answers[qi] === opt.score
+                    background: form.drawdown_answers[qi] === opt.score
                       ? 'rgba(59,130,246,0.12)' : 'transparent',
-                    border: form.fomo_answers[qi] === opt.score
+                    border: form.drawdown_answers[qi] === opt.score
                       ? '1px solid rgba(59,130,246,0.3)' : '1px solid transparent',
                     transition: 'all 0.15s',
                   }}>
                     <input
                       type="radio"
-                      name={`fomo-${qi}`}
-                      checked={form.fomo_answers[qi] === opt.score}
-                      onChange={() => setFomoAnswer(qi, opt.score)}
+                      name={`dd-${qi}`}
+                      checked={form.drawdown_answers[qi] === opt.score}
+                      onChange={() => setDrawdownAnswer(qi, opt.score)}
                       style={{ accentColor: '#3b82f6' }}
                     />
                     <span style={{ color: '#cbd5e1', fontSize: '0.85rem' }}>{opt.label}</span>
@@ -411,7 +442,196 @@ export default function QuestionnaireStepper() {
           </div>
         );
 
-      case 3: // Hard Constraints
+      case 2: // Volatility Tolerance
+        return (
+          <div>
+            <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
+              Volatility Preference
+            </h2>
+            <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+              Do you prefer smooth compounding or wild growth swings?
+              <span style={{ color: '#60a5fa', fontWeight: 600 }}> Score: {volScore}/10</span>
+            </p>
+            {VOLATILITY_QUESTIONS.map((q, qi) => (
+              <div key={qi} style={{
+                marginBottom: '1.25rem',
+                padding: '1rem',
+                borderRadius: '0.6rem',
+                background: 'rgba(30,41,59,0.5)',
+                border: '1px solid rgba(255,255,255,0.06)',
+              }}>
+                <p style={{ color: '#e2e8f0', fontSize: '0.9rem', fontWeight: 500, marginBottom: '0.75rem' }}>
+                  {qi + 1}. {q.question}
+                </p>
+                {q.options.map((opt, oi) => (
+                  <label key={oi} style={{
+                    display: 'flex', alignItems: 'center', gap: '0.5rem',
+                    padding: '0.4rem 0.6rem', borderRadius: '0.4rem',
+                    cursor: 'pointer', marginBottom: '0.3rem',
+                    background: form.volatility_answers[qi] === opt.score
+                      ? 'rgba(59,130,246,0.12)' : 'transparent',
+                    border: form.volatility_answers[qi] === opt.score
+                      ? '1px solid rgba(59,130,246,0.3)' : '1px solid transparent',
+                    transition: 'all 0.15s',
+                  }}>
+                    <input
+                      type="radio"
+                      name={`vol-${qi}`}
+                      checked={form.volatility_answers[qi] === opt.score}
+                      onChange={() => setVolatilityAnswer(qi, opt.score)}
+                      style={{ accentColor: '#3b82f6' }}
+                    />
+                    <span style={{ color: '#cbd5e1', fontSize: '0.85rem' }}>{opt.label}</span>
+                  </label>
+                ))}
+              </div>
+            ))}
+          </div>
+        );
+
+      case 3: // Goal Flexibility
+        const flexLabels = {
+          1: "Must hit exactly",
+          3: "Mostly strict",
+          5: "Balanced",
+          7: "Flexible",
+          9: "Very lenient",
+          10: "Return over Goal"
+        };
+        return (
+          <div>
+            <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
+              Goal Flexibility
+            </h2>
+            <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '2rem' }}>
+              How satisfied would you be with a reasonable return even if your exact goal amount is missed?
+            </p>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ 
+                display: 'inline-block', 
+                padding: '0.2rem 0.6rem', 
+                borderRadius: '1rem', 
+                background: 'rgba(59, 130, 246, 0.2)', 
+                color: '#60a5fa', 
+                fontSize: '0.85rem', 
+                fontWeight: 700,
+                marginBottom: '1rem'
+              }}>
+                Value: {form.goal_flexibility}
+              </div>
+              <input
+                type="range"
+                min="1" max="10"
+                value={form.goal_flexibility}
+                onChange={(e) => setForm({ ...form, goal_flexibility: parseInt(e.target.value) })}
+                style={{ width: '100%', accentColor: '#3b82f6' }}
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 5px', color: '#475569', fontSize: '0.7rem', marginTop: '0.5rem' }}>
+                {[1,2,3,4,5,6,7,8,9,10].map(v => <span key={v}>{v}</span>)}
+              </div>
+              
+              <div style={{ 
+                marginTop: '2rem', 
+                minHeight: '4.5rem', 
+                display: 'flex', 
+                flexDirection: 'column',
+                justifyContent: 'center',
+                background: 'rgba(255,255,255,0.03)',
+                borderRadius: '0.5rem',
+                padding: '0.75rem',
+                border: '1px solid rgba(255,255,255,0.05)',
+                textAlign: 'left'
+              }}>
+                <span style={{ color: '#94a3b8', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.25rem' }}>
+                  Interpretation
+                </span>
+                <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '1rem' }}>
+                  {flexLabels[form.goal_flexibility] || "Balanced Sensitivity"}
+                </span>
+                <p style={{ color: '#64748b', fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                  {form.goal_flexibility <= 3 ? "Prioritizes meeting specific dollar targets over taking extra risk." : 
+                   form.goal_flexibility >= 8 ? "Prioritizes total portfolio growth over rigid goal success." :
+                   "Balances the need for growth with the requirement to hit targets."}
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 4: // Concentration Preference
+        const concLabels = {
+          1: "Max Conviction (1-2 stocks)",
+          2: "Focused (3-5 stocks)",
+          3: "Strategic (5-8 stocks)",
+          4: "Active (8-12 stocks)",
+          5: "Standard (12-15 stocks)",
+          6: "Balanced (15-20 stocks)",
+          7: "Diversified (20-25 stocks)",
+          8: "Broad (25-30 stocks)",
+          9: "Market Wide (30-40 stocks)",
+          10: "Index Proxy (40+ stocks)"
+        };
+        return (
+          <div>
+            <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
+              Concentration Preference
+            </h2>
+            <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '2rem' }}>
+              How many individual holdings do you prefer? Fewer holdings allow for higher conviction but more specific risk.
+            </p>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ 
+                display: 'inline-block', 
+                padding: '0.2rem 0.6rem', 
+                borderRadius: '1rem', 
+                background: 'rgba(167, 139, 250, 0.2)', 
+                color: '#a78bfa', 
+                fontSize: '0.85rem', 
+                fontWeight: 700,
+                marginBottom: '1rem'
+              }}>
+                Value: {form.concentration_pref}
+              </div>
+              <input
+                type="range"
+                min="1" max="10"
+                value={form.concentration_pref}
+                onChange={(e) => setForm({ ...form, concentration_pref: parseInt(e.target.value) })}
+                style={{ width: '100%', accentColor: '#8b5cf6' }}
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 5px', color: '#475569', fontSize: '0.7rem', marginTop: '0.5rem' }}>
+                {[1,2,3,4,5,6,7,8,9,10].map(v => <span key={v}>{v}</span>)}
+              </div>
+
+              <div style={{ 
+                marginTop: '2rem', 
+                minHeight: '4.5rem', 
+                display: 'flex', 
+                flexDirection: 'column',
+                justifyContent: 'center',
+                background: 'rgba(255,255,255,0.03)',
+                borderRadius: '0.5rem',
+                padding: '0.75rem',
+                border: '1px solid rgba(255,255,255,0.05)',
+                textAlign: 'left'
+              }}>
+                <span style={{ color: '#94a3b8', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.25rem' }}>
+                  Interpretation
+                </span>
+                <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '1rem' }}>
+                  {concLabels[form.concentration_pref] || "Standard Diversification"}
+                </span>
+                <p style={{ color: '#64748b', fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                  {form.concentration_pref <= 3 ? "Optimizes for high-alpha concentrated bets on top-performing assets." : 
+                   form.concentration_pref >= 8 ? "Optimizes for low-tracking error and broad market exposure." :
+                   "Optimizes for a balanced mix of conviction and risk-mitigation."}
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 5: // Hard Constraints
         return (
           <div>
             <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
@@ -421,7 +641,13 @@ export default function QuestionnaireStepper() {
               Want to guarantee a position in specific companies? These will be carved out before optimization.
             </p>
             {form.hard_constraints.map((c, i) => (
-              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.75rem' }}>
+              <div key={i} style={{ 
+                display: 'grid', 
+                gridTemplateColumns: '2fr 1fr auto', 
+                gap: '0.5rem', 
+                marginBottom: '0.75rem',
+                alignItems: 'end'
+              }}>
                 <div>
                   <label style={labelStyle}>Ticker</label>
                   <TickerInput
@@ -437,11 +663,15 @@ export default function QuestionnaireStepper() {
                   <input style={inputStyle} type="number" value={c.pct} placeholder="10"
                     onChange={(e) => updateConstraint(i, 'pct', e.target.value)} />
                 </div>
+                <button onClick={() => removeConstraint(i)} style={{
+                  background: 'none', border: 'none', color: '#f87171', cursor: 'pointer',
+                  fontSize: '1.2rem', paddingBottom: '0.5rem',
+                }}>×</button>
               </div>
             ))}
             {!constraintsOk && (
               <p style={{ color: '#f87171', fontSize: '0.75rem', marginTop: '0.25rem' }}>
-                ✗ One or more tickers are invalid. Please fix them before continuing.
+                ✗ One or more tickers are invalid or have 0% allocation. Please fix them before continuing.
               </p>
             )}
             <button onClick={addConstraint} style={{ ...btnSecondary, fontSize: '0.8rem', marginTop: '0.5rem' }}>
@@ -450,7 +680,7 @@ export default function QuestionnaireStepper() {
           </div>
         );
 
-      case 4: // Current Portfolio
+      case 6: // Current Portfolio
         return (
           <div>
             <h2 style={{ color: '#f1f5f9', fontWeight: 700, marginBottom: '0.5rem' }}>
@@ -460,7 +690,13 @@ export default function QuestionnaireStepper() {
               If you already hold investments, enter them here so we can compare and optimize.
             </p>
             {form.current_portfolio.map((c, i) => (
-              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.75rem' }}>
+              <div key={i} style={{ 
+                display: 'grid', 
+                gridTemplateColumns: '2fr 1fr auto', 
+                gap: '0.5rem', 
+                marginBottom: '0.75rem',
+                alignItems: 'end'
+              }}>
                 <div>
                   <label style={labelStyle}>Ticker</label>
                   <TickerInput
@@ -476,11 +712,15 @@ export default function QuestionnaireStepper() {
                   <input style={inputStyle} type="number" value={c.pct} placeholder="50"
                     onChange={(e) => updatePortfolio(i, 'pct', e.target.value)} />
                 </div>
+                <button onClick={() => removePortfolioRow(i)} style={{
+                  background: 'none', border: 'none', color: '#f87171', cursor: 'pointer',
+                  fontSize: '1.2rem', paddingBottom: '0.5rem',
+                }}>×</button>
               </div>
             ))}
             {!portfolioOk && (
               <p style={{ color: '#f87171', fontSize: '0.75rem', marginTop: '0.25rem' }}>
-                ✗ One or more tickers are invalid. Please fix or remove them.
+                ✗ One or more tickers are invalid or have 0% allocation. Please fix or remove them.
               </p>
             )}
             <button onClick={addPortfolioRow} style={{ ...btnSecondary, fontSize: '0.8rem', marginTop: '0.5rem' }}>

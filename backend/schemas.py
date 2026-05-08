@@ -42,13 +42,17 @@ class HardConstraint(BaseModel):
 
 class QuestionnaireV1(BaseModel):
     goals: list[GoalItem] = []
-    risk_tolerance: int = Field(ge=1, le=100, default=50)
+    drawdown_answers: list[Optional[int]] = []
+    volatility_answers: list[Optional[int]] = []
+    drawdown_sensitivity: int = Field(ge=1, le=10, default=5)
+    volatility_sensitivity: int = Field(ge=1, le=10, default=5)
+    goal_flexibility: int = Field(ge=1, le=10, default=5)
+    concentration_pref: int = Field(ge=1, le=10, default=5)
     start_cap: float = 100000.0
     monthly_contrib: float = 500.0
-    fomo_tendency: int = Field(ge=1, le=10, default=5)
-    fomo_answers: list[int] = []
     hard_constraints: list[HardConstraint] = []
     current_portfolio: list[HardConstraint] = []
+    # Reserved logic (e.g. forced 10% AAPL)
     reserved_asset: str = "AAPL"
     reserved_ratio: float = 0.1
 

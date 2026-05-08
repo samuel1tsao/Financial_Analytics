@@ -29,10 +29,10 @@ from _constants import (
     TEST_PROFILES,
     USER_CONDITION_DIM,
     CAPITAL_NORMALIZER,
-    RISK_NORMALIZER,
+    PREFERENCE_NORMALIZER,
+    CAGR_NORMALIZER,
     GOAL_YEAR_NORMALIZER,
     SIM_TERMINAL_HORIZON_CAP,
-    WF_SNAPSHOTS_PER_EPISODE,
     MIN_ACTIVE_WEIGHT,
     RELATIVE_WEIGHT_THRESHOLD,
     MAX_DYNAMIC_ASSETS,
@@ -40,7 +40,8 @@ from _constants import (
     CAGR_REWARD_SCALE,
     MDD_PENALTY_SCALE,
     VOL_PENALTY_SCALE,
-    MAX_RISK_OFFSET,
+    GFR_BRACKETS,
+    DIVERSITY_PENALTY_SCALE,
     decompose_profiles,
 )
 from _sim_worker import (
@@ -68,12 +69,17 @@ _CATEGORICAL_PREFIXES = ["sector", "industry", "state", "quoteType", "exchange"]
 
 class PortfolioTransformerRL(nn.Module):
     """
-    Transformer with single Gaussian policy head.
+    Transformer with single Gaussian policy head + Learnable Embedding Adapter.
+
+    The adapter takes the frozen 8-dim embeddings from Member A and projects
+    them to a richer 32-dim space via a small trainable MLP. This allows RL
+    gradients to learn WHICH aspects of the embedding are useful for portfolio
+    allocation, increasing the embedding's share of the input from ~3.5% to ~13%.
 
     Uses cross-asset attention to produce (mu, sigma) outputs:
         - Optimized for current goal/horizon specified in the user condition.
     """
-    def __init__(self, input_dim, config):
+    def __init__(self, input_dim, config, emb_raw_dim=8):
         super().__init__()
 
         self.d_model = config.get("rl_d_model", 64)
@@ -82,8 +88,22 @@ class PortfolioTransformerRL(nn.Module):
         dim_feedforward = config.get("rl_dim_feedforward", 256)
         dropout        = config.get("rl_dropout", 0.1)
 
-        # Project input features to transformer dimension
-        self.input_proj = nn.Linear(input_dim, self.d_model)
+        # Learnable Embedding Adapter: expands frozen embeddings
+        # from emb_raw_dim (8) to adapter_out_dim (32) so RL gradients
+        # can learn to re-weight and amplify informative embedding dimensions.
+        self.emb_raw_dim = emb_raw_dim
+        adapter_out_dim = config.get("rl_adapter_dim", 32)
+        self.emb_adapter = nn.Sequential(
+            nn.Linear(emb_raw_dim, adapter_out_dim),
+            nn.ReLU(),
+            nn.Linear(adapter_out_dim, adapter_out_dim),
+        )
+
+        # Effective input dim after adapter: (input_dim - emb_raw_dim + adapter_out_dim)
+        adapted_input_dim = input_dim - emb_raw_dim + adapter_out_dim
+
+        # Project adapted features to transformer dimension
+        self.input_proj = nn.Linear(adapted_input_dim, self.d_model)
 
         # Transformer encoder for cross-asset attention
         encoder_layer = nn.TransformerEncoderLayer(
@@ -105,9 +125,20 @@ class PortfolioTransformerRL(nn.Module):
     def forward(self, x, src_key_padding_mask=None):
         """
         x: (batch, num_assets, input_dim)
+           Layout: [embedding(8) | user_condition(8) | static_features(~217)]
         Returns: (mu, sigma) each (batch, num_assets)
         """
-        h   = F.relu(self.input_proj(x))
+        # Split out the frozen embedding dims and adapt them
+        emb_raw = x[:, :, :self.emb_raw_dim]               # (B, N, 8)
+        # Note: input_dim now expects user_condition(8)
+        user_cond_end = self.emb_raw_dim + 8
+        other   = x[:, :, user_cond_end:]                  # (B, N, 217)
+        user_c  = x[:, :, self.emb_raw_dim:user_cond_end]  # (B, N, 8)
+        
+        emb_adapted = self.emb_adapter(emb_raw)             # (B, N, 32)
+        x_adapted = torch.cat([emb_adapted, user_c, other], dim=-1)
+
+        h   = F.relu(self.input_proj(x_adapted))
         out = self.transformer(h, src_key_padding_mask=src_key_padding_mask)
 
         mu    = self.mu_head(out).squeeze(-1)
@@ -233,26 +264,36 @@ def _run_agent_simulations_batch(w_pre, bootstrap_indices, sim_cache, clean_retu
 
 def _encode_user_condition(user_profile):
     """
-    Encode a single-goal user profile into a 4-dim condition vector.
-    [risk_normalized, capital_normalized, goal_year_normalized, goal_ratio]
-
-    For single-goal profiles (from decompose_profiles): uses goal_year and goal_amount.
-    For legacy multi-goal profiles: uses the latest goal year and total goal amount.
+    Encode a single-goal user profile into an 8-dim condition vector.
     """
-    risk_val  = float(user_profile.get("risk_tolerance", 5.0)) / RISK_NORMALIZER
-    start_cap = float(user_profile.get("start_cap", 100000.0))
+    # 1. Sensitivity Dimensions (1-10 normalized to [0, 1])
+    dd_sens    = float(user_profile.get("drawdown_sensitivity", 5.0)) / PREFERENCE_NORMALIZER
+    vol_sens   = float(user_profile.get("volatility_sensitivity", 5.0)) / PREFERENCE_NORMALIZER
+    goal_flex  = float(user_profile.get("goal_flexibility", 5.0)) / PREFERENCE_NORMALIZER
+    conc_pref  = float(user_profile.get("concentration_pref", 5.0)) / PREFERENCE_NORMALIZER
 
-    # Single-goal profile (preferred path)
+    # 2. Financial Dimensions
+    start_cap  = float(user_profile.get("start_cap", 100000.0))
+    
     if "goal_year" in user_profile:
-        goal_year   = float(user_profile["goal_year"]) / GOAL_YEAR_NORMALIZER
-        goal_ratio  = float(user_profile["goal_amount"]) / start_cap
+        goal_year  = float(user_profile["goal_year"]) / GOAL_YEAR_NORMALIZER
+        goal_ratio = float(user_profile["goal_amount"]) / start_cap
     else:
-        # Legacy fallback: use max goal year and total amount
         goals = user_profile.get("goals", {})
-        goal_year   = float(max(goals.keys())) / GOAL_YEAR_NORMALIZER if goals else 0.0
-        goal_ratio  = float(sum(goals.values())) / start_cap if goals else 0.0
+        goal_year  = float(max(goals.keys())) / GOAL_YEAR_NORMALIZER if goals else 0.0
+        goal_ratio = float(sum(goals.values())) / start_cap if goals else 0.0
 
-    return [risk_val, start_cap / CAPITAL_NORMALIZER, goal_year, goal_ratio]
+    # 3. Explicit Required CAGR (Normalized: 20% CAGR = 1.0)
+    raw_goal_year = float(user_profile.get("goal_year", 30))
+    # Required multiplier to hit goal
+    required_mult = goal_ratio
+    # CAGR = (mult ^ (1/yrs)) - 1
+    required_cagr = (max(required_mult, 1.0) ** (1.0 / max(raw_goal_year, 1))) - 1.0
+    required_cagr_norm = min(max(required_cagr, 0.0) / CAGR_NORMALIZER, 1.0)
+
+    # Full 8-dim vector
+    return [dd_sens, vol_sens, goal_flex, conc_pref, 
+            start_cap / CAPITAL_NORMALIZER, goal_year, goal_ratio, required_cagr_norm]
 
 
 def _get_static_feature_columns(master_df):
@@ -298,14 +339,14 @@ def _precompute_rl_features(dataset, config):
 def _build_rl_input_fast(emb_matrix, static_matrix, user_profile):
     """
     Assemble the input tensor from cached matrices + user profile.
-    Layout per asset: [embedding | user_condition(33) | static_features]
+    Layout per asset: [embedding | user_condition(8) | static_features]
     Returns tensor of shape (1, N_assets, input_dim) on DEVICE.
     """
     user_vec   = np.array(_encode_user_condition(user_profile), dtype=np.float32)
     N          = emb_matrix.shape[0]
-    user_tiled = np.tile(user_vec, (N, 1))   # (N, 33)
+    user_tiled = np.tile(user_vec, (N, 1))   # (N, 8)
 
-    # [emb | user_condition | static] — matches original build_rl_dataset ordering
+    # [emb | user_condition | static]
     full = np.concatenate([emb_matrix, user_tiled, static_matrix], axis=1)
     return torch.tensor(full[np.newaxis, :, :], dtype=torch.float32, device=DEVICE)
 
@@ -313,7 +354,7 @@ def _build_rl_input_fast(emb_matrix, static_matrix, user_profile):
 def build_rl_dataset(dataset, user_profile, config, specific_embeddings=None):
     """
     Assemble the input tensor for the Transformer (legacy per-call version).
-    Each asset row = [Embedding | UserCondition(33) | StaticFeatures].
+    Each asset row = [Embedding | UserCondition(8) | StaticFeatures].
     Kept for walk-forward mode where embeddings change per snapshot.
     """
     master_df  = dataset["master_df"]
@@ -408,7 +449,7 @@ def _greedy_evaluate_fast(agents, emb_matrix, static_matrix, tickers, user_profi
 
 
 def get_rl_transformer_filename_base(config, input_dim):
-    """Generate a unique identifier for the RL agent's architecture (v2 = dual-head)."""
+    """Generate a unique identifier for the RL agent's architecture."""
     dm = config.get("rl_d_model", 64)
     nh = config.get("rl_nhead", 4)
     lr = config.get("rl_learning_rate", 0.0001)
@@ -657,21 +698,15 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
                 
                 annual_return = rc.get("annual_return", 0)
                 # ---- Return component ----
-                # annual_return = (safe_mult ** (1/horizon)) - 1
-                # return_score = annual_return * CAGR_REWARD_SCALE
                 ret_detail = f"Ret = ({annual_return:.4%}) * {CAGR_REWARD_SCALE:.1f} = {rc.get('return_score',0):+.2f}"
                 # ---- GFR component ----
                 gfr_val = m.get('GFR',0)
-                gfr_contrib = rc.get('gfr_bonus',0) - rc.get('gfr_penalty',0)
+                gfr_contrib = rc.get('gfr_contrib',0)
                 gfr_detail = f"GFR = {gfr_val:.4f} -> contrib {gfr_contrib:+.2f}"
                 # ---- MDD component ----
-                # raw_mdd = metrics['MDD'] * MDD_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
-                # mdd_penalty = raw_mdd / desperation_factor
-                mdd_detail = f"MDD = {m.get('MDD',0):.4f} * {MDD_PENALTY_SCALE:.1f} * {(MAX_RISK_OFFSET - profile['risk_tolerance']):.1f} / {rc.get('desperation_factor',1.0):.1f} = {rc.get('mdd_penalty',0):.2f}"
+                mdd_detail = f"MDD = {m.get('MDD',0):.4f} * {MDD_PENALTY_SCALE:.1f} * {profile.get('drawdown_sensitivity',5):.1f} / {rc.get('desperation_factor',1.0):.1f} = {rc.get('mdd_penalty',0):.2f}"
                 # ---- Volatility component ----
-                # raw_vol = Annual_Vol * VOL_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
-                # vol_penalty = raw_vol / desperation_factor
-                vol_detail = f"Vol = {m.get('Annual_Vol',0):.4f} * {VOL_PENALTY_SCALE:.1f} * {(MAX_RISK_OFFSET - profile['risk_tolerance']):.1f} / {rc.get('desperation_factor',1.0):.1f} = {rc.get('vol_penalty',0):.2f}"
+                vol_detail = f"Vol = {m.get('Annual_Vol',0):.4f} * {VOL_PENALTY_SCALE:.1f} * {profile.get('volatility_sensitivity',5):.1f} / {rc.get('desperation_factor',1.0):.1f} = {rc.get('vol_penalty',0):.2f}"
                 # ---- Diversity component ----
                 div_detail = f"Div = {rc.get('diversity_penalty',0):.2f}"
                 # ---- Assemble reward equation ----

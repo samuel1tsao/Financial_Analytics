@@ -70,9 +70,15 @@ def build_user_preference_vector(dataset, user_profile, config):
     embeddings    = dataset["dynamic_embeddings"]
     daily_returns = dataset.get("drip_daily_returns") or dataset["daily_returns"]
     tau           = config.get("sim_glide_path_tau", 8.0)
-    v_anchor      = config.get("sim_v_score_anchor", 0.50)
-
-    risk_user = user_profile["risk_tolerance"]
+    # Derive a legacy risk_user if it's missing (0-10 scale)
+    if "risk_tolerance" in user_profile:
+        risk_user = float(user_profile["risk_tolerance"])
+    else:
+        # Map: low sensitivity -> high risk
+        dd_sens  = float(user_profile.get("drawdown_sensitivity", 5.0))
+        vol_sens = float(user_profile.get("volatility_sensitivity", 5.0))
+        risk_user = 11.0 - (dd_sens + vol_sens) / 2.0
+    
     goals     = user_profile["goals"]
 
     # Step 1: Multi-goal risk budget (glide-path decay)
@@ -245,7 +251,13 @@ def recommend_and_allocate_member_b(dataset, user_profile, user_vector, config):
         filtered = dict(ranked[:5])
 
     # Temperature-scaled softmax allocation
-    risk_user = user_profile["risk_tolerance"]
+    if "risk_tolerance" in user_profile:
+        risk_user = float(user_profile["risk_tolerance"])
+    else:
+        dd_sens  = float(user_profile.get("drawdown_sensitivity", 5.0))
+        vol_sens = float(user_profile.get("volatility_sensitivity", 5.0))
+        risk_user = 11.0 - (dd_sens + vol_sens) / 2.0
+
     T = max(0.1, (11.0 - risk_user) / 2.0)
     exp_scores = {t: math.exp(min(DEFAULT_SOFTMAX_CAP, s / T)) for t, s in filtered.items()}
     sum_exp = sum(exp_scores.values())

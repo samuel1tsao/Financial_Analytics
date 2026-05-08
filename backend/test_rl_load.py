@@ -9,7 +9,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 try:
     from _rl_worker import PortfolioTransformerRL, _build_rl_input_fast, _softmax_normalize_top_k
-    from _constants import DEFAULT_PIPELINE_CONFIG, TOP_K_ASSETS, MIN_ACTIVE_WEIGHT
+    from _constants import DEFAULT_PIPELINE_CONFIG, MAX_DYNAMIC_ASSETS, MIN_ACTIVE_WEIGHT
     print("Imports successful")
 except ImportError as e:
     print(f"Import error: {e}")

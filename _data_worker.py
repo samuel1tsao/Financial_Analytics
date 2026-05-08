@@ -146,7 +146,7 @@ def generate_dataset_member_a(tickers, config):
 def _load_csv_index(filepath, index_col='ticker'):
     """Load a CSV with an index column, or return an empty DataFrame."""
     if os.path.exists(filepath):
-        return pd.read_csv(filepath, index_col=index_col)
+        return pd.read_csv(filepath, index_col=index_col, low_memory=False)
     return pd.DataFrame()
 
 
@@ -154,7 +154,7 @@ def _load_timeseries_csv(filepath):
     """Load a time-series CSV (dates as index), stripping timezone if present."""
     if os.path.exists(filepath):
         try:
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            df = pd.read_csv(filepath, index_col=0, parse_dates=True, low_memory=False)
             if not df.empty and df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             return df

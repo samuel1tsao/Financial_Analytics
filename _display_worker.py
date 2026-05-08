@@ -128,7 +128,12 @@ def plot_theta_sensitivity(profiles, data_cache, config, evaluate_fn, theta_grid
         ax.set_xlabel('Threshold (\u03b8)')
         ax.set_ylabel('Dynamic K (# assets)', color='#2196F3')
         ax2.set_ylabel('GFR / Normalized ETV')
-        ax.set_title(f'{profile["profile_name"][:25]}\nRisk={profile["risk_tolerance"]}')
+        if "risk_tolerance" in profile:
+            risk_str = f"Risk={profile['risk_tolerance']}"
+        else:
+            risk_str = (f"DD={profile.get('drawdown_sensitivity',5)} Vol={profile.get('volatility_sensitivity',5)} "
+                        f"Flex={profile.get('goal_flexibility',5)} Conc={profile.get('concentration_pref',5)}")
+        ax.set_title(f'{profile["profile_name"][:25]}\n{risk_str}')
         ax.grid(alpha=0.3)
 
         lines = l1 + l2 + l3
@@ -150,7 +155,13 @@ def _print_report_header(user_profile, risk_budget, theta, T, recommendations, n
     print("\u2588  DYNAMIC TOP-K ASSET RECOMMENDATION REPORT")
     print("\u2588" * 90)
     print(f"\u2588  Profile:              {user_profile.get('profile_name', 'Custom User')}")
-    print(f"\u2588  Risk Tolerance:       {user_profile['risk_tolerance']}/10")
+    if "risk_tolerance" in user_profile:
+        print(f"\u2588  Risk Tolerance:       {user_profile['risk_tolerance']}/10")
+    else:
+        print(f"\u2588  DD Sensitivity:       {user_profile.get('drawdown_sensitivity',5)}/10")
+        print(f"\u2588  Vol Sensitivity:      {user_profile.get('volatility_sensitivity',5)}/10")
+        print(f"\u2588  Goal Flexibility:     {user_profile.get('goal_flexibility',5)}/10")
+        print(f"\u2588  Concentration Pref:   {user_profile.get('concentration_pref',5)}/10")
     print(f"\u2588  Risk Budget (Glide):  {risk_budget:.3f}/10 (Linear Scale)"
           f"(V_score ceiling after multi-goal decay)")
     print(f"\u2588  Threshold (\u03b8):        {theta}  (S_i >= \u03b8 to enter portfolio)")

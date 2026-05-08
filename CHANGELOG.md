@@ -1,5 +1,45 @@
 # Changelog
 
+## [2026-05-08] - Asset Fundamentals & Sync Stability
+
+### FIX — Missing Asset Fundamentals (MSTX)
+- **Broken Import Resolution**: Fixed a critical `ImportError` in `market_routes.py` where the background sync task was attempting to call `sync_historical_deep` (renamed to `sync_historical_financials`). This prevented newly discovered tickers (like MSTX) from being added to the database.
+- **Robust Background Sync**: Added explicit `try-except` blocks and logging to `_sync_single_ticker_background` to prevent a single asset's sync failure from crashing the entire background process.
+- **MSTX Data Recovery**: Manually triggered a sync for the `MSTX` ticker, restoring access to its fundamentals (Defiance Daily Target 2X Long MSTR ETF).
+
+### FIX — RL Ensemble Loading & Checkpoint Robustness
+- **Checkpoint Validation**: Improved the `RLRecommender` singleton to gracefully handle partial ensemble loads. If a specific agent checkpoint (e.g., `agent_2`) is corrupted or 0 bytes, the system now logs a warning and proceeds with the remaining healthy ensemble members instead of crashing the entire recommendation engine.
+- **Diagnostic Cleanup**: Removed temporary diagnostic scripts used to trace model loading inconsistencies.
+
+## [2026-05-07] - Learnable Embedding Adapter & Questionnaire UX
+
+### FIX — Questionnaire Validation & State Persistence
+- **Strict Step Validation**: Implemented a comprehensive `stepOk` validation engine that prevents users from skipping required questions. Users must now provide starting capital, at least one financial goal, and answer all risk-profile multiple-choice questions before proceeding.
+- **Allocation Sanitization**: Added validation to "Specific Stock Preferences" and "Current Portfolio" steps to prevent 0% or negative percentage entries.
+- **Row Deletion**: Added removal buttons ("×") to all dynamic row sections (Goals, Stock Preferences, and Current Portfolio), allowing users to easily delete erroneous entries.
+- **Answer Persistence**: Expanded the backend schema and frontend pre-fill logic to store and reload raw multiple-choice answers. Users can now return to the questionnaire and see their previously selected responses instead of just the aggregated sensitivity scores.
+- **UX Feedback**: Added descriptive error messages for each step to guide users through missing or invalid inputs.
+
+### FEAT — Questionnaire UX Refinement
+- **Slider Overhaul**: Updated the Goal Flexibility and Concentration Preference sliders in the questionnaire. Removed the jarring large-text feedback above the slider and replaced it with a sleek value badge and a detailed "Interpretation" card underneath.
+- **Dynamic Interpretations**: Added human-readable rationales that explain the financial trade-offs of different sensitivity settings (e.g., alpha focus vs. risk mitigation).
+- **Numeric Ticks**: Added 1-10 numeric labels below sliders for improved precision and clarity.
+
+### FEAT — Embedding Adapter Layer in RL Transformer
+- **Problem**: The frozen 8-dim embeddings from Member A (the Sequence Transformer) represented only ~3.5% of the RL Transformer's ~229-dim input vector. The remaining ~96.5% was static one-hot categoricals (sector, industry, exchange), meaning the RL model could easily learn to ignore the behavioral embeddings entirely.
+- **Solution**: Added a **Learnable Embedding Adapter** — a small 2-layer MLP (`Linear(8→32) → ReLU → Linear(32→32)`) inside `PortfolioTransformerRL` that expands the frozen embeddings to a 32-dim representation before concatenating with user/static features.
+- **Gradient Flow**: RL policy gradients now flow through the adapter, allowing the model to learn *which aspects* of the behavioral embedding are useful for portfolio allocation. The frozen embeddings themselves don't change, but their interpretation is trainable.
+- **Signal Amplification**: The embedding's share of the input increases from ~3.5% to ~13%, making it significantly harder for the model to ignore.
+- **Cost**: Adds only ~1,300 parameters with zero throughput impact.
+- **Breaking Change**: The architecture change requires a fresh training run; old checkpoints are incompatible.
+
+### FIX — Backend Dependency & Import Stability
+- **Constant Registry Fix**: Resolved critical `ImportError`s caused by missing `RISK_NORMALIZER` and `DIVERSITY_PENALTY_THRESHOLD` constants in `_constants.py`.
+- **Import Cleanup**: Removed unused and redundant imports in `vector_encoder.py` to stabilize the API startup process.
+
+### TUNE — Risk Score Aggregation
+- **Consolidated Risk Metric**: Implemented an aggregate `risk_score` calculation in the questionnaire encoder that averages drawdown and volatility sensitivities, providing a unified metric for frontend visualizations.
+
 ## [2026-05-06] - Reward Stabilization & Math Observability
 
 ### FEAT — Rich Reward "Math" Observability

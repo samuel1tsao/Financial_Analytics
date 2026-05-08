@@ -20,12 +20,24 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 from _constants import (
-    TRADING_DAYS_PER_YEAR as TRADING_DAYS,
+    TRADING_DAYS_PER_YEAR,
     SIM_YEARS,
     LOAN_DAILY_RATE,
     CASH_BUCKET_ANNUAL_RATE,
     DAILY_RETURN_CLAMP,
     GFR_OBJECTIVE_THRESHOLD,
+    CAGR_REWARD_SCALE,
+    MDD_PENALTY_SCALE,
+    VOL_PENALTY_SCALE,
+    GFR_BRACKETS,
+    DIVERSITY_PENALTY_SCALE,
+    DIVERSITY_PENALTY_THRESHOLD,
+    MIN_ACTIVE_WEIGHT,
+    RELATIVE_WEIGHT_THRESHOLD,
+    MAX_DYNAMIC_ASSETS,
+    SIM_MONTHLY_START_YEAR,
+    SIM_TERMINAL_HORIZON_CAP,
+    DEBUG_LOG_MAX_YEARS,
 )
 
 
@@ -106,7 +118,7 @@ def _run_sim_core(
         debt *= (1 + LOAN_DAILY_RATE)
 
         # 2. Apply daily returns
-        cash_bucket   *= (1 + CASH_BUCKET_ANNUAL_RATE / TRADING_DAYS)
+        cash_bucket   *= (1 + CASH_BUCKET_ANNUAL_RATE / TRADING_DAYS_PER_YEAR)
         growth_ret     = float(portfolio_daily_returns[i])
         # Clip extreme daily moves to ±50% to prevent blow-ups from bad data
         growth_ret     = max(-DAILY_RETURN_CLAMP, min(DAILY_RETURN_CLAMP, growth_ret))
@@ -121,8 +133,8 @@ def _run_sim_core(
             growth_bucket += daily_contrib
 
         # 4. Goal liquidation at annual boundaries
-        year_idx = day_off // TRADING_DAYS + 1
-        if day_off > 0 and day_off % TRADING_DAYS == 0 and year_idx in goals:
+        year_idx = day_off // TRADING_DAYS_PER_YEAR + 1
+        if day_off > 0 and day_off % TRADING_DAYS_PER_YEAR == 0 and year_idx in goals:
             needed = float(goals[year_idx])
             # Waterfall: cash first, then growth
             for bucket_name in ("cash", "growth"):
@@ -170,7 +182,7 @@ def _run_sim_with_trajectory(
     for day_off in range(end_i - start_i):
         i = start_i + day_off
         debt *= (1 + LOAN_DAILY_RATE)
-        cash_bucket   *= (1 + CASH_BUCKET_ANNUAL_RATE / TRADING_DAYS)
+        cash_bucket   *= (1 + CASH_BUCKET_ANNUAL_RATE / TRADING_DAYS_PER_YEAR)
         growth_ret     = float(portfolio_daily_returns[i])
         growth_ret     = max(-DAILY_RETURN_CLAMP, min(DAILY_RETURN_CLAMP, growth_ret))
         growth_bucket *= (1 + growth_ret)
@@ -182,8 +194,8 @@ def _run_sim_with_trajectory(
         else:
             growth_bucket += daily_contrib
 
-        year_idx = day_off // TRADING_DAYS + 1
-        if day_off > 0 and day_off % TRADING_DAYS == 0:
+        year_idx = day_off // TRADING_DAYS_PER_YEAR + 1
+        if day_off > 0 and day_off % TRADING_DAYS_PER_YEAR == 0:
             if year_idx in goals:
                 needed = float(goals[year_idx])
                 for bucket_name in ("cash", "growth"):
@@ -308,7 +320,7 @@ def backtest_portfolio(
     """
     goals       = user_config["goals"]
     start_cap   = float(user_config["start_cap"])
-    n_days      = TRADING_DAYS * SIM_YEARS
+    n_days      = TRADING_DAYS_PER_YEAR * SIM_YEARS
     short_max, medium_max = boundary
 
     # ── Blend portfolio into a single daily-return series ──────────────────────
@@ -403,25 +415,6 @@ def simulate_batch(
 # Precision Monthly Simulator (Member D / Universal Policy)
 # ══════════════════════════════════════════════════════════════════════════════
 
-from _constants import (
-    TRADING_DAYS_PER_YEAR,
-    GFR_OBJECTIVE_THRESHOLD,
-    MIN_ACTIVE_WEIGHT,
-    RELATIVE_WEIGHT_THRESHOLD,
-    MAX_DYNAMIC_ASSETS,
-    DIVERSITY_PENALTY_SCALE,
-    DIVERSITY_PENALTY_THRESHOLD,
-    SIM_MONTHLY_START_YEAR,
-    SIM_TERMINAL_HORIZON_CAP,
-    DEBUG_LOG_MAX_YEARS,
-    CAGR_REWARD_SCALE,
-    MDD_PENALTY_SCALE,
-    VOL_PENALTY_SCALE,
-    MAX_RISK_OFFSET,
-    GFR_BRACKETS,
-    GFR_MISS_FLAT_PENALTY,
-    GFR_PERFECT_REWARD,
-)
 
 
 # ── Sim Helpers ───────────────────────────────────────────────────────────────
@@ -499,7 +492,6 @@ def build_simulation_cache(base_returns, max_horizon_years=30):
     cache_array = np.zeros((num_starts, num_assets), dtype=np.float32)
     
     # ── HYPER-FAST NUMPY CONVERSION ──
-    from _constants import TRADING_DAYS_PER_YEAR
     n_days = len(clean_returns)
     one_plus_ret = (1.0 + clean_returns.values).astype(np.float32)
     
@@ -584,13 +576,17 @@ def _aggregate_path_results(results, cvar_percentile=None):
     gfr = successes / total if total > 0 else 0
     etv = np.mean(all_tvs) if all_tvs else 0.0
     wds = np.mean(all_wds) if all_wds else 0.0
-    mean_market_mult = np.mean(all_mults) if all_mults else 1.0
+    
+    if all_mults:
+        safe_mults = np.maximum(all_mults, 1e-9)
+        mean_market_mult = float(np.exp(np.mean(np.log(safe_mults))))
+    else:
+        mean_market_mult = 1.0
 
     # MDD Aggregation: Mean or CVaR (Tail Risk)
     if all_mdds:
         if cvar_percentile is not None:
             sorted_mdds = np.sort(all_mdds)
-            # Find number of paths to average (worst X%)
             n_cvar = max(1, int(len(sorted_mdds) * (cvar_percentile / 100.0)))
             mdd = float(np.mean(sorted_mdds[-n_cvar:]))
         else:
@@ -603,72 +599,73 @@ def _aggregate_path_results(results, cvar_percentile=None):
 
 def _compute_reward(metrics, user_profile):
     """
-    3-part reward: Annual return score – risk-scaled MDD penalty – softened GFR penalty.
-    Horizon is always clamped to available data span.
-    All scaling constants live in _constants.py for easy tuning.
+    Compute the multi-faceted RL reward score for a simulation outcome.
+    Incorporates per-user penalty tuning via 4 sensitivity dimensions.
     """
-    horizon    = float(user_profile.get("goal_year", SIM_TERMINAL_HORIZON_CAP))
-    risk_tol   = float(user_profile["risk_tolerance"])
+    horizon = float(user_profile.get("goal_year", SIM_TERMINAL_HORIZON_CAP))
     
-    # Calculate Required CAGR
+    # 0. Per-user penalty sensitivities (1-10 scale, higher = more penalty)
+    dd_sens   = float(user_profile.get("drawdown_sensitivity", 5.0))
+    vol_sens  = float(user_profile.get("volatility_sensitivity", 5.0))
+    goal_flex = float(user_profile.get("goal_flexibility", 5.0))
+    conc_pref = float(user_profile.get("concentration_pref", 5.0))
+
+    # desperation_factor suppresses penalties if aggressive growth is required
     start_cap = user_profile.get('start_cap', 1.0)
     goal_amt = user_profile['goals'].get(int(horizon), start_cap)
-    
     if start_cap > 0 and horizon > 0:
         required_cagr = (goal_amt / start_cap) ** (1.0 / horizon) - 1.0
     else:
         required_cagr = 0.0
-        
-    # Desperation Factor: if required CAGR is > 10%, suppress risk penalties
     desperation_factor = max(1.0, required_cagr / 0.10)
 
-    # 1. Geometric CAGR Score — bounds exponential explosions from volatile assets
+    # 1. CAGR Score (Return Component)
     mean_market_mult = float(metrics.get("Mean_Market_Mult", 1.0))
-    # Ensure multiplier is positive to prevent complex number math errors
     safe_mult = max(mean_market_mult, 1e-6)
     annual_return = (safe_mult ** (1.0 / horizon)) - 1.0
+    # Winsorize upside at +500% to avoid outlier explosion
+    annual_return = min(annual_return, 5.0)
     return_score = annual_return * CAGR_REWARD_SCALE
 
-    # 2. Risk-Scaled MDD Penalty (Suppressed by Desperation Factor)
-    raw_mdd_penalty = metrics["MDD"] * MDD_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
+    # 2. MDD Penalty (Drawdown Component)
+    mdd_val = float(metrics.get("MDD", 0.0))
+    raw_mdd_penalty = mdd_val * MDD_PENALTY_SCALE * dd_sens
     mdd_penalty = raw_mdd_penalty / desperation_factor
-    
-    # 2b. Risk-Scaled Volatility / Consistency Penalty (Suppressed by Desperation Factor)
-    annual_vol = metrics.get("Annual_Vol", 0.0)
-    raw_vol_penalty = annual_vol * VOL_PENALTY_SCALE * (MAX_RISK_OFFSET - risk_tol)
+
+    # 3. Volatility Penalty (Consistency Component)
+    annual_vol = float(metrics.get("Annual_Vol", 0.0))
+    raw_vol_penalty = annual_vol * VOL_PENALTY_SCALE * vol_sens
     vol_penalty = raw_vol_penalty / desperation_factor
 
-    # 3. GFR Bracketed Contribution (Success Rate over N paths)
-    gfr = float(metrics["GFR"])
+    # 4. GFR Contribution (Goal Success Rate)
+    gfr = float(metrics.get("GFR", 0.0))
     x_coords = [b[0] for b in GFR_BRACKETS]
     y_coords = [b[1] for b in GFR_BRACKETS]
-    
-    # Sort for interpolation
     idx_sort = np.argsort(x_coords)
-    x_sorted = np.array(x_coords)[idx_sort]
-    y_sorted = np.array(y_coords)[idx_sort]
+    gfr_raw_contrib = float(np.interp(gfr, np.array(x_coords)[idx_sort], np.array(y_coords)[idx_sort]))
     
-    gfr_contrib = float(np.interp(gfr, x_sorted, y_sorted))
-    gfr_penalty = -min(0, gfr_contrib)
-    gfr_bonus   = max(0, gfr_contrib)
+    # flex=1 -> severity=1.0 (strict), flex=10 -> severity=0.1 (lenient)
+    gfr_severity = (11.0 - goal_flex) / 10.0
+    gfr_contrib = gfr_raw_contrib * gfr_severity
 
-    # 4. Diversity Penalty (Decisiveness Penalty)
-    # Count assets that have substantial weight
+    # 5. Diversity Penalty (Concentration Component)
     active_assets = int(metrics.get("Active_Assets", 0))
-    diversity_penalty = max(0, active_assets - DIVERSITY_PENALTY_THRESHOLD) * DIVERSITY_PENALTY_SCALE
+    div_threshold = max(3, int(11 - conc_pref))
+    diversity_penalty = max(0, active_assets - div_threshold) * DIVERSITY_PENALTY_SCALE
 
     total_reward = return_score + gfr_contrib - mdd_penalty - vol_penalty - diversity_penalty
-    
+
+    # Return breakdown for detailed logging
     metrics["reward_components"] = {
         "return_score": return_score,
+        "annual_return": annual_return,
         "mdd_penalty": mdd_penalty,
         "vol_penalty": vol_penalty,
-        "gfr_penalty": gfr_penalty,
-        "gfr_bonus": gfr_bonus,
-        "annual_return": annual_return,
+        "gfr_contrib": gfr_contrib,
         "diversity_penalty": diversity_penalty,
-        "required_cagr": required_cagr,
-        "desperation_factor": desperation_factor
+        "desperation_factor": desperation_factor,
+        "div_threshold": div_threshold,
+        "gfr_severity": gfr_severity
     }
 
     return total_reward
@@ -706,7 +703,6 @@ def _run_single_sim_path(weight_array, sim_cache, clean_returns, start_capital, 
             precomputed_returns[year - 1] = cache_array[pos]
     elif start_idx is not None:
         # Chronological mode
-        from _constants import TRADING_DAYS_PER_YEAR
         n_days = len(clean_returns)
         one_plus_ret = (1.0 + clean_returns.values).astype(np.float32)
         

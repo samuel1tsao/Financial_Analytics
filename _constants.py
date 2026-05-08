@@ -99,47 +99,28 @@ MDD_PENALTY_SCALE         = 2.0
 # Volatility / Consistency: Penalizes spiky, non-continuous returns (e.g. one-time massive spikes)
 VOL_PENALTY_SCALE         = 10.0
 
-# Risk factor: penalty_multiplier = (MAX_RISK_OFFSET - user_risk_tolerance)
-# Risk 1 -> multiplier 10 | Risk 10 -> multiplier 1
-MAX_RISK_OFFSET           = 11.0
-
-# Global factor to optionally dampen risk‑related penalties (MDD & Volatility)
-RISK_PENALTY_FACTOR      = 1.0  # Set <1.0 to lessen penalties for high‑risk profiles
-
-
-# GFR bracketed penalty/reward structure (Success Rate over N paths)
-GFR_BRACKETS              = [
-    (0.00, -30.0),    # 0% success (certain failure) -> Flat penalty
-    (0.50, -10.0),    # 50% success -> Mild penalty
-    (0.85,   0.0),    # 85% success -> Neutral
-    (1.00,  10.0)     # 100% success -> Bonus
+# GFR: Piecewise bonus/penalty based on success rate
+GFR_BRACKETS = [
+    (0.0, -20.0), (0.2, -15.0), (0.4, -10.0), (0.6, -5.0), (0.8, 0.0), (1.0, 5.0)
 ]
-GFR_MISS_FLAT_PENALTY     = 0.0     # (Deprecated in favor of GFR_BRACKETS)
-GFR_PERFECT_REWARD        = 10.0    # (Explicit bonus for 1.0)
 
-# Number of top assets to select by weight — used consistently in BOTH training and evaluation.
-# Replaces the old static TOP_K_ASSETS limit with a dynamic relative threshold.
-RELATIVE_WEIGHT_THRESHOLD = 0.1   # Keep assets >= 10% of the max weight
-MAX_DYNAMIC_ASSETS        = 20    # Ceiling for safety
-MIN_ACTIVE_WEIGHT         = 0.001   # kept only for display/log filtering
-DIVERSITY_PENALTY_SCALE   = 0.5   # Penalty per active asset in reward
-DIVERSITY_PENALTY_THRESHOLD = 10  # No penalty until active assets > this value
+# Diversity: Scaled penalty for holding too many assets (concentration pref affects threshold)
+DIVERSITY_PENALTY_SCALE = 0.5
+DIVERSITY_PENALTY_THRESHOLD = 10
 
-# Random asset subset size per training iteration.
-# Instead of presenting all ~6500 assets to the Transformer every step, we sample a random
-# subset. This: (1) speeds up attention O(N²→n²), (2) gives stronger per-asset gradient signal,
-# (3) forces the policy to learn general feature patterns rather than memorizing specific tickers.
-# Set to None to disable subsetting and use the full universe.
-RL_ASSET_SUBSET_SIZE      = 500
+# Portfolio Constraint Constants
+MIN_ACTIVE_WEIGHT         = 0.01   # Assets below this are dropped
+RELATIVE_WEIGHT_THRESHOLD = 0.05   # Assets below 5% of max weight are dropped
+MAX_DYNAMIC_ASSETS        = 30     # Hard cap on portfolio size
+RL_ASSET_SUBSET_SIZE      = 100    # Stochastic asset sampling per iteration (if not None)
 
-# Number of walk-forward snapshots to sample per RL episode
-WF_SNAPSHOTS_PER_EPISODE  = 8
-
-# User condition vector dimensions (single-goal: risk, capital, goal_year, goal_ratio)
-USER_CONDITION_DIM        = 4
+# User condition vector dimensions (8-dim: dd_sens, vol_sens, goal_flex, conc_pref, capital, goal_year, goal_ratio, req_cagr)
+USER_CONDITION_DIM        = 8
 CAPITAL_NORMALIZER        = 1_000_000.0
-RISK_NORMALIZER           = 10.0
+PREFERENCE_NORMALIZER     = 10.0    # All preference scores are 1-10
+CAGR_NORMALIZER           = 0.20    # 20% CAGR = 1.0
 GOAL_YEAR_NORMALIZER      = 30.0    # Normalize goal year to [0, 1]
+RISK_NORMALIZER           = 10.0    # Legacy normalizer for sensitivity scores
 
 # Simulation start year for monthly-shifted evaluation
 SIM_MONTHLY_START_YEAR    = 2006
@@ -276,41 +257,41 @@ DEFAULT_PIPELINE_CONFIG = {
 # ═══════════════════════════════════════════════════════════════════════
 
 TEST_PROFILES = [
-    # ── CONSERVATIVE (Risk 1-3) ──────────────────────────────────────────
-    {"profile_name": "Risk-Averse Saver", "risk_tolerance": 1.5, "start_cap": 25000, "monthly_contrib": 0, "goals": {3: 30000, 10: 60000}},
-    {"profile_name": "Conservative Retiree", "risk_tolerance": 2.0, "start_cap": 500000, "monthly_contrib": 0, "goals": {2: 50000, 5: 100000, 10: 200000}},
-    {"profile_name": "Legacy Protector", "risk_tolerance": 1.0, "start_cap": 1500000, "monthly_contrib": 0, "goals": {20: 2000000}},
-    {"profile_name": "Down Payment Safety", "risk_tolerance": 2.5, "start_cap": 80000, "monthly_contrib": 0, "goals": {4: 110000}},
-    {"profile_name": "Rainy Day Buffer", "risk_tolerance": 3.0, "start_cap": 15000, "monthly_contrib": 0, "goals": {5: 25000, 15: 50000}},
-    {"profile_name": "Trust Fund Anchor", "risk_tolerance": 1.8, "start_cap": 2000000, "monthly_contrib": 0, "goals": {10: 2500000, 25: 4000000}},
-    {"profile_name": "Stable Income Seeker", "risk_tolerance": 2.2, "start_cap": 300000, "monthly_contrib": 0, "goals": {5: 350000, 15: 500000, 30: 800000}},
-    {"profile_name": "Low-Volatility Pensioner", "risk_tolerance": 1.2, "start_cap": 1200000, "monthly_contrib": 0, "goals": {5: 1300000, 20: 1800000}},
-    {"profile_name": "Frugal Conservative", "risk_tolerance": 2.8, "start_cap": 50000, "monthly_contrib": 0, "goals": {10: 100000}},
-    {"profile_name": "Bond-Heavy Defensive", "risk_tolerance": 1.5, "start_cap": 100000, "monthly_contrib": 0, "goals": {3: 110000, 7: 130000, 12: 160000}},
+    # ── CONSERVATIVE (Hates drawdowns/vol, strict goals) ────────────────
+    {"profile_name": "Risk-Averse Saver", "drawdown_sensitivity": 9, "volatility_sensitivity": 8, "goal_flexibility": 2, "concentration_pref": 7, "start_cap": 25000, "monthly_contrib": 0, "goals": {3: 30000, 10: 60000}},
+    {"profile_name": "Conservative Retiree", "drawdown_sensitivity": 8, "volatility_sensitivity": 7, "goal_flexibility": 3, "concentration_pref": 6, "start_cap": 500000, "monthly_contrib": 0, "goals": {2: 50000, 5: 100000, 10: 200000}},
+    {"profile_name": "Legacy Protector", "drawdown_sensitivity": 10, "volatility_sensitivity": 9, "goal_flexibility": 1, "concentration_pref": 5, "start_cap": 1500000, "monthly_contrib": 0, "goals": {20: 2000000}},
+    {"profile_name": "Down Payment Safety", "drawdown_sensitivity": 8, "volatility_sensitivity": 6, "goal_flexibility": 2, "concentration_pref": 8, "start_cap": 80000, "monthly_contrib": 0, "goals": {4: 110000}},
+    {"profile_name": "Rainy Day Buffer", "drawdown_sensitivity": 7, "volatility_sensitivity": 7, "goal_flexibility": 4, "concentration_pref": 6, "start_cap": 15000, "monthly_contrib": 0, "goals": {5: 25000, 15: 50000}},
+    {"profile_name": "Trust Fund Anchor", "drawdown_sensitivity": 9, "volatility_sensitivity": 8, "goal_flexibility": 2, "concentration_pref": 5, "start_cap": 2000000, "monthly_contrib": 0, "goals": {10: 2500000, 25: 4000000}},
+    {"profile_name": "Stable Income Seeker", "drawdown_sensitivity": 8, "volatility_sensitivity": 8, "goal_flexibility": 3, "concentration_pref": 6, "start_cap": 300000, "monthly_contrib": 0, "goals": {5: 350000, 15: 500000, 30: 800000}},
+    {"profile_name": "Low-Volatility Pensioner", "drawdown_sensitivity": 9, "volatility_sensitivity": 9, "goal_flexibility": 1, "concentration_pref": 5, "start_cap": 1200000, "monthly_contrib": 0, "goals": {5: 1300000, 20: 1800000}},
+    {"profile_name": "Frugal Conservative", "drawdown_sensitivity": 7, "volatility_sensitivity": 7, "goal_flexibility": 5, "concentration_pref": 7, "start_cap": 50000, "monthly_contrib": 0, "goals": {10: 100000}},
+    {"profile_name": "Bond-Heavy Defensive", "drawdown_sensitivity": 9, "volatility_sensitivity": 8, "goal_flexibility": 2, "concentration_pref": 7, "start_cap": 100000, "monthly_contrib": 0, "goals": {3: 110000, 7: 130000, 12: 160000}},
 
-    # ── BALANCED (Risk 4-6) ──────────────────────────────────────────────
-    {"profile_name": "Balanced Growth", "risk_tolerance": 5.0, "start_cap": 150000, "monthly_contrib": 0, "goals": {5: 180000, 20: 400000}},
-    {"profile_name": "Mid-Career Climber", "risk_tolerance": 4.5, "start_cap": 250000, "monthly_contrib": 0, "goals": {10: 450000, 25: 1000000}},
-    {"profile_name": "House & College Fund", "risk_tolerance": 5.5, "start_cap": 100000, "monthly_contrib": 0, "goals": {7: 150000, 18: 300000}},
-    {"profile_name": "Pragmatic High Earner", "risk_tolerance": 6.0, "start_cap": 400000, "monthly_contrib": 0, "goals": {5: 600000, 15: 1200000, 30: 2500000}},
-    {"profile_name": "Moderate Explorer", "risk_tolerance": 4.0, "start_cap": 40000, "monthly_contrib": 0, "goals": {8: 100000}},
-    {"profile_name": "Diversified Builder", "risk_tolerance": 5.8, "start_cap": 120000, "monthly_contrib": 0, "goals": {12: 300000, 28: 800000}},
-    {"profile_name": "Mid-Stage Saver", "risk_tolerance": 4.2, "start_cap": 200000, "monthly_contrib": 0, "goals": {5: 250000, 10: 350000, 20: 600000}},
-    {"profile_name": "Steady Path Wealth", "risk_tolerance": 4.8, "start_cap": 75000, "monthly_contrib": 0, "goals": {10: 150000, 20: 350000, 30: 700000}},
-    {"profile_name": "Balanced Heritage", "risk_tolerance": 5.2, "start_cap": 800000, "monthly_contrib": 0, "goals": {15: 1500000, 30: 3000000}},
-    {"profile_name": "Early Retiree Attempt", "risk_tolerance": 6.0, "start_cap": 350000, "monthly_contrib": 0, "goals": {12: 1000000}},
+    # ── BALANCED (Moderate sensitivities) ──────────────────────────────
+    {"profile_name": "Balanced Growth", "drawdown_sensitivity": 5, "volatility_sensitivity": 5, "goal_flexibility": 5, "concentration_pref": 5, "start_cap": 150000, "monthly_contrib": 0, "goals": {5: 180000, 20: 400000}},
+    {"profile_name": "Mid-Career Climber", "drawdown_sensitivity": 6, "volatility_sensitivity": 5, "goal_flexibility": 5, "concentration_pref": 4, "start_cap": 250000, "monthly_contrib": 0, "goals": {10: 450000, 25: 1000000}},
+    {"profile_name": "House & College Fund", "drawdown_sensitivity": 5, "volatility_sensitivity": 4, "goal_flexibility": 6, "concentration_pref": 6, "start_cap": 100000, "monthly_contrib": 0, "goals": {7: 150000, 18: 300000}},
+    {"profile_name": "Pragmatic High Earner", "drawdown_sensitivity": 4, "volatility_sensitivity": 4, "goal_flexibility": 7, "concentration_pref": 4, "start_cap": 400000, "monthly_contrib": 0, "goals": {5: 600000, 15: 1200000, 30: 2500000}},
+    {"profile_name": "Moderate Explorer", "drawdown_sensitivity": 6, "volatility_sensitivity": 6, "goal_flexibility": 4, "concentration_pref": 5, "start_cap": 40000, "monthly_contrib": 0, "goals": {8: 100000}},
+    {"profile_name": "Diversified Builder", "drawdown_sensitivity": 4, "volatility_sensitivity": 5, "goal_flexibility": 6, "concentration_pref": 6, "start_cap": 120000, "monthly_contrib": 0, "goals": {12: 300000, 28: 800000}},
+    {"profile_name": "Mid-Stage Saver", "drawdown_sensitivity": 6, "volatility_sensitivity": 6, "goal_flexibility": 5, "concentration_pref": 5, "start_cap": 200000, "monthly_contrib": 0, "goals": {5: 250000, 10: 350000, 20: 600000}},
+    {"profile_name": "Steady Path Wealth", "drawdown_sensitivity": 5, "volatility_sensitivity": 5, "goal_flexibility": 6, "concentration_pref": 5, "start_cap": 75000, "monthly_contrib": 0, "goals": {10: 150000, 20: 350000, 30: 700000}},
+    {"profile_name": "Balanced Heritage", "drawdown_sensitivity": 5, "volatility_sensitivity": 5, "goal_flexibility": 5, "concentration_pref": 5, "start_cap": 800000, "monthly_contrib": 0, "goals": {15: 1500000, 30: 3000000}},
+    {"profile_name": "Early Retiree Attempt", "drawdown_sensitivity": 4, "volatility_sensitivity": 4, "goal_flexibility": 7, "concentration_pref": 3, "start_cap": 350000, "monthly_contrib": 0, "goals": {12: 1000000}},
 
-    # ── AGGRESSIVE (Risk 7-9) ────────────────────────────────────────────
-    {"profile_name": "Aggressive Young Investor", "risk_tolerance": 9.0, "start_cap": 50000, "monthly_contrib": 0, "goals": {15: 200000, 30: 1000000}},
-    {"profile_name": "Tech Bulls Catalyst", "risk_tolerance": 8.0, "start_cap": 10000, "monthly_contrib": 0, "goals": {10: 80000, 20: 400000, 30: 1500000}},
-    {"profile_name": "Crypto-Minded Equity", "risk_tolerance": 8.5, "start_cap": 5000, "monthly_contrib": 0, "goals": {5: 25000, 15: 150000}},
-    {"profile_name": "HNW Risk Taker", "risk_tolerance": 7.5, "start_cap": 1000000, "monthly_contrib": 0, "goals": {10: 3000000, 25: 10000000}},
-    {"profile_name": "Compound Interest Maxi", "risk_tolerance": 7.0, "start_cap": 20000, "monthly_contrib": 0, "goals": {25: 500000, 30: 1000000}},
-    {"profile_name": "Full Growth Engine", "risk_tolerance": 9.0, "start_cap": 100000, "monthly_contrib": 0, "goals": {5: 200000, 10: 500000, 20: 2000000, 30: 5000000}},
-    {"profile_name": "Venture Style Liquid", "risk_tolerance": 8.2, "start_cap": 300000, "monthly_contrib": 0, "goals": {15: 1500000}},
-    {"profile_name": "Speculative Compounder", "risk_tolerance": 7.8, "start_cap": 15000, "monthly_contrib": 0, "goals": {10: 100000, 20: 500000, 30: 2000000}},
-    {"profile_name": "Unconstrained Growth", "risk_tolerance": 9.0, "start_cap": 2500, "monthly_contrib": 0, "goals": {30: 500000}},
-    {"profile_name": "Aggressive Legacy", "risk_tolerance": 7.2, "start_cap": 500000, "monthly_contrib": 0, "goals": {20: 3000000, 30: 8000000}},
+    # ── AGGRESSIVE (Low sensitivities, high flex, concentration) ───────
+    {"profile_name": "Aggressive Young Investor", "drawdown_sensitivity": 2, "volatility_sensitivity": 2, "goal_flexibility": 9, "concentration_pref": 2, "start_cap": 50000, "monthly_contrib": 0, "goals": {15: 200000, 30: 1000000}},
+    {"profile_name": "Tech Bulls Catalyst", "drawdown_sensitivity": 3, "volatility_sensitivity": 3, "goal_flexibility": 8, "concentration_pref": 3, "start_cap": 10000, "monthly_contrib": 0, "goals": {10: 80000, 20: 400000, 30: 1500000}},
+    {"profile_name": "Crypto-Minded Equity", "drawdown_sensitivity": 2, "volatility_sensitivity": 3, "goal_flexibility": 9, "concentration_pref": 2, "start_cap": 5000, "monthly_contrib": 0, "goals": {5: 25000, 15: 150000}},
+    {"profile_name": "HNW Risk Taker", "drawdown_sensitivity": 3, "volatility_sensitivity": 3, "goal_flexibility": 7, "concentration_pref": 4, "start_cap": 1000000, "monthly_contrib": 0, "goals": {10: 3000000, 25: 10000000}},
+    {"profile_name": "Compound Interest Maxi", "drawdown_sensitivity": 4, "volatility_sensitivity": 4, "goal_flexibility": 7, "concentration_pref": 3, "start_cap": 20000, "monthly_contrib": 0, "goals": {25: 500000, 30: 1000000}},
+    {"profile_name": "Full Growth Engine", "drawdown_sensitivity": 2, "volatility_sensitivity": 2, "goal_flexibility": 10, "concentration_pref": 2, "start_cap": 100000, "monthly_contrib": 0, "goals": {5: 200000, 10: 500000, 20: 2000000, 30: 5000000}},
+    {"profile_name": "Venture Style Liquid", "drawdown_sensitivity": 3, "volatility_sensitivity": 3, "goal_flexibility": 8, "concentration_pref": 3, "start_cap": 300000, "monthly_contrib": 0, "goals": {15: 1500000}},
+    {"profile_name": "Speculative Compounder", "drawdown_sensitivity": 3, "volatility_sensitivity": 4, "goal_flexibility": 8, "concentration_pref": 2, "start_cap": 15000, "monthly_contrib": 0, "goals": {10: 100000, 20: 500000, 30: 2000000}},
+    {"profile_name": "Unconstrained Growth", "drawdown_sensitivity": 1, "volatility_sensitivity": 1, "goal_flexibility": 10, "concentration_pref": 1, "start_cap": 2500, "monthly_contrib": 0, "goals": {30: 500000}},
+    {"profile_name": "Aggressive Legacy", "drawdown_sensitivity": 3, "volatility_sensitivity": 4, "goal_flexibility": 7, "concentration_pref": 4, "start_cap": 500000, "monthly_contrib": 0, "goals": {20: 3000000, 30: 8000000}},
 ]
 
 
@@ -341,7 +322,10 @@ def decompose_profiles(profiles=None, max_horizon=None):
 
             single_goal_profiles.append({
                 "profile_name": f"{p['profile_name']} (Y{goal_yr})",
-                "risk_tolerance": p["risk_tolerance"],
+                "drawdown_sensitivity": p["drawdown_sensitivity"],
+                "volatility_sensitivity": p["volatility_sensitivity"],
+                "goal_flexibility": p["goal_flexibility"],
+                "concentration_pref": p["concentration_pref"],
                 "start_cap": p["start_cap"],
                 "monthly_contrib": p.get("monthly_contrib", 0),
                 "goal_year": goal_yr,
