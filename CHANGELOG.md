@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-05-08] - RL Reward Math & Fundamental Volatility Consistency
+
+### FIX — Geometric Path Aggregation (The "MSTX Bias" Cure)
+- **Mathematical Correction**: Discovered that aggregating randomized market paths using an **Arithmetic Mean** of terminal multipliers was creating a massive bias toward hyper-volatile "lottery" assets (like MSTX). One extreme +500% outlier path was skewing the average expectation, tricking the RL agent into ignoring the 99% of paths where the asset crashed.
+- **Geometric CAGR across Paths**: Switched the simulation aggregator in `_sim_worker.py` to use the **Geometric Mean** across all paths. This correctly captures "volatility drag," ensuring that an asset which spikes and then crashes is correctly penalized.
+
+### FEAT — Fundamental Volatility & Consistency Filter
+- **Dynamic Risk Boundary**: Replaced the hard-coded asset exclusion list with a **Fundamental Volatility Filter** in `vector_encoder.py`. The system now dynamically calculates the trailing 30-day volatility of every asset and compares it against a ceiling derived from the user's `volatility_sensitivity` profile.
+- **Consistency Ratio**: Implemented a "Structural Stability" check that rejects assets whose recent (30-day) volatility has spiked by more than **50%** relative to their 1-year historical baseline. This automatically weeds out "broken" or erratic assets like MSTX while allowing consistent high-growth stocks like SNDK to pass.
+- **Logit Smoothing**: Reduced `target_std` in `sharpen_logits` from 1.0 to 0.5. This prevents the neural network from "locking on" to a single high-logit asset with 80%+ weights, forcing a more balanced and diversified consensus across the ensemble.
+
 ## [2026-05-08] - Asset Fundamentals & Sync Stability
 
 ### FIX — Missing Asset Fundamentals (MSTX)

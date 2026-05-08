@@ -243,7 +243,18 @@ Instead of providing the autoencoder with just a 1-year trailing snapshot of `hi
     *   *Rejected (Padding):* Padding with 0s acts as a punitive drag on the average, misrepresenting a successful young company as a mediocre one.
     *   *Rejected (Dropping):* Dropping samples without 15 years of data would eliminate the vast majority of our S&P 1500 universe from the backtester.
     *   *Chosen (Truncated Windows):* If the required lookback window exceeds the asset's lifespan at that historical snapshot, we compute the mean over its maximum available lifetime `[max(0, i - h + 1) : i + 1]`. A 7-year-old company's "15-year trailing return" simply equals its lifetime 7-year return. This maximizes data utilization while preventing NaN contamination.
+    
+### 11.11 Geometric Path Aggregation (The "Wealth Expectation" Paradox)
+*   **Problem:** In Monte Carlo simulations, taking the **Arithmetic Mean** of terminal wealth across many randomized paths (`mean_market_mult = np.mean(all_mults)`) artificially rewards variance. A path that hits a +500% outlier multiple times (the "lottery path") skews the average so heavily that the RL agent learns to maximize "Expected Wealth" by gambling on high-skew, hyper-volatile assets, even if the median path is bankruptcy.
+*   **Solution:** We implemented **Geometric Mean Aggregation** across paths: `exp(mean(log(multipliers)))`.
+*   **Impact:** This aligns the reward with the **Median Path** (the most likely outcome) rather than the extreme right-tail mean. It inherently penalizes "volatility drag" and ensures the agent favors consistent compounding over erratic spikes.
 
+### 11.12 Fundamental Volatility & Consistency Filter (Inference Guardrails)
+*   **Problem:** Even with fixed training math, pre-trained neural networks may still exhibit "hallucinated" confidence in erratic assets. Hardcoded ticker exclusions are not scalable.
+*   **Solution:** Implemented a **Dynamic Fundamental Filter** in the inference pipeline:
+    1. **Recent Volatility Cap:** Computes trailing 30-day volatility and compares it against a ceiling derived from the user's `volatility_sensitivity` (mapping 1-10 to a 200%-40% cap range).
+    2. **Consistency Check:** Rejects assets whose recent (30-day) volatility has spiked by more than **50%** relative to their long-term historical (1-year) baseline (`recent_vol / hist_vol > 1.5`).
+*   **Rationale:** This ensures the "item" (asset) recommended is structurally consistent with its historical profile, weeding out "broken" assets without hardcoding specific tickers.
 ---
 > [!TIP]
 > **Risk Management:** If Hybrid Embeddings take too long, fall back to a simple Historical Correlation Matrix for Week 2 to avoid blocking other tracks.
