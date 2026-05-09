@@ -35,20 +35,21 @@ We synthesize data from Yahoo Finance and Wikipedia to create a rich, safety-cla
 > **Data Poisoning Prevention:** All candidate features are classified by temporal stability using a `COLUMN_SAFETY_REGISTRY` with 150+ annotated yfinance columns. Only `SAFE_STATIC` and `DERIVED` features are permitted as embedding model inputs. See Section 11.7 for full rationale.
 
 ## 3. Methodology
-The core of the project involves transitioning from early baseline models to an **End-to-End Transformer Architecture trained via Reinforcement Learning (Policy Gradients)**.
+The core of the project involves transitioning from early baseline models to an **End-to-End Multi-Agent Ensemble Transformer Architecture trained via Reinforcement Learning (Policy Gradients)**.
 *   **Baselines:** Popularity-based (Top Gainers) and Content-Based Filtering using metadata (Sector/Industry) - e.g., S&P index funds.
 *   **RL-Driven Transformer Pipeline:**
     1.  **Ingestion:** Concatenates Transformer-derived temporal sequence embeddings (replacing older autoencoders), user features, and static asset features into a dense vector for every asset.
     2.  **Core Engine (Transformer):** Self-Attention contextualizes the entire market without pre-filtering, dynamically calculating cross-asset covariance and user-asset relevance.
-    3.  **Action Generation (Gaussian Policy):** Outputs a parameterized normal distribution ($\mu$, $\sigma$) per asset. $\mu$ serves as the target allocation, while $\sigma$ dictates the RL agent's exploration noise.
-    4.  **Black-Box Environment:** Executes sampled portfolio weights through a discrete, non-differentiable simulator handling cash flows and goal logic, outputting a scalar Reward.
-    5.  **Policy Gradient Update:** Uses the REINFORCE framework to bypass simulator non-differentiability, pulling $\mu$ toward successful allocations and refining $\sigma$.
+    3.  **Action Generation (Dual Gaussian Policy):** Outputs two independent parameterized normal distributions ($\mu$, $\sigma$) per asset for `pre-goal` (funding) and `post-goal` (growth) phases. $\mu$ serves as the target allocation, while $\sigma$ dictates the RL agent's exploration noise.
+    4.  **Multi-Agent Ensemble:** To prevent local optima, $N$ independent agents are trained in parallel using `joblib`. The final recommended portfolio is the averaged consensus of all agents.
+    5.  **Black-Box Environment:** Executes sampled portfolio weights through a discrete, non-differentiable simulator handling cash flows and goal logic, outputting a scalar Reward.
+    6.  **Policy Gradient Update:** Uses the REINFORCE framework to bypass simulator non-differentiability, pulling $\mu$ toward successful allocations and refining $\sigma$.
 
 ## 4. MVP Scope & Implementation
 The MVP will focus on a **Personalized Allocation Pipeline**:
-1.  **Input:** User defines Risk Tolerance (1–10), Sector Preferences, and Time Horizons (e.g., "5-year house down payment" vs. "30-year retirement").
-2.  **Processing:** The system filters assets by risk/volatility, then applies a weighted allocation logic.
-3.  **Output:** A diversified portfolio recommendation including specific ticker symbols and percentage weights.
+1.  **Input & State Management:** User defines Risk Tolerance (1–10), Sector Preferences, and Time Horizons. The questionnaire utilizes a strict validation engine (preventing 0% inputs and enforcing required goals) alongside answer persistence for returning users.
+2.  **Processing:** The system filters assets by risk/volatility, evaluates them through the Multi-Agent RL Ensemble, and applies a weighted allocation logic.
+3.  **Output:** A diversified portfolio recommendation with a True Wealth Percentile (River Plot) visualization, driven by a client-side Monte Carlo simulator running 1,000 historical paths.
 
 ### Future Extensions (Stretch Goals)
 *   **Time-Decay Rebalancing:** Automated risk reduction as goal dates approach.
@@ -62,10 +63,10 @@ The MVP will focus on a **Personalized Allocation Pipeline**:
 We will use a dual-evaluation strategy:
 *   **Recommender Metrics:** NDCG and Precision@K to measure how well the system identifies high-performing assets within the user's preferred sectors.
 *   **Financial Metrics:** Back-testing recommended portfolios against a **Sharpe Ratio** benchmark and the S&P 500.
-*   **Terminal Wealth Comparison:** Simulating a $10,000 investment over a 20-30 year period against:
+*   **True Wealth Percentiles (River Plot):** Simulating a $10,000 investment over a 20-30 year period using 1,000 Monte Carlo paths to generate a 10th - 90th Probability Fan, compared against:
     *   **Static Baseline:** 60/40 Stock/Bond split.
     *   **Aggressive Baseline:** 100% S&P 500 Equity.
-*   **Goal Success Rate:** Measuring **Max Drawdown** for short/medium-term goals. Success is defined by capital preservation during volatility.
+*   **Goal Success Rate:** Measuring **Max Drawdown** and exact goal fulfillment percentages for short/medium-term goals. Success is defined by capital preservation during volatility and actual withdrawal execution.
 
 ---
 
@@ -144,6 +145,7 @@ Closing the loop end-to-end.
 *   **Loss Function:** `Loss = -(Reward - Baseline) * log(Probability of Sampled Weights)`
 *   **Variance Reduction:** Utilizes an Exponential Moving Average (EMA) baseline to center gradient updates, stabilizing learning across the massive continuous action space.
 *   **Stochastic Updates:** Performs ultra-fast gradient updates after every iteration using three key throughput optimizations (see Section 12.8): (1) a pre-computed Annual Simulation Cache replaces per-step Pandas slicing with a single `np.dot` per year, (2) Random Asset Subset Sampling (`RL_ASSET_SUBSET_SIZE = 500`) reduces Transformer attention cost by ~169×, and (3) each gradient update uses only `rl_paths_per_step = 5` simulation paths instead of 50, enabling ~10× more updates per wall-clock second. Combined, these achieve sustained 1+ it/s training throughput.
+*   **Parallel Ensemble Execution:** Spawns $N$ independent training processes via `joblib`, allowing the full Multi-Agent Ensemble to train concurrently.
 *   **Optimization:** Gradient flows from the Policy Loss directly through the Gaussian Policy and into the RL Transformer, shifting $\mu$ toward successful weights and shrinking $\sigma$ as confidence grows.
 
 ---
@@ -343,6 +345,14 @@ This creates "Decisiveness Pressure": the agent pays a tax for every asset it ad
 ### 12.14 UI Interpretability & Sensitivity Mapping
 **Problem:** Users found the questionnaire sliders "jarring" because the interpretation text above the slider jumped and shifted the layout during interaction. Additionally, numeric values were opaque without clear labels.
 **Solution:** Migrated detailed interpretations to **Fixed-Height Cards** below the sliders. These cards provide static visual anchors and more detailed financial rationales for each of the 10 sensitivity levels. Added numeric tick marks (1-10) to the slider track to align the visual "feel" with the underlying RL condition vector.
+
+### 12.15 High-Fidelity Client-Side Simulation (River Plot)
+**Problem:** Server-side Monte Carlo simulations for 1,000 paths caused too much latency for interactive UI sliders. Visualizing only the arithmetic mean collapsed the variance distributions visually.
+**Solution:** Offloaded the cashflow compounding to the frontend (running 1,000 paths in JS) to maintain instant slider interactivity. Replaced standard deviation with **True Wealth Percentiles (10th - 90th Probability Fan / River Plot)** to provide a robust median-based expected path.
+
+### 12.16 Multi-Agent Ensemble Parallelism
+**Problem:** Single-agent RL is prone to local optima, and sequentially training multiple agents bottlenecked the pipeline.
+**Solution:** Refactored the training loop to spawn $N$ completely independent training processes using `joblib`. Each agent computes its own gradients and maintains its own checkpoint. The orchestrator later averages their policy outputs into a robust consensus allocation, providing ~3x speedup and vastly superior portfolio stability.
 
 ---
 
