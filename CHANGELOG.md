@@ -1,5 +1,21 @@
 # Changelog
 
+## [2026-05-16] - Backtest Hindsight Bias Elimination & Inference Robustness
+
+### FIX — Temporal Asset-Filtering (Hindsight Bias Elimination)
+- **Problem**: The Monte Carlo 30-year backtest engine was previously capable of recommending or purchasing assets before their historical IPO/launch date (hindsight bias), causing unrealistic performance spikes.
+- **Temporal Filter**: Restructured `encode_multi_horizon` in `vector_encoder.py` and the simulation loop to strictly restrict the candidate asset universe to only those assets that have existed for at least `require_historical_years` as of the simulation start date (or target backtest date).
+- **As of Date Constraint**: Enabled the recommendation pipeline to accept an `as_of_date` parameter, forcing `RLRecommender` to slice historical returns and evaluate candidate assets using only information that was available at that specific historical point.
+
+### FIX — Dimensional Drift Defense in Vector Encoder
+- **Problem**: Mismatched feature dimensionality between the master dataframe and the pre-trained model input layer (which expects a specific input dimension, e.g., 230) could cause hard crashes during matrix concatenation in `get_weights`.
+- **Dynamic Padding/Truncation**: Added defensive padding and truncation logic to `RLRecommender.get_weights` in `vector_encoder.py`. It dynamically pads (with constants) or truncates the static feature matrix so that the concatenated tensor perfectly matches the model's `loaded_input_dim`.
+
+### FIX — Simulation Robustness and Volatility Filtering Fallbacks
+- **Problem**: If the user's volatility sensitivity was set extremely low, the dynamic volatility filter could eliminate *all* candidate assets, resulting in empty portfolios and simulation crashes.
+- **Lowest-Volatility Fallback**: Added a fallback in `vector_encoder.py` that, if the volatility filter filters out 100% of candidates, relaxes the constraint and selects the top 30 lowest-volatility assets to preserve portfolio continuity.
+- **Empty Column Guards**: Added robust guards to `_sim_worker.py` handling missing or empty columns in `daily_returns` and defaulting back to a broad index (e.g., `VOO`, `SPY`) if no valid assets exist.
+
 ## [2026-05-08] - RL Reward Math & Fundamental Volatility Consistency
 
 ### FIX — Geometric Path Aggregation (The "MSTX Bias" Cure)

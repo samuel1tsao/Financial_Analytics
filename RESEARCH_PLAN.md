@@ -19,6 +19,11 @@
 9. [Key Design Considerations & Trade-offs](#9-key-design-considerations--trade-offs)
 10. [Stretch Goals & Future Enhancements](#10-stretch-goals--future-enhancements)
 11. [Architectural Alternatives & Embedding Considerations](#11-architectural-alternatives--embedding-considerations)
+12. [RL Training Findings & Engineering Considerations](#12-rl-training-findings--engineering-considerations)
+13. [Multi-Phase Waterfall Allocation](#13-multi-phase-waterfall-allocation-engineering-spec)
+14. [Explainable AI & Rationale Generation](#14-explainable-ai--rationale-generation)
+15. [Temporal Asset-Filtering (Hindsight Bias Elimination)](#15-temporal-asset-filtering-hindsight-bias-elimination)
+16. [Dimensional Drift Defense & Volatility Filtering Fallbacks](#16-dimensional-drift-defense--volatility-filtering-fallbacks)
 
 ---
 
@@ -392,3 +397,42 @@ The engine uses historical volatility (`hist_volatility`) to explain the asset's
 
 ### 14.3 Multi-Goal Sensitivity
 The rationales change based on the waterfall segment. A stock might be a "Strategic diversifier" in a 5-year house goal but shift to a "High-conviction primary holding" in the 30-year Growth Phase, reflecting the RL agent's temporal adaptability.
+
+---
+
+## 15. Temporal Asset-Filtering (Hindsight Bias Elimination)
+
+To ensure the statistical validity of the 30-year historical Monte Carlo simulations, we must strictly prevent the model from recommending or "purchasing" assets prior to their actual IPO or market entry date. Recommending a modern stock (e.g., TSLA or VOO) in a simulated year like 1996 represents a severe form of **hindsight bias** (or lookahead bias) that artificially inflates backtest returns.
+
+### 15.1 Temporal Asset Universe Resolution
+We resolved this by implementing a dynamic temporal asset-filtering mechanism in the portfolio inference pipeline:
+1. **`as_of_date` Constraint**: Added an optional `as_of_date` parameter to `encode_multi_horizon` in `vector_encoder.py`. When provided, the recommender dynamically trims the available returns history up to the simulated point in time:
+   $$\mathcal{D}_{\text{available}} = \{ r_{t} \in \mathcal{D} \mid t \le T_{\text{as\_of}} \}$$
+2. **Launch/IPO Validation**: Filters the available candidate asset list to include only those stocks that have been actively traded for at least $N$ years (controlled by `require_historical_years`) prior to the target date. An asset $i$ is valid if and only if:
+   $$\text{Count}(r_{i, t} \mid t \le T_{\text{as\_of}}) \ge N \times \text{Trading Days Per Year}$$
+3. **Waterfall Segment Alignment**: During a multi-goal simulation run, the simulator passes the starting year of the active segment as the `as_of_date` to prevent any asset selection that relies on future data.
+
+This guarantees that the simulated portfolio performance reflects only real-world historical constraints, preventing "random massive spikes" from pre-IPO asset inclusion.
+
+---
+
+## 16. Dimensional Drift Defense & Volatility Filtering Fallbacks
+
+As the system architecture evolves, changes in downstream models or static database schemas can lead to discrepancies between the dimension of engineered input features and the pre-trained neural network layers. 
+
+### 16.1 Dynamic Padding and Truncation (Dimensional Drift Defense)
+The `RLRecommender` expects a fixed input dimension determined during the training run (e.g., `loaded_input_dim = 230` consisting of sequence embeddings, user profile vectors, and static features). If new features are added to `master_df` or if columns are altered, the static feature matrix size will drift. 
+
+To prevent runtime crashes, we implemented a self-healing **Dimensional Drift Defense** inside the feature concatenation step in `vector_encoder.py`:
+- **Under-dimensioned Inputs**: If the static feature matrix contains fewer columns than expected, the engine dynamically pads the tensor using constant zero-padding:
+  $$\text{static\_matrix}_{\text{padded}} = [\text{static\_matrix}, \mathbf{0}_{N \times d_{\text{pad}}}]$$
+- **Over-dimensioned Inputs**: If the master dataframe includes new experimental columns, the engine truncates the feature matrix to the exact expected width, discarding the extra columns:
+  $$\text{static\_matrix}_{\text{truncated}} = \text{static\_matrix}[:, 0 : d_{\text{expected}}]$$
+
+### 16.2 Volatility Filtering Fallback (Continuity Insurance)
+Under aggressive risk-averse settings (e.g., user `volatility_sensitivity = 1`), the dynamic volatility cap and the 50% consistency spike filters can sometimes eliminate **100% of candidate assets**, which would otherwise trigger an empty recommendation vector and crash the simulator.
+
+To ensure portfolio continuity:
+- If the filter returns an empty subset, the pipeline logs a warning and dynamically relaxes the risk boundary.
+- It bypasses the hard cap and selects the **top 30 lowest-volatility assets** from the universe as a safe fallback, ensuring the user always receives a valid, highly-diversified conservative recommendation instead of an error.
+- Robust fallback logic was also added to `_sim_worker.py` to default back to high-grade index funds (such as `VOO` or `SPY`) if there are absolute data dropouts in the daily returns matrix.
