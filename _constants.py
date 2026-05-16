@@ -191,16 +191,16 @@ DEFAULT_PIPELINE_CONFIG = {
     "rl_dropout": 0.1,
     "rl_learning_rate": 0.001,
     "rl_episodes": 10000000,
-    "rl_force_rebuild": True,
+    "rl_force_rebuild": False,
     "rl_initial_mu_bias": 0.0,
     "rl_checkpoint_frequency": 10,
     "sim_paths_per_episode": 50,          # (Legacy) Number of start-dates for full evaluation
     "rl_paths_per_step": 10,              # Sim paths per gradient update step (stochastic training)
     "rl_verbose_every": 10,                # Print progress every N iterations
     "rl_ensemble_size": 3,                 # Number of agents to train and average together
-    "rl_convergence_window": 500,          # Rolling window size for reward smoothing
-    "rl_convergence_patience": 5000,       # Iterations without improvement before convergence
-    "rl_convergence_min_delta": 0.5,       # Minimum reward improvement to reset patience
+    "rl_convergence_window": 5000,         # Large window to smooth out multi-profile noise
+    "rl_convergence_patience": 25000,      # Wait much longer before declaring convergence
+    "rl_convergence_min_delta": 0.1,       # Lower threshold for what counts as an "improvement"
     "rl_early_stopping": False,            # If True, halt training on convergence detection
     "debug_path": False,                   # Global toggle for per‑episode sample‑path logging
     "rl_parallel_cores": -1,               # Use all cores by default (set to 1 for tiny jobs)

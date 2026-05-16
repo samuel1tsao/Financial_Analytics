@@ -558,7 +558,10 @@ def _resolve_simulation_starts(portfolio_returns, start_date=None, start_year_id
 
     # Default: all trading days from SIM_MONTHLY_START_YEAR onward to allow high-fidelity sampling
     recent = portfolio_returns[portfolio_returns.index.year >= SIM_MONTHLY_START_YEAR]
-    indices = np.where(portfolio_returns.index >= recent.index[0])[0]
+    if len(recent) > 0:
+        indices = np.where(portfolio_returns.index >= recent.index[0])[0]
+    else:
+        indices = np.arange(len(portfolio_returns))
     return indices.tolist()
 
 

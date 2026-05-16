@@ -88,9 +88,7 @@ class PortfolioTransformerRL(nn.Module):
         dim_feedforward = config.get("rl_dim_feedforward", 256)
         dropout        = config.get("rl_dropout", 0.1)
 
-        # Learnable Embedding Adapter: expands frozen embeddings
-        # from emb_raw_dim (8) to adapter_out_dim (32) so RL gradients
-        # can learn to re-weight and amplify informative embedding dimensions.
+        # 1. Expand frozen embeddings (8 -> 32)
         self.emb_raw_dim = emb_raw_dim
         adapter_out_dim = config.get("rl_adapter_dim", 32)
         self.emb_adapter = nn.Sequential(
@@ -99,8 +97,25 @@ class PortfolioTransformerRL(nn.Module):
             nn.Linear(adapter_out_dim, adapter_out_dim),
         )
 
-        # Effective input dim after adapter: (input_dim - emb_raw_dim + adapter_out_dim)
-        adapted_input_dim = input_dim - emb_raw_dim + adapter_out_dim
+        # 2. Amplify User Condition (8 -> 32)
+        user_out_dim = config.get("rl_user_dim", 32)
+        self.user_adapter = nn.Sequential(
+            nn.Linear(8, user_out_dim),
+            nn.ReLU(),
+            nn.Linear(user_out_dim, user_out_dim),
+        )
+
+        # 3. Compress Static Asset Features (~214 -> 64)
+        self.static_raw_dim = input_dim - emb_raw_dim - 8
+        static_out_dim = config.get("rl_static_dim", 64)
+        self.static_adapter = nn.Sequential(
+            nn.Linear(self.static_raw_dim, static_out_dim),
+            nn.ReLU(),
+            nn.Linear(static_out_dim, static_out_dim),
+        )
+
+        # Effective input dim after all adapters (32 + 32 + 64 = 128)
+        adapted_input_dim = adapter_out_dim + user_out_dim + static_out_dim
 
         # Project adapted features to transformer dimension
         self.input_proj = nn.Linear(adapted_input_dim, self.d_model)
@@ -125,18 +140,23 @@ class PortfolioTransformerRL(nn.Module):
     def forward(self, x, src_key_padding_mask=None):
         """
         x: (batch, num_assets, input_dim)
-           Layout: [embedding(8) | user_condition(8) | static_features(~217)]
+           Layout: [embedding(8) | user_condition(8) | static_features(~214)]
         Returns: (mu, sigma) each (batch, num_assets)
         """
-        # Split out the frozen embedding dims and adapt them
+        # Split out the three distinct feature groups
         emb_raw = x[:, :, :self.emb_raw_dim]               # (B, N, 8)
-        # Note: input_dim now expects user_condition(8)
         user_cond_end = self.emb_raw_dim + 8
-        other   = x[:, :, user_cond_end:]                  # (B, N, 217)
         user_c  = x[:, :, self.emb_raw_dim:user_cond_end]  # (B, N, 8)
+        other   = x[:, :, user_cond_end:]                  # (B, N, ~214)
         
-        emb_adapted = self.emb_adapter(emb_raw)             # (B, N, 32)
-        x_adapted = torch.cat([emb_adapted, user_c, other], dim=-1)
+        # Apply specialized adapters
+        emb_adapted    = self.emb_adapter(emb_raw)         # (B, N, 32)
+        user_adapted   = self.user_adapter(user_c)         # (B, N, 32)
+        static_adapted = self.static_adapter(other)        # (B, N, 64)
+
+        # Concatenate re-balanced signal (Total 128 dims)
+        # User condition is now 25% of the total signal (32/128) instead of 3%
+        x_adapted = torch.cat([emb_adapted, user_adapted, static_adapted], dim=-1)
 
         h   = F.relu(self.input_proj(x_adapted))
         out = self.transformer(h, src_key_padding_mask=src_key_padding_mask)
@@ -500,6 +520,11 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
         valid_ticker_mask = valid_col_indices >= 0
         is_active_matrix = base_returns.notna().values
         clean_returns_values = clean_returns.values
+        
+        # Precompute Asset Stats for Logging (Annualized)
+        asset_means = cache_array.mean(axis=0)
+        asset_vols  = cache_array.std(axis=0)
+        
         print(f"  Cache ready. {len(sim_start_pool)} start dates, {num_columns} columns.")
 
         # ── Initialize agent ──────────────────────────────────────────────
@@ -526,7 +551,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             print(f"  Restart Mode: Deleting checkpoint...")
             os.remove(checkpoint_path)
         elif not force_rebuild and os.path.exists(checkpoint_path):
-            print(f"  Resume Mode: Loading checkpoint...")
+            print(f"  Resume Mode: Attempting to load {os.path.basename(checkpoint_path)}...")
             try:
                 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
                 agent.load_state_dict(checkpoint['model_state'])
@@ -541,8 +566,8 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
                 print(f"  WARNING: Failed to load checkpoint: {e}. Starting from scratch.")
 
         n_paths       = config.get("rl_paths_per_step", 5)
-        verbose_every = config.get("rl_verbose_every", 10)
-        check_freq    = config.get("rl_checkpoint_frequency", 10)
+        verbose_every = 100
+        check_freq    = 100
         conv_window   = config.get("rl_convergence_window", 500)
         conv_patience = config.get("rl_convergence_patience", 5000)
         conv_min_delta = config.get("rl_convergence_min_delta", 0.5)
@@ -667,6 +692,8 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
             # Checkpoint
             should_ckpt = (it + 1) % check_freq == 0 or it == start_iter + iterations - 1
             if should_ckpt or (patience_counter >= conv_patience and early_stopping):
+                # Atomic Save: Write to .tmp first then replace to prevent corruption on crash
+                temp_path = checkpoint_path + ".tmp"
                 torch.save({
                     'episode': it + 1,
                     'model_state': agent.state_dict(),
@@ -675,7 +702,23 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
                     'baseline': baseline,
                     'best_rolling_reward': best_rolling_reward,
                     'patience_counter': patience_counter,
-                }, checkpoint_path)
+                }, temp_path)
+                # Retry loop for Windows file-lock conflicts (OneDrive, serving process, etc.)
+                for _attempt in range(3):
+                    try:
+                        os.replace(temp_path, checkpoint_path)
+                        break
+                    except PermissionError:
+                        if _attempt < 2:
+                            time.sleep(1.0 * (2 ** _attempt))  # 1s, 2s backoff
+                        else:
+                            # Last resort: save alongside with a unique name so we don't lose progress
+                            fallback_path = checkpoint_path.replace(".pt", f"_iter{it+1}.pt")
+                            try:
+                                os.replace(temp_path, fallback_path)
+                                print(f"  WARNING: Saved to fallback {fallback_path} due to file lock.")
+                            except Exception:
+                                print(f"  WARNING: Could not save checkpoint at iter {it+1}. Training continues.")
 
             # Early stopping
             if patience_counter >= conv_patience:
@@ -687,6 +730,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
 
             # Logging
             if it % verbose_every == 0 or it == start_iter + iterations - 1:
+                if it > 0: print("\n" + "-"*80 + "\n")
                 elapsed = time.time() - t0
                 ips = (it - start_iter + 1) / elapsed if elapsed > 0 else 0
                 gs = f"Start: ${profile.get('start_cap',0):,.0f} -> Y{profile.get('goal_year','?')}: ${profile.get('goal_amount',0):,.0f}"
@@ -721,7 +765,7 @@ def _agent_process_entry(agent_idx, data_pickle_path, config, input_dim, log_dir
                     if len(idx) == 0: return "None"
                     top_idx = idx[np.argsort(fw[idx])][::-1] # All non-zero, sorted
                     tickers_list = clean_returns.columns
-                    return " | ".join([f"{tickers_list[i]} ({fw[i]*100:.1f}%)" for i in top_idx])
+                    return " | ".join([f"{tickers_list[i]} ({fw[i]*100:.1f}%, mu={asset_means[i]:.1%}, vol={asset_vols[i]:.1%})" for i in top_idx])
                 
                 print(f"    -> Allocation: {_get_top_str(full_pre)}")
 

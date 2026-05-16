@@ -147,35 +147,49 @@ class RLRecommender:
             emb_dim = len(next(iter(self.dynamic_embeddings.values()))) if self.dynamic_embeddings else 8
             user_cond_dim = len(_encode_user_condition(TEST_PROFILES[0]))
             
-            input_dim = emb_dim + user_cond_dim + static_dim
-            logger.info(f"RL Recommender: Calculated input_dim={input_dim} (Emb:{emb_dim}, User:{user_cond_dim}, Static:{static_dim})")
+            target_input_dim = emb_dim + user_cond_dim + static_dim
+            logger.info(f"RL Recommender: Calculated target_input_dim={target_input_dim} (Emb:{emb_dim}, User:{user_cond_dim}, Static:{static_dim})")
         except Exception as e:
-            logger.warning(f"Could not calculate input_dim dynamically, using fallback: {e}")
-            input_dim = 230 # Current production default
+            logger.warning(f"Could not calculate target_input_dim dynamically, using fallback: {e}")
+            target_input_dim = 230 # Current production default
 
         self.models = []
+        self.loaded_input_dim = target_input_dim
         
-        # Pattern to find all agents for this architecture ID
-        # Format: checkpoint_rl_v2_*_id{input_dim}_agent_{idx}.pt
+        # 1. Helper to find agents for a specific dimension
         import glob
-        pattern = os.path.join(CACHE_DIR, f"checkpoint_rl_v2_*_id{input_dim}_agent_*.pt")
-        agent_files = glob.glob(pattern)
+        import re
+        def find_valid_agents_for_dim(dim):
+            p1 = os.path.join(CACHE_DIR, f"checkpoint_rl_v2_*_id{dim}_agent_*.pt")
+            p2 = os.path.join(CACHE_DIR, f"checkpoint_rl_v2_*_id{dim}.pt")
+            files = glob.glob(p1)
+            if not files:
+                files = glob.glob(p2)
+            return [f for f in files if os.path.getsize(f) > 0]
+            
+        agent_files = find_valid_agents_for_dim(target_input_dim)
         
+        # 2. Dynamic Fallback: if no valid agents for target_input_dim, fallback to highest available dimension
         if not agent_files:
-            # Also check for combined master files (legacy)
-            pattern_master = os.path.join(CACHE_DIR, f"checkpoint_rl_v2_*_id{input_dim}.pt")
-            agent_files = glob.glob(pattern_master)
+            all_files = glob.glob(os.path.join(CACHE_DIR, "checkpoint_rl_v2_*_id*.pt"))
+            available_dims = []
+            for f in all_files:
+                if os.path.getsize(f) > 0:
+                    m = re.search(r'_id(\d+)(?:_agent)?', f)
+                    if m:
+                        available_dims.append(int(m.group(1)))
+            
+            if available_dims:
+                fallback_dim = max(set(available_dims)) # take the most recent/highest dimension
+                logger.warning(f"No valid RL agents found for target_input_dim {target_input_dim}. Falling back to {fallback_dim}.")
+                self.loaded_input_dim = fallback_dim
+                agent_files = find_valid_agents_for_dim(fallback_dim)
 
         if agent_files:
             for epath in sorted(agent_files):
                 try:
-                    # Skip corrupted/empty files
-                    if os.path.getsize(epath) == 0:
-                        logger.warning(f"Skipping corrupted 0-byte agent: {os.path.basename(epath)}")
-                        continue
-                        
                     ecp = torch.load(epath, map_location=self.device, weights_only=False)
-                    m = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                    m = PortfolioTransformerRL(self.loaded_input_dim, self.config).to(self.device)
                     
                     # Handle different checkpoint formats (single agent vs ensemble master)
                     if 'model_state' in ecp:
@@ -185,7 +199,7 @@ class RLRecommender:
                     elif 'agents_state' in ecp and isinstance(ecp['agents_state'], list):
                         # If it's a master file with multiple states, load all of them
                         for state in ecp['agents_state']:
-                            m_sub = PortfolioTransformerRL(input_dim, self.config).to(self.device)
+                            m_sub = PortfolioTransformerRL(self.loaded_input_dim, self.config).to(self.device)
                             self._load_state_dict_with_compat(m_sub, state)
                             m_sub.eval()
                             self.models.append(m_sub)
@@ -197,15 +211,16 @@ class RLRecommender:
             if self.models:
                 logger.info(f"Ensemble ready with {len(self.models)} total agents.")
             else:
-                logger.warning(f"No valid RL agents found for input_dim {input_dim}.")
+                logger.warning(f"No valid RL agents found for input_dim {self.loaded_input_dim}.")
         else:
-            logger.warning(f"No RL checkpoints found matching input_dim {input_dim} in {CACHE_DIR}.")
+            logger.warning(f"No RL checkpoints found matching any recent input_dim in {CACHE_DIR}.")
 
         self._initialized = True
 
-    def get_weights(self, user_profile: dict, tickers: list) -> tuple:
+    def get_weights(self, user_profile: dict, tickers: list, as_of_date: str = None) -> tuple:
         """
         Inference: Returns (pre_goal_weights, post_goal_weights) as dictionaries.
+        If as_of_date is provided, volatility and consistency filters use data up to that date.
         """
         if not self.models or not self.dynamic_embeddings:
             return {}, {}
@@ -221,26 +236,51 @@ class RLRecommender:
         # Fundamental Volatility Filter: Automatically weed out broken/hyper-volatile assets
         # dynamically based on the user's declared volatility sensitivity.
         vol_sens = float(user_profile.get("volatility_sensitivity", 5))
-        # Sensitivity 1 (Risk Seeking) -> Max Vol 2.0 (200%)
-        # Sensitivity 10 (Risk Averse) -> Max Vol 0.4 (40%)
-        max_allowed_vol = 2.00 - ((vol_sens - 1) / 9.0) * 1.60
+        # Sensitivity 1 (Risk Seeking) -> Max Vol 1.5 (150%)
+        # Sensitivity 10 (Risk Averse) -> Max Vol 0.25 (25%)
+        max_allowed_vol = 1.50 - ((vol_sens - 1) / 9.0) * 1.25
         
+        # 1. Filter data by date if requested
+        dr = self.daily_returns
+        if as_of_date and self.daily_returns is not None:
+            dr = self.daily_returns[self.daily_returns.index <= as_of_date]
+        
+        # First pass: collect all eligible candidates with their volatility scores
+        all_candidates = []
         for t in tickers:
             if t in self.dynamic_embeddings and t in self.master_df.index:
-                # Fundamental Consistency & Recent Volatility Filter
-                if self.daily_returns is not None and t in self.daily_returns.columns:
-                    recent_vol = self.daily_returns[t].tail(30).std() * np.sqrt(252)
-                    hist_vol = self.daily_returns[t].tail(252).std() * np.sqrt(252)
-                    
-                    # 1. Check if RECENT volatility exceeds the user's tolerance
-                    if pd.notna(recent_vol) and recent_vol > max_allowed_vol:
-                        continue
-                        
-                    # 2. Check for Consistency: Reject assets whose volatility has recently spiked >50%
-                    if pd.notna(recent_vol) and pd.notna(hist_vol) and hist_vol > 0:
-                        if (recent_vol / hist_vol) > 1.5:
-                            continue
-                
+                recent_vol = None
+                hist_vol = None
+                if dr is not None and t in dr.columns:
+                    recent_vol = dr[t].tail(30).std() * np.sqrt(252)
+                    hist_vol = dr[t].tail(252).std() * np.sqrt(252)
+                all_candidates.append((t, recent_vol, hist_vol))
+        
+        # Second pass: apply volatility and consistency filters
+        for t, recent_vol, hist_vol in all_candidates:
+            passed = True
+            if recent_vol is not None and pd.notna(recent_vol):
+                # 1. Check if RECENT volatility exceeds the user's tolerance
+                if recent_vol > max_allowed_vol:
+                    passed = False
+                # 2. Check for Consistency: Reject assets whose volatility has recently spiked >50%
+                elif hist_vol is not None and pd.notna(hist_vol) and hist_vol > 0:
+                    if (recent_vol / hist_vol) > 1.5:
+                        passed = False
+            
+            if passed:
+                emb_rows.append(self.dynamic_embeddings[t])
+                static_rows.append(self.master_df.loc[t, static_cols].values)
+                valid_tickers.append(t)
+        
+        # Fallback: if vol filter eliminated ALL candidates, relax and take the lowest-vol assets
+        if not valid_tickers and all_candidates:
+            logger.warning(f"Volatility filter (max={max_allowed_vol:.2f}) eliminated all {len(all_candidates)} candidates. "
+                           f"Relaxing to lowest-volatility assets.")
+            # Sort by recent_vol (ascending), NaN last
+            sorted_candidates = sorted(all_candidates, key=lambda x: x[1] if (x[1] is not None and pd.notna(x[1])) else 999.0)
+            # Take the top 30 lowest-volatility assets as fallback
+            for t, _, _ in sorted_candidates[:30]:
                 emb_rows.append(self.dynamic_embeddings[t])
                 static_rows.append(self.master_df.loc[t, static_cols].values)
                 valid_tickers.append(t)
@@ -255,6 +295,14 @@ class RLRecommender:
         user_vec = np.array(_encode_user_condition(user_profile), dtype=np.float32)
         N = emb_matrix.shape[0]
         user_tiled = np.tile(user_vec, (N, 1))
+        
+        # Handle Dimensional Drift: dynamically pad/truncate static_matrix if model expects different dimension
+        expected_static_dim = getattr(self, "loaded_input_dim", 230) - emb_matrix.shape[1] - user_tiled.shape[1]
+        if static_matrix.shape[1] > expected_static_dim:
+            static_matrix = static_matrix[:, :expected_static_dim] # Truncate new features
+        elif static_matrix.shape[1] < expected_static_dim:
+            pad_width = expected_static_dim - static_matrix.shape[1]
+            static_matrix = np.pad(static_matrix, ((0, 0), (0, pad_width)), mode='constant')
         
         full_input = np.concatenate([emb_matrix, user_tiled, static_matrix], axis=1)
         x = torch.tensor(full_input[np.newaxis, :, :], dtype=torch.float32).to(self.device)
@@ -352,10 +400,12 @@ class RLRecommender:
 
 # ─── Multi-Horizon Encoding ──────────────────────────────────────────────────
 
-def encode_multi_horizon(answers: dict) -> dict:
+def encode_multi_horizon(answers: dict, require_historical_years: int = None, as_of_date: str = None) -> dict:
     """
-    Generate a series of weight recommendations for multiple goal horizons.
+    Given a multi-goal questionnaire, returns the 'pre' weights for each contiguous segment.
     Handles 'reserved assets' by fixing their weights and scaling the RL recommendation.
+    If require_historical_years is provided, only assets with that many years of historical data are recommended.
+    If as_of_date is provided, the recommendation is made as of that point in history.
     """
     global _RECOMMENDER_INSTANCE
     if _RECOMMENDER_INSTANCE is None:
@@ -363,6 +413,9 @@ def encode_multi_horizon(answers: dict) -> dict:
         _RECOMMENDER_INSTANCE = RLRecommender()
     
     recommender = _RECOMMENDER_INSTANCE
+    dr = recommender.daily_returns
+    if as_of_date and dr is not None:
+        dr = dr[dr.index <= as_of_date]
     
     start_cap = float(answers.get("start_cap") or 100000)
     monthly_contrib = float(answers.get("monthly_contrib") or 500)
@@ -424,9 +477,22 @@ def encode_multi_horizon(answers: dict) -> dict:
             "goal_amount": goal_amount
         }
         
+        # Ensure we only recommend assets that have existed for at least required years as of the target date
+        valid_tickers = list(recommender.dynamic_embeddings.keys())
+        if dr is not None:
+            required_years = require_historical_years if require_historical_years is not None else 0
+            min_required_days = int((required_years * TRADING_DAYS_PER_YEAR) * 0.95)
+            valid_tickers = [
+                t for t in valid_tickers 
+                if t in dr.columns 
+                and dr[t].count() >= min_required_days
+            ]
+            if not valid_tickers:
+                valid_tickers = list(recommender.dynamic_embeddings.keys()) # fallback
+                
         # Use RL agent to get "Pre-goal" weights for this segment
         # In a multi-horizon setup, we use the pre-goal head for the active goal segment.
-        w_pre, _ = recommender.get_weights(profile, list(recommender.dynamic_embeddings.keys()))
+        w_pre, _ = recommender.get_weights(profile, valid_tickers, as_of_date=as_of_date)
         
         # Integrate reserved assets
         # Weights = sum(reserved) + (1 - sum(reserved_ratio)) * w_pre
@@ -483,7 +549,7 @@ def encode_multi_horizon(answers: dict) -> dict:
     # Uses the 'post-goal' weights from the RL model for the last goal's profile
     if prev_yr < max_horizon:
         # Re-fetch weights to get mu_post from the last goal context
-        _, w_post = recommender.get_weights(profile, list(recommender.dynamic_embeddings.keys()))
+        _, w_post = recommender.get_weights(profile, valid_tickers if require_historical_years is not None else list(recommender.dynamic_embeddings.keys()), as_of_date=as_of_date)
         
         combined_post_weights = reserved_weights.copy()
         for t, wt in w_post.items():
@@ -535,7 +601,7 @@ def simulate_multi_horizon_portfolio(
     Run a year-by-year simulation of portfolio returns, switching weights at segment boundaries.
     """
     recommender = RLRecommender()
-    if not recommender._initialized or recommender.daily_returns is None:
+    if not recommender._initialized or recommender.daily_returns is None or len(recommender.daily_returns.columns) == 0:
         # Fallback if no data
         return {"error": "Market data unavailable for simulation"}
 
@@ -551,7 +617,15 @@ def simulate_multi_horizon_portfolio(
     active_tickers = [t for t in active_tickers if t in recommender.daily_returns.columns]
     if not active_tickers:
         # Fallback to S&P 500 if no valid tickers found (to avoid crash)
-        active_tickers = ["VOO"] if "VOO" in recommender.daily_returns.columns else [recommender.daily_returns.columns[0]]
+        cols = recommender.daily_returns.columns
+        if "VOO" in cols:
+            active_tickers = ["VOO"]
+        elif "SPY" in cols:
+            active_tickers = ["SPY"]
+        elif len(cols) > 0:
+            active_tickers = [cols[0]]
+        else:
+            return {"error": "No valid assets found in market data for simulation"}
 
     # 2. Extract only required daily returns
     base_returns = recommender.drip_daily_returns if recommender.drip_daily_returns is not None else recommender.daily_returns
