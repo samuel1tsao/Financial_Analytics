@@ -679,7 +679,8 @@ def _compute_reward(metrics, user_profile):
 def _run_single_sim_path(weight_array, sim_cache, clean_returns, start_capital, goals, mode,
                          max_horizon_years, debug_path, start_date_str,
                          post_goal_weights=None, goal_year=None,
-                         bootstrap_indices=None, start_idx=None):
+                         bootstrap_indices=None, start_idx=None,
+                         monthly_contrib=0.0):
     """
     Simulate one trajectory using FAST precomputed annual dot products.
     If bootstrap_indices is provided, uses block bootstrapping.
@@ -693,6 +694,8 @@ def _run_single_sim_path(weight_array, sim_cache, clean_returns, start_capital, 
     max_drawdown      = 0.0
     trail             = []
     phase_switched    = False
+    any_bankrupt      = False
+    bankrupt_reason   = None
     
     cache_array, start_idx_to_pos = sim_cache
     
@@ -724,6 +727,7 @@ def _run_single_sim_path(weight_array, sim_cache, clean_returns, start_capital, 
         raise ValueError("Must provide either bootstrap_indices or start_idx")
         
     actual_withdrawals = 0.0
+    contrib_annual = monthly_contrib * 12.0
     
     for year in range(1, max_horizon_years + 1):
         # Two-phase weight selection: pre-goal vs post-goal
@@ -739,6 +743,7 @@ def _run_single_sim_path(weight_array, sim_cache, clean_returns, start_capital, 
         # FAST VECTOR DOT PRODUCT
         yr_return = np.dot(w, precomputed_returns[year - 1])
         capital           *= (1 + yr_return)
+        capital           += contrib_annual
         market_multiplier *= (1 + yr_return)
         
         if year == target_horizon:
@@ -747,47 +752,37 @@ def _run_single_sim_path(weight_array, sim_cache, clean_returns, start_capital, 
         # Track drawdown based on MARKET performance, not cash balance
         mi_peak, max_drawdown = _update_drawdown(market_multiplier, mi_peak, max_drawdown)
 
-        # Track actual withdrawals before it's deducted
+        # Process goal withdrawal (if any)
+        goal_log = ""
         if year in goals:
             target = goals[year]
             if capital >= target:
                 actual_withdrawals += target
+                capital -= target
+                goal_log = f" | GOAL -${target:,.0f} -> ${capital:,.0f} ✅"
             else:
-                actual_withdrawals += max(capital, 0.0)
-
-        # Process goal withdrawal (if any)
-        capital_before = capital
-        capital, bankrupt, goal_log = _process_goal_withdrawal(capital, year, goals)
+                withdrawn = max(capital, 0.0)
+                actual_withdrawals += withdrawn
+                shortfall = target - withdrawn
+                capital = 0.0
+                any_bankrupt = True
+                if bankrupt_reason is None:
+                    bankrupt_reason = "goal" if withdrawn > 0 else "market"
+                goal_log = f" | GOAL -${target:,.0f} -> $0 (Shortfall: -${shortfall:,.0f}) ❌"
 
         # Build debug trail
         phase_tag = " [POST]" if (post_goal_weights is not None and goal_year is not None and year > goal_year) else ""
         step_str = f"Y{year}: ${capital:,.0f} ({yr_return:+.1%}){goal_log}{phase_tag}"
-        if bankrupt:
-            trail.append(step_str)
-            reason = "goal" if capital_before > 0 else "market"
-            reported_mdd = max_drawdown if reason == "goal" else 1.0
-            
-            # Continue computing the market multiplier for the rest of the target horizon
-            if year < target_horizon:
-                for rem_year in range(year + 1, target_horizon + 1):
-                    w_rem = post_goal_weights if (post_goal_weights is not None and goal_year is not None and rem_year > goal_year) else weight_array
-                    yr_rem_return = np.dot(w_rem, precomputed_returns[rem_year - 1])
-                    horizon_market_multiplier *= (1 + yr_rem_return)
-            elif year == target_horizon:
-                horizon_market_multiplier = market_multiplier
-                
-            return {"bankrupt": True, "bankrupt_reason": reason, "terminal_value": 0.0,
-                    "max_drawdown": reported_mdd,
-                    "actual_withdrawals": actual_withdrawals, "market_multiplier": horizon_market_multiplier, "log": " -> ".join(trail)}
         if debug_path and year <= DEBUG_LOG_MAX_YEARS:
             trail.append(step_str)
 
     log_msg = ""
     if debug_path:
-        log_msg = f"    Start: {start_date_str} | Path: {' -> '.join(trail)} ✅"
+        log_msg = f"    Start: {start_date_str} | Path: {' -> '.join(trail)} " + ("❌" if any_bankrupt else "✅")
 
-    return {"bankrupt": False, "terminal_value": capital, "actual_withdrawals": actual_withdrawals,
-            "max_drawdown": max_drawdown, "market_multiplier": horizon_market_multiplier, "log": log_msg}
+    return {"bankrupt": any_bankrupt, "bankrupt_reason": bankrupt_reason, "terminal_value": capital,
+            "max_drawdown": max_drawdown,
+            "actual_withdrawals": actual_withdrawals, "market_multiplier": horizon_market_multiplier, "log": log_msg}
 
 
 # ── Portfolio Evaluator ───────────────────────────────────────────────────────
@@ -813,7 +808,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
         # If cache_data is a tuple (array, pos_dict), it's the new format
         sim_cache = cache_data
     else:
-        cache_array, start_idx_to_pos, clean_returns, column_to_idx = build_simulation_cache(base_returns)
+        cache_array, start_idx_to_pos, clean_returns, column_to_idx, max_sim_years = build_simulation_cache(base_returns)
         sim_cache = (cache_array, start_idx_to_pos)
 
     # Convert weights dict -> sorted candidates -> two-stage top-K + normalized threshold
@@ -865,6 +860,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
     max_horizon_requested = goal_year if goal_year else (max(user_profile['goals'].keys()) if user_profile['goals'] else 1)
     max_horizon = min(max_horizon_requested, max_sim_years)
     start_cap   = user_profile['start_cap']
+    monthly_contrib = float(user_profile.get('monthly_contrib', 0.0))
     
     # Calculate decay probabilities for the entire cache pool (for bootstrapping)
     cache_array, start_idx_to_pos = sim_cache
@@ -894,7 +890,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
                 weight_array, sim_cache, clean_returns, start_cap,
                 user_profile['goals'], mode, max_horizon, debug_path, date_str,
                 post_goal_weights=post_weight_array, goal_year=goal_year,
-                start_idx=actual_idx
+                start_idx=actual_idx, monthly_contrib=monthly_contrib
             )
         )
     else:
@@ -911,7 +907,7 @@ def evaluate_portfolio_member_c(dataset, recommendations, user_profile, config,
                     weight_array, sim_cache, clean_returns, start_cap,
                     user_profile['goals'], mode, max_horizon, debug_path=False, start_date_str="Bootstrapped",
                     post_goal_weights=post_weight_array, goal_year=goal_year,
-                    bootstrap_indices=bootstrap_indices
+                    bootstrap_indices=bootstrap_indices, monthly_contrib=monthly_contrib
                 )
             )
 

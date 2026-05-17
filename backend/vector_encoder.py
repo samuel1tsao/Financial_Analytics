@@ -82,7 +82,9 @@ class RLRecommender:
         return cls._instance
 
     def _load_state_dict_with_compat(self, model, state_dict):
-        """Maps old dual-head keys (pre/post) to the new single-head architecture."""
+        """Maps old dual-head keys (pre/post) to the new single-head architecture.
+        Uses strict=False to handle architecture migrations (e.g., old flat model -> new adapter model).
+        """
         new_state_dict = {}
         for k, v in state_dict.items():
             # 1. Ignore post-goal heads (they are redundant in the single-head architecture)
@@ -96,11 +98,30 @@ class RLRecommender:
             # 3. Keep standard names if they already exist (single-head v3+)
             elif k.startswith("mu_head") or k.startswith("sigma_head"):
                 new_state_dict[k] = v
-            # 4. Keep all other layers (transformer, input_proj)
+            # 4. Keep all other layers (transformer, input_proj, adapters)
             else:
                 new_state_dict[k] = v
         
-        model.load_state_dict(new_state_dict, strict=True)
+        # Pre-filter: remove keys whose shapes don't match the current model
+        # This handles architecture transitions (e.g., old input_proj [64,254] -> new [64,128])
+        model_state = model.state_dict()
+        compatible_state = {}
+        skipped_keys = []
+        for k, v in new_state_dict.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                compatible_state[k] = v
+            else:
+                skipped_keys.append(k)
+        
+        if skipped_keys:
+            logger.info(f"Compat load - skipped {len(skipped_keys)} shape-mismatched/legacy keys: {skipped_keys}")
+        
+        result = model.load_state_dict(compatible_state, strict=False)
+        if result.missing_keys:
+            # Adapter keys are expected to be missing when loading old checkpoints
+            unexpected_missing = [k for k in result.missing_keys if 'adapter' not in k and k not in skipped_keys]
+            if unexpected_missing:
+                logger.warning(f"Compat load - unexpected missing keys: {unexpected_missing}")
 
     def __init__(self):
         if self._initialized:
@@ -117,11 +138,12 @@ class RLRecommender:
             res = generate_dataset_member_a([], self.config)
             self.master_df = res[0]
             self.price_matrix = res[1]
+            self.volume_matrix = res[2]
             self.daily_returns = res[3]
             self.drip_daily_returns = res[4]
             
             emb_cache = load_embedding_cache(
-                self.master_df, self.price_matrix, res[2], self.daily_returns, self.config, 
+                self.master_df, self.price_matrix, self.volume_matrix, self.daily_returns, self.config, 
                 drip_daily_returns=self.drip_daily_returns, folder=CACHE_DIR
             )
             if emb_cache:
@@ -129,12 +151,31 @@ class RLRecommender:
                 self.X_mean = emb_cache["model_checkpoint"]["X_mean"]
                 self.X_std = emb_cache["model_checkpoint"]["X_std"]
                 logger.info(f"RL Embeddings loaded successfully from {CACHE_DIR}")
+                
+                # Load ML Model for Dynamic PIT Recalculation
+                try:
+                    from _ml_worker import AssetTransformerNet
+                    horizons = self.config.get("ml_target_horizons", [1, 3, 5, 10, 15])
+                    target_metrics = self.config.get("ml_target_metrics", ["return", "volatility", "volume"])
+                    output_macro_dim = len(horizons) * len(target_metrics)
+                    output_ar_dim = 3
+                    input_dim = self.X_mean.shape[0]
+                    
+                    self.ml_model = AssetTransformerNet(input_dim, self.config, output_macro_dim, output_ar_dim)
+                    self.ml_model.load_state_dict(emb_cache["model_checkpoint"]["model_state"])
+                    self.ml_model.eval()
+                    logger.info("Successfully loaded Phase 1 ML model for dynamic embedding recalculation.")
+                except Exception as ex:
+                    logger.warning(f"Could not load ML model for dynamic embedding recalculation: {ex}")
+                    self.ml_model = None
             else:
                 self.dynamic_embeddings = {}
+                self.ml_model = None
                 logger.error("Failed to load Phase 1 embeddings")
         except Exception as e:
             logger.error(f"Error loading dataset for RL: {e}")
             self.dynamic_embeddings = {}
+            self.ml_model = None
 
         # 2. Dynamic Model Discovery (Ensemble)
         # Calculate expected input_dim dynamically to match current features
@@ -217,6 +258,82 @@ class RLRecommender:
 
         self._initialized = True
 
+    def _recalculate_point_in_time_embeddings(self, tickers: list, as_of_date: str) -> dict:
+        """
+        Dynamically computes the historical sequence embeddings up to as_of_date
+        to completely eliminate look-ahead bias and data poisoning.
+        """
+        if not hasattr(self, "ml_model") or self.ml_model is None:
+            return {}
+            
+        import pandas as pd
+        import numpy as np
+        
+        # 1. Truncate returns and volume up to as_of_date
+        dr = self.daily_returns[self.daily_returns.index <= as_of_date] if self.daily_returns is not None else None
+        if dr is None or dr.empty:
+            return {}
+            
+        # Re-compute dynamic features up to as_of_date
+        daily_ret = dr.copy()
+        
+        # Rolling 21-day volatility
+        daily_vol = daily_ret.rolling(21, min_periods=1).std() * np.sqrt(252)
+        daily_vol = daily_vol.fillna(0.0)
+        daily_ret = daily_ret.fillna(0.0)
+        
+        # Log volume
+        daily_logv = np.log1p(self.volume_matrix)
+        daily_logv = daily_logv[daily_logv.index <= as_of_date]
+        daily_logv = daily_logv.fillna(0.0)
+        
+        # Categorical / static features
+        categorical_cols = ["sector", "industry", "state", "quoteType", "exchange"]
+        master_encoded = pd.get_dummies(self.master_df, columns=[c for c in categorical_cols if c in self.master_df.columns], drop_first=True)
+        all_feature_cols = [c for c in master_encoded.columns if any(c.startswith(cat + "_") for cat in categorical_cols)]
+        
+        max_seq_len = self.config.get("ml_max_seq_len", 3780)
+        pit_embeddings = {}
+        
+        self.ml_model.eval()
+        with torch.no_grad():
+            for t in tickers:
+                if t not in daily_ret.columns or t not in daily_vol.columns or t not in daily_logv.columns:
+                    continue
+                if t not in master_encoded.index:
+                    continue
+                    
+                df_t = pd.DataFrame({
+                    'ret': daily_ret[t],
+                    'vol': daily_vol[t],
+                    'logv': daily_logv[t]
+                }).dropna()
+                
+                if len(df_t) < 5:
+                    continue
+                    
+                # Truncate to max_seq_len
+                df_t = df_t.tail(max_seq_len)
+                L = len(df_t)
+                
+                feat_vec = master_encoded.loc[t, all_feature_cols].astype(float).values
+                static_feats = np.tile(feat_vec, (L, 1))
+                
+                seq = np.concatenate([df_t.values, static_feats], axis=1)
+                
+                x_t = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+                x_norm = (x_t - self.X_mean) / self.X_std
+                
+                # Check for NaNs or Infs and fill with 0
+                x_norm = torch.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                mask = torch.zeros((1, L), dtype=torch.bool)
+                
+                _, _, emb = self.ml_model(x_norm, src_key_padding_mask=mask)
+                pit_embeddings[t] = emb.squeeze(0).cpu().numpy()
+                
+        return pit_embeddings
+
     def get_weights(self, user_profile: dict, tickers: list, as_of_date: str = None) -> tuple:
         """
         Inference: Returns (pre_goal_weights, post_goal_weights) as dictionaries.
@@ -233,13 +350,20 @@ class RLRecommender:
         static_rows = []
         valid_tickers = []
         
-        # Fundamental Volatility Filter: Automatically weed out broken/hyper-volatile assets
-        # dynamically based on the user's declared volatility sensitivity.
+        # Fundamental Volatility Filter: Automatically weed out strictly broken assets
+        # We keep this broad to avoid "market timing", relying on RL hold policy instead
         vol_sens = float(user_profile.get("volatility_sensitivity", 5))
-        # Sensitivity 1 (Risk Seeking) -> Max Vol 1.5 (150%)
-        # Sensitivity 10 (Risk Averse) -> Max Vol 0.25 (25%)
         max_allowed_vol = 1.50 - ((vol_sens - 1) / 9.0) * 1.25
         
+        # Recalculate embeddings dynamically in memory if as_of_date is provided
+        pit_embeddings = {}
+        if as_of_date:
+            try:
+                pit_embeddings = self._recalculate_point_in_time_embeddings(tickers, as_of_date)
+                logger.info(f"Dynamically recalculated {len(pit_embeddings)} point-in-time embeddings for {as_of_date}.")
+            except Exception as e:
+                logger.warning(f"Failed to recalculate point-in-time embeddings: {e}")
+
         # 1. Filter data by date if requested
         dr = self.daily_returns
         if as_of_date and self.daily_returns is not None:
@@ -247,6 +371,7 @@ class RLRecommender:
         
         # First pass: collect all eligible candidates with their volatility scores
         all_candidates = []
+        all_candidates_dict = {}
         for t in tickers:
             if t in self.dynamic_embeddings and t in self.master_df.index:
                 recent_vol = None
@@ -255,6 +380,7 @@ class RLRecommender:
                     recent_vol = dr[t].tail(30).std() * np.sqrt(252)
                     hist_vol = dr[t].tail(252).std() * np.sqrt(252)
                 all_candidates.append((t, recent_vol, hist_vol))
+                all_candidates_dict[t] = recent_vol
         
         # Second pass: apply volatility and consistency filters
         for t, recent_vol, hist_vol in all_candidates:
@@ -269,7 +395,18 @@ class RLRecommender:
                         passed = False
             
             if passed:
-                emb_rows.append(self.dynamic_embeddings[t])
+                emb = None
+                if as_of_date:
+                    emb = pit_embeddings.get(t)
+                    if emb is None:
+                        try:
+                            from _ml_worker import load_walkforward_embedding
+                            emb = load_walkforward_embedding(t, as_of_date, self.config)
+                        except Exception:
+                            pass
+                if emb is None:
+                    emb = self.dynamic_embeddings[t]
+                emb_rows.append(emb)
                 static_rows.append(self.master_df.loc[t, static_cols].values)
                 valid_tickers.append(t)
         
@@ -281,7 +418,18 @@ class RLRecommender:
             sorted_candidates = sorted(all_candidates, key=lambda x: x[1] if (x[1] is not None and pd.notna(x[1])) else 999.0)
             # Take the top 30 lowest-volatility assets as fallback
             for t, _, _ in sorted_candidates[:30]:
-                emb_rows.append(self.dynamic_embeddings[t])
+                emb = None
+                if as_of_date:
+                    emb = pit_embeddings.get(t)
+                    if emb is None:
+                        try:
+                            from _ml_worker import load_walkforward_embedding
+                            emb = load_walkforward_embedding(t, as_of_date, self.config)
+                        except Exception:
+                            pass
+                if emb is None:
+                    emb = self.dynamic_embeddings[t]
+                emb_rows.append(emb)
                 static_rows.append(self.master_df.loc[t, static_cols].values)
                 valid_tickers.append(t)
         
@@ -323,17 +471,24 @@ class RLRecommender:
             # Duplicate for compatibility (single head now handles both pre/post logic via condition)
             mu_pre = mu_avg
             mu_post = mu_avg
+
+            # ── Dynamic Logit Standardization ──
+            # The raw RL logits have near-zero variance. We MUST standardize them to a target standard deviation
+            # to blow up the microscopic differences into meaningful Softmax percentages.
+            conc_pref = float(user_profile.get("concentration_pref", 5))
             
-            # Sharpen logits to match the variance seen during training's exploration sampling
-            # Reduced target_std from 1.0 to 0.5 to prevent overly concentrated allocations
+            # High conc_pref (9) -> target_std = 1.2 (Blows up differences -> Concentrated Softmax)
+            # Low conc_pref (1)  -> target_std = 0.2 (Keeps differences tiny -> Flat/Diversified Softmax)
+            dynamic_target_std = 0.2 + ((conc_pref - 1) / 8.0) * 1.0
+
             def sharpen_logits(m, target_std=0.5):
                 std = m.std(dim=-1, keepdim=True)
                 std = torch.clamp(std, min=1e-6)
                 return (m - m.mean(dim=-1, keepdim=True)) / std * target_std
 
-            mu_pre_sharp = sharpen_logits(mu_pre)
-            mu_post_sharp = sharpen_logits(mu_post)
-            
+            mu_pre_sharp = sharpen_logits(mu_pre, target_std=dynamic_target_std)
+            mu_post_sharp = sharpen_logits(mu_post, target_std=dynamic_target_std)
+
             w_pre = F.softmax(mu_pre_sharp, dim=-1)[0].cpu().numpy()
             w_post = F.softmax(mu_post_sharp, dim=-1)[0].cpu().numpy()
             
@@ -488,7 +643,14 @@ def encode_multi_horizon(answers: dict, require_historical_years: int = None, as
                 and dr[t].count() >= min_required_days
             ]
             if not valid_tickers:
-                valid_tickers = list(recommender.dynamic_embeddings.keys()) # fallback
+                # Fallback: Relax constraint, but still strictly require the asset to have existed as of as_of_date
+                # (i.e., has at least 5 returns in dr, which is already sliced <= as_of_date)
+                valid_tickers = [
+                    t for t in recommender.dynamic_embeddings.keys()
+                    if t in dr.columns 
+                    and dr[t].count() >= 5
+                ]
+                logger.info(f"Fallback triggered: relaxed required history but strictly limited to {len(valid_tickers)} assets active as of {as_of_date}")
                 
         # Use RL agent to get "Pre-goal" weights for this segment
         # In a multi-horizon setup, we use the pre-goal head for the active goal segment.

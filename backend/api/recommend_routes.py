@@ -243,3 +243,31 @@ def run_simulation_benchmark(
     except Exception as e:
         logger.error(f"Benchmark simulation crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/evaluate")
+def evaluate_portfolio(payload: dict):
+    """
+    Unauthenticated evaluation endpoint for notebook/research use.
+    Accepts the same answers JSON as the questionnaire and returns RL recommendations.
+    Does NOT persist to DB.
+    
+    Optional backtest params (pass alongside normal answers):
+        as_of_date: str             - Only use data up to this date (e.g. "1996-03-28")
+        require_historical_years: int - Only recommend assets with this many years of history
+    """
+    from vector_encoder import encode_multi_horizon
+    try:
+        # Extract backtest-specific params before passing to encoder
+        as_of_date = payload.pop("as_of_date", None)
+        require_historical_years = payload.pop("require_historical_years", None)
+        
+        result = encode_multi_horizon(
+            payload,
+            require_historical_years=require_historical_years,
+            as_of_date=as_of_date
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Evaluation crash: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
